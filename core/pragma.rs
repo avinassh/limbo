@@ -86,6 +86,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["mode", "table"],
         ),
+        EnableAgi => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["enable_agi"],
+        ),
     }
 }
 

@@ -250,6 +250,10 @@ fn update_pragma(
             connection.set_capture_data_changes(opts);
             Ok((program, TransactionMode::Write))
         }
+        PragmaName::EnableAgi => {
+            connection.enable_agi();
+            Ok((program, TransactionMode::None))
+        }
     }
 }
 
@@ -437,6 +441,7 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.columns[1].to_string());
             Ok((program, TransactionMode::Read))
         }
+        PragmaName::EnableAgi => todo!()
     }
 }
 
