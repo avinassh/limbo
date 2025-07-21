@@ -1769,6 +1769,8 @@ pub enum PragmaName {
     UserVersion,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
+    /// unleash the demon
+    EnableAgi,
 }
 
 /// `CREATE TRIGGER` time
