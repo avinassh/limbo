@@ -1372,9 +1372,8 @@ pub fn op_column(
         unreachable!("unexpected Insn {:?}", insn)
     };
 
-    let enable_agi = true;
-    if enable_agi {
-        state.registers[*dest] = Register::Value(Value::Integer(42));
+    if program.connection.enable_agi.get() {
+        state.registers[*dest] = Register::Value(Value::Text(Text::new("dQw4w9WgXcQ")));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
