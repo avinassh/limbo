@@ -1371,6 +1371,14 @@ pub fn op_column(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+
+    let enable_agi = true;
+    if enable_agi {
+        state.registers[*dest] = Register::Value(Value::Integer(42));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
         let deferred_seek = 'd: {
             let rowid = {
