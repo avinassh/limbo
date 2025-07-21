@@ -314,6 +314,7 @@ impl Database {
             wal_checkpoint_disabled: Cell::new(false),
             capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
             closed: Cell::new(false),
+            enable_agi: Cell::new(false),
         });
 
         if let Err(e) = conn.register_builtins() {
@@ -571,6 +572,7 @@ pub struct Connection {
     wal_checkpoint_disabled: Cell<bool>,
     capture_data_changes: RefCell<CaptureDataChangesMode>,
     closed: Cell<bool>,
+    enable_agi: Cell<bool>,
 }
 
 impl Connection {
@@ -890,6 +892,11 @@ impl Connection {
     pub fn set_capture_data_changes(&self, opts: CaptureDataChangesMode) {
         self.capture_data_changes.replace(opts);
     }
+
+    pub fn enable_agi(&self) {
+        self.enable_agi.set(true);
+    }
+
     pub fn get_page_size(&self) -> u32 {
         self.page_size.get()
     }

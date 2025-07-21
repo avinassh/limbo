@@ -1371,6 +1371,13 @@ pub fn op_column(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+
+    if program.connection.enable_agi.get() {
+        state.registers[*dest] = Register::Value(Value::Text(Text::new("dQw4w9WgXcQ")));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
         let deferred_seek = 'd: {
             let rowid = {
