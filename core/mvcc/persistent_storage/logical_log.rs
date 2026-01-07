@@ -213,7 +213,7 @@ impl LogicalLog {
             .encryption_ctx
             .as_ref()
             .ok_or_else(|| LimboError::InternalError("Encryption context not set".into()))?;
-        ctx.encrypt_raw_with_ad(plaintext, ad)
+        ctx.encrypt_log_record(plaintext, ad)
     }
 
     /// Decrypt a record payload using the configured cipher
@@ -223,7 +223,7 @@ impl LogicalLog {
             .encryption_ctx
             .as_ref()
             .ok_or_else(|| LimboError::InternalError("Encryption context not set".into()))?;
-        ctx.decrypt_raw_with_ad(ciphertext, nonce, ad)
+        ctx.decrypt_log_record(ciphertext, nonce, ad)
     }
 
     pub fn log_tx(&mut self, tx: &LogRecord) -> Result<Completion> {
@@ -526,7 +526,7 @@ impl StreamingLogicalLogReader {
         let ciphertext = self.consume_buffer(io, encrypted_size)?;
 
         // Decrypt
-        let plaintext = ctx.decrypt_raw_with_ad(&ciphertext, &nonce, ad)?;
+        let plaintext = ctx.decrypt_log_record(&ciphertext, &nonce, ad)?;
 
         // Total bytes read: nonce_size + 8 (payload_size) + encrypted_size
         let bytes_read = nonce_size + 8 + encrypted_size;

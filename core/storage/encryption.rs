@@ -805,14 +805,33 @@ impl EncryptionContext {
         Ok(result)
     }
 
+    /// Encrypt a log record payload with associated data.
+    /// Returns (ciphertext, nonce) for storage in the MVCC logical log.
+    #[cfg(feature = "encryption")]
+    pub fn encrypt_log_record(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        self.encrypt_raw_with_ad(plaintext, ad)
+    }
+
+    /// Decrypt a log record payload with associated data.
+    /// Used for reading encrypted records from the MVCC logical log.
+    #[cfg(feature = "encryption")]
+    pub fn decrypt_log_record(
+        &self,
+        ciphertext: &[u8],
+        nonce: &[u8],
+        ad: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.decrypt_raw_with_ad(ciphertext, nonce, ad)
+    }
+
     /// encrypts raw data using the configured cipher, returns ciphertext and nonce
-    pub fn encrypt_raw(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    fn encrypt_raw(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         const AD: &[u8] = b"";
         self.encrypt_raw_with_ad(plaintext, AD)
     }
 
     /// encrypts raw data with associated data using the configured cipher
-    pub fn encrypt_raw_with_ad(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    fn encrypt_raw_with_ad(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         macro_rules! encrypt_cipher {
             ($cipher:expr) => {{
                 let (ciphertext, nonce) = $cipher.encrypt(plaintext, ad)?;
@@ -832,12 +851,12 @@ impl EncryptionContext {
         }
     }
 
-    pub fn decrypt_raw(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_raw(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
         const AD: &[u8] = b"";
         self.decrypt_raw_with_ad(ciphertext, nonce, AD)
     }
 
-    pub fn decrypt_raw_with_ad(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_raw_with_ad(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
         macro_rules! decrypt_with_nonce {
             ($cipher:expr, $nonce_size:literal, $name:literal) => {{
                 let nonce_array: [u8; $nonce_size] = nonce.try_into().map_err(|_| {
