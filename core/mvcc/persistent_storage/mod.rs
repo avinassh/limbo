@@ -5,6 +5,7 @@ use std::sync::Arc;
 pub mod logical_log;
 use crate::mvcc::database::LogRecord;
 use crate::mvcc::persistent_storage::logical_log::LogicalLog;
+use crate::storage::encryption::EncryptionContext;
 use crate::{Completion, File, Result};
 
 pub struct Storage {
@@ -50,6 +51,16 @@ impl Storage {
 
     pub fn checkpoint_threshold(&self) -> i64 {
         self.logical_log.read().checkpoint_threshold()
+    }
+
+    /// Set the encryption context for the logical log.
+    pub fn set_encryption_context(&self, ctx: Arc<EncryptionContext>) {
+        self.logical_log.write().set_encryption_context(ctx);
+    }
+
+    /// Check if encryption is enabled for this storage.
+    pub fn is_encrypted(&self) -> bool {
+        self.logical_log.read().encryption_context().is_some()
     }
 }
 

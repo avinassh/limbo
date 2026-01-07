@@ -2589,7 +2589,16 @@ impl Connection {
                 "cannot reset encryption attributes if already set in the session".to_string(),
             ));
         }
-        pager.set_encryption_context(cipher_mode, key)
+        pager.set_encryption_context(cipher_mode, key)?;
+
+        // Also propagate encryption context to MVCC storage if enabled
+        if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+            let page_size = pager.get_page_size_unchecked().get() as usize;
+            let encryption_ctx = EncryptionContext::new(cipher_mode, key, page_size)?;
+            mv_store.set_encryption_context(Arc::new(encryption_ctx));
+        }
+
+        Ok(())
     }
 
     /// Sets a custom busy handler callback.

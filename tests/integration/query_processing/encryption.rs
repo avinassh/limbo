@@ -460,3 +460,425 @@ fn test_turso_header_structure(db: TempDatabase) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+// ==================== MVCC Encryption Tests ====================
+
+/// Test basic CRUD operations with encryption in MVCC mode.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_basic_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let db_path = tmp_db.path.clone();
+
+    {
+        let conn = tmp_db.connect_limbo();
+        run_query(
+            &tmp_db,
+            &conn,
+            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        )?;
+        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
+
+        // Create table and insert data
+        run_query(
+            &tmp_db,
+            &conn,
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30);",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25);",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 35);",
+        )?;
+
+        // Verify data
+        let mut count = 0;
+        run_query_on_row(&tmp_db, &conn, "SELECT * FROM users ORDER BY id", |row: &Row| {
+            count += 1;
+            match row.get::<i64>(0).unwrap() {
+                1 => {
+                    assert_eq!(row.get::<String>(1).unwrap(), "Alice");
+                    assert_eq!(row.get::<i64>(2).unwrap(), 30);
+                }
+                2 => {
+                    assert_eq!(row.get::<String>(1).unwrap(), "Bob");
+                    assert_eq!(row.get::<i64>(2).unwrap(), 25);
+                }
+                3 => {
+                    assert_eq!(row.get::<String>(1).unwrap(), "Charlie");
+                    assert_eq!(row.get::<i64>(2).unwrap(), 35);
+                }
+                _ => panic!("Unexpected row"),
+            }
+        })?;
+        assert_eq!(count, 3);
+        do_flush(&conn, &tmp_db)?;
+    }
+
+    // Verify data can be read back with correct key
+    {
+        let uri = format!(
+            "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
+            db_path.to_str().unwrap()
+        );
+        let (_io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
+        )?;
+
+        let mut count = 0;
+        run_query_on_row(&tmp_db, &conn, "SELECT COUNT(*) FROM users", |row: &Row| {
+            count = row.get::<i64>(0).unwrap();
+        })?;
+        assert_eq!(count, 3);
+    }
+
+    Ok(())
+}
+
+/// Test database persistence and recovery after reopen with encryption in MVCC mode.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_encryption_reopen(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let db_path = tmp_db.path.clone();
+    let opts = tmp_db.db_opts;
+
+    // Create database and insert data
+    {
+        let conn = tmp_db.connect_limbo();
+        run_query(
+            &tmp_db,
+            &conn,
+            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        )?;
+        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT);",
+        )?;
+        run_query(&tmp_db, &conn, "INSERT INTO test VALUES (1, 'first');")?;
+        run_query(&tmp_db, &conn, "INSERT INTO test VALUES (2, 'second');")?;
+        do_flush(&conn, &tmp_db)?;
+    }
+
+    // Reopen and add more data
+    {
+        let uri = format!(
+            "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
+            db_path.to_str().unwrap()
+        );
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        run_query(&tmp_db, &conn, "INSERT INTO test VALUES (3, 'third');")?;
+        do_flush(&conn, &tmp_db)?;
+    }
+
+    // Reopen again and verify all data
+    {
+        let uri = format!(
+            "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
+            db_path.to_str().unwrap()
+        );
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+
+        let mut rows = Vec::new();
+        run_query_on_row(&tmp_db, &conn, "SELECT * FROM test ORDER BY id", |row: &Row| {
+            rows.push((row.get::<i64>(0).unwrap(), row.get::<String>(1).unwrap()));
+        })?;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], (1, "first".to_string()));
+        assert_eq!(rows[1], (2, "second".to_string()));
+        assert_eq!(rows[2], (3, "third".to_string()));
+    }
+
+    Ok(())
+}
+
+/// Test UPDATE and DELETE operations with encryption in MVCC mode.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_encryption_updates_deletes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let db_path = tmp_db.path.clone();
+    let opts = tmp_db.db_opts;
+
+    {
+        let conn = tmp_db.connect_limbo();
+        run_query(
+            &tmp_db,
+            &conn,
+            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        )?;
+        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
+
+        run_query(
+            &tmp_db,
+            &conn,
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL);",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "INSERT INTO products VALUES (1, 'Apple', 1.50);",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "INSERT INTO products VALUES (2, 'Banana', 0.75);",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "INSERT INTO products VALUES (3, 'Cherry', 2.00);",
+        )?;
+
+        // Update a row
+        run_query(
+            &tmp_db,
+            &conn,
+            "UPDATE products SET price = 1.75 WHERE id = 1;",
+        )?;
+
+        // Delete a row
+        run_query(&tmp_db, &conn, "DELETE FROM products WHERE id = 2;")?;
+
+        do_flush(&conn, &tmp_db)?;
+    }
+
+    // Reopen and verify changes persisted
+    {
+        let uri = format!(
+            "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
+            db_path.to_str().unwrap()
+        );
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+
+        let mut rows = Vec::new();
+        run_query_on_row(
+            &tmp_db,
+            &conn,
+            "SELECT id, name, price FROM products ORDER BY id",
+            |row: &Row| {
+                rows.push((
+                    row.get::<i64>(0).unwrap(),
+                    row.get::<String>(1).unwrap(),
+                    row.get::<f64>(2).unwrap(),
+                ));
+            },
+        )?;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (1, "Apple".to_string(), 1.75));
+        assert_eq!(rows[1], (3, "Cherry".to_string(), 2.00));
+    }
+
+    Ok(())
+}
+
+/// Test multiple tables with JOINs in encrypted MVCC mode.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_encryption_multiple_tables(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let db_path = tmp_db.path.clone();
+    let opts = tmp_db.db_opts;
+
+    {
+        let conn = tmp_db.connect_limbo();
+        run_query(
+            &tmp_db,
+            &conn,
+            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        )?;
+        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
+
+        // Create multiple tables
+        run_query(
+            &tmp_db,
+            &conn,
+            "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT);",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, author_id INTEGER);",
+        )?;
+
+        // Insert data
+        run_query(&tmp_db, &conn, "INSERT INTO authors VALUES (1, 'Tolkien');")?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "INSERT INTO authors VALUES (2, 'Rowling');",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "INSERT INTO books VALUES (1, 'The Hobbit', 1);",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "INSERT INTO books VALUES (2, 'Harry Potter', 2);",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "INSERT INTO books VALUES (3, 'LOTR', 1);",
+        )?;
+
+        do_flush(&conn, &tmp_db)?;
+    }
+
+    // Reopen and verify with JOIN
+    {
+        let uri = format!(
+            "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
+            db_path.to_str().unwrap()
+        );
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+
+        let mut count = 0;
+        run_query_on_row(
+            &tmp_db,
+            &conn,
+            "SELECT b.title, a.name FROM books b JOIN authors a ON b.author_id = a.id WHERE a.name = 'Tolkien'",
+            |_row: &Row| {
+                count += 1;
+            },
+        )?;
+        assert_eq!(count, 2); // The Hobbit and LOTR
+    }
+
+    Ok(())
+}
+
+/// Test transaction support with encryption in MVCC mode.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_encryption_transactions(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let db_path = tmp_db.path.clone();
+    let opts = tmp_db.db_opts;
+
+    {
+        let conn = tmp_db.connect_limbo();
+        run_query(
+            &tmp_db,
+            &conn,
+            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        )?;
+        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
+
+        run_query(
+            &tmp_db,
+            &conn,
+            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance REAL);",
+        )?;
+        run_query(&tmp_db, &conn, "INSERT INTO accounts VALUES (1, 100.0);")?;
+        run_query(&tmp_db, &conn, "INSERT INTO accounts VALUES (2, 200.0);")?;
+
+        // Transaction with multiple operations
+        run_query(&tmp_db, &conn, "BEGIN;")?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "UPDATE accounts SET balance = balance - 50 WHERE id = 1;",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "UPDATE accounts SET balance = balance + 50 WHERE id = 2;",
+        )?;
+        run_query(&tmp_db, &conn, "COMMIT;")?;
+
+        do_flush(&conn, &tmp_db)?;
+    }
+
+    // Verify transaction was committed
+    {
+        let uri = format!(
+            "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
+            db_path.to_str().unwrap()
+        );
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+
+        let mut balances = Vec::new();
+        run_query_on_row(
+            &tmp_db,
+            &conn,
+            "SELECT id, balance FROM accounts ORDER BY id",
+            |row: &Row| {
+                balances.push((row.get::<i64>(0).unwrap(), row.get::<f64>(1).unwrap()));
+            },
+        )?;
+
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0], (1, 50.0));
+        assert_eq!(balances[1], (2, 250.0));
+    }
+
+    Ok(())
+}
+
+/// Test different cipher modes with encryption in MVCC mode.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_encryption_cipher_modes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let opts = tmp_db.db_opts;
+    let flags = tmp_db.db_flags;
+
+    let test_cases = [
+        ("aes256gcm", "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"),
+        ("aegis128l", "b1bbfda4f589dc9daaf004fe21111e00"),
+    ];
+
+    for (cipher_name, hexkey) in test_cases {
+        let test_db = TempDatabase::builder()
+            .with_opts(opts)
+            .with_flags(flags)
+            .build();
+        let db_path = test_db.path.clone();
+
+        // Create and populate database
+        {
+            let conn = test_db.connect_limbo();
+            run_query(&test_db, &conn, &format!("PRAGMA hexkey = '{hexkey}';"))?;
+            run_query(&test_db, &conn, &format!("PRAGMA cipher = '{cipher_name}';"))?;
+            run_query(
+                &test_db,
+                &conn,
+                "CREATE TABLE cipher_test (id INTEGER PRIMARY KEY, data TEXT);",
+            )?;
+            run_query(
+                &test_db,
+                &conn,
+                &format!("INSERT INTO cipher_test VALUES (1, 'Encrypted with {cipher_name}');"),
+            )?;
+            do_flush(&conn, &test_db)?;
+        }
+
+        // Reopen and verify
+        {
+            let uri = format!(
+                "file:{}?cipher={cipher_name}&hexkey={hexkey}",
+                db_path.to_str().unwrap()
+            );
+            let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+
+            let mut result = String::new();
+            run_query_on_row(&test_db, &conn, "SELECT data FROM cipher_test", |row: &Row| {
+                result = row.get::<String>(0).unwrap();
+            })?;
+            assert_eq!(result, format!("Encrypted with {cipher_name}"));
+        }
+    }
+
+    Ok(())
+}

@@ -3,7 +3,10 @@
 use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
-    storage::sqlite3_ondisk::{read_varint, write_varint_to_vec},
+    storage::{
+        encryption::{CipherMode, EncryptionContext},
+        sqlite3_ondisk::{read_varint, write_varint_to_vec},
+    },
     turso_assert,
     types::{ImmutableRecord, IndexInfo},
     Buffer, Completion, CompletionError, LimboError, Result,
@@ -21,16 +24,24 @@ pub struct LogicalLog {
     /// Size at which we start performing a checkpoint on the logical log.
     /// Set to -1 to disable automatic checkpointing.
     checkpoint_threshold: i64,
+    /// Optional encryption context for encrypting log records
+    encryption_ctx: Option<Arc<EncryptionContext>>,
 }
 
 /// Log's Header, this will be the 64 bytes in any logical log file.
 /// Log header is 64 bytes at maximum, fields added must not exceed that size. If it doesn't exceed
 /// it, any bytes missing will be padded with zeroes.
-#[derive(Debug)]
+///
+/// Header format (64 bytes):
+/// - version: u8 (1 byte) - log format version
+/// - salt: u64 (8 bytes) - random salt
+/// - cipher_id: u8 (1 byte) - 0 = no encryption, 1-8 = cipher mode ID
+/// - padding: remaining bytes to 64
+#[derive(Debug, Clone)]
 struct LogHeader {
     version: u8,
     salt: u64,
-    encrypted: u8, // 0 is no
+    cipher_id: u8,
 }
 
 const LOG_HEADER_MAX_SIZE: usize = 64;
@@ -41,11 +52,31 @@ const LOG_HEADER_PADDING: [u8; LOG_HEADER_MAX_SIZE] = [0; LOG_HEADER_MAX_SIZE];
 const TRANSACTION_HEAD_SIZE: usize = 8 + 8 + 8;
 
 impl LogHeader {
+    pub fn new(cipher_mode: Option<CipherMode>) -> Self {
+        Self {
+            version: 1,
+            salt: 0,
+            cipher_id: cipher_mode.map(|m| m.cipher_id()).unwrap_or(0),
+        }
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.cipher_id != 0
+    }
+
+    pub fn cipher_mode(&self) -> Result<Option<CipherMode>> {
+        if self.cipher_id == 0 {
+            Ok(None)
+        } else {
+            CipherMode::from_cipher_id(self.cipher_id).map(Some)
+        }
+    }
+
     pub fn serialize(&self, buffer: &mut Vec<u8>) {
         let buffer_size_start = buffer.len();
         buffer.push(self.version);
         buffer.extend_from_slice(&self.salt.to_be_bytes());
-        buffer.push(self.encrypted);
+        buffer.push(self.cipher_id);
 
         let header_size_before_padding = buffer.len() - buffer_size_start;
         let padding = 64 - header_size_before_padding;
@@ -60,7 +91,7 @@ impl Default for LogHeader {
         Self {
             version: 1,
             salt: 0,
-            encrypted: 0,
+            cipher_id: 0,
         }
     }
 }
@@ -161,15 +192,59 @@ impl LogicalLog {
             file,
             offset: 0,
             checkpoint_threshold: DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+            encryption_ctx: None,
         }
+    }
+
+    /// Set the encryption context for the logical log.
+    pub fn set_encryption_context(&mut self, ctx: Arc<EncryptionContext>) {
+        self.encryption_ctx = Some(ctx);
+    }
+
+    /// Get the encryption context.
+    pub fn encryption_context(&self) -> Option<&Arc<EncryptionContext>> {
+        self.encryption_ctx.as_ref()
+    }
+
+    /// Encrypt a record payload using the configured cipher
+    #[cfg(feature = "encryption")]
+    fn encrypt_record(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        let ctx = self
+            .encryption_ctx
+            .as_ref()
+            .ok_or_else(|| LimboError::InternalError("Encryption context not set".into()))?;
+        ctx.encrypt_raw_with_ad(plaintext, ad)
+    }
+
+    /// Decrypt a record payload using the configured cipher
+    #[cfg(feature = "encryption")]
+    fn decrypt_record(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
+        let ctx = self
+            .encryption_ctx
+            .as_ref()
+            .ok_or_else(|| LimboError::InternalError("Encryption context not set".into()))?;
+        ctx.decrypt_raw_with_ad(ciphertext, nonce, ad)
     }
 
     pub fn log_tx(&mut self, tx: &LogRecord) -> Result<Completion> {
         let mut buffer = Vec::new();
 
+        // Check if encryption is enabled
+        #[cfg(feature = "encryption")]
+        let is_encrypted = self.encryption_ctx.is_some();
+        #[cfg(not(feature = "encryption"))]
+        let is_encrypted = false;
+
         // 1. Serialize log header if it's first write
         let is_first_write = self.offset == 0;
         if is_first_write {
+            #[cfg(feature = "encryption")]
+            let header = if let Some(ctx) = &self.encryption_ctx {
+                LogHeader::new(Some(ctx.cipher_mode()))
+            } else {
+                LogHeader::default()
+            };
+            #[cfg(not(feature = "encryption"))]
             let header = LogHeader::default();
             header.serialize(&mut buffer);
         }
@@ -181,10 +256,27 @@ impl LogicalLog {
         let buffer_pos_for_rows_size = buffer.len();
 
         // 3. Serialize rows (both table and index rows)
-        tx.row_versions.iter().for_each(|row_version| {
-            let row_type = LogRecordType::from_row_version(row_version);
-            row_type.serialize(&mut buffer, row_version);
-        });
+        #[cfg(feature = "encryption")]
+        if is_encrypted {
+            for row_version in &tx.row_versions {
+                let row_type = LogRecordType::from_row_version(row_version);
+                self.serialize_encrypted_row(&mut buffer, &row_type, row_version)?;
+            }
+        } else {
+            tx.row_versions.iter().for_each(|row_version| {
+                let row_type = LogRecordType::from_row_version(row_version);
+                row_type.serialize(&mut buffer, row_version);
+            });
+        }
+
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = is_encrypted;
+            tx.row_versions.iter().for_each(|row_version| {
+                let row_type = LogRecordType::from_row_version(row_version);
+                row_type.serialize(&mut buffer, row_version);
+            });
+        }
 
         // 4. Serialize transaction's end marker and rows size. This marker will be the position of the offset
         //    after writing the buffer.
@@ -216,6 +308,68 @@ impl LogicalLog {
         let c = self.file.pwrite(self.offset, buffer, c)?;
         self.offset += buffer_len as u64;
         Ok(c)
+    }
+
+    /// Encrypted row format:
+    /// - table_id (i64, 8 bytes) - plaintext, used as AD
+    /// - row_kind (u8) - plaintext, used as AD
+    /// - record_type (u8) - plaintext, used as AD
+    /// - nonce (variable, based on cipher)
+    /// - encrypted_payload_size (u64)
+    /// - encrypted_payload (ciphertext + tag)
+    #[cfg(feature = "encryption")]
+    fn serialize_encrypted_row(
+        &self,
+        buffer: &mut Vec<u8>,
+        row_type: &LogRecordType,
+        row_version: &RowVersion,
+    ) -> Result<()> {
+        let table_id_i64: i64 = row_version.row.id.table_id.into();
+        assert!(
+            table_id_i64 < 0,
+            "table_id_i64 should be negative, but got {table_id_i64}"
+        );
+
+        // Determine row kind: 0 = table row, 1 = index row
+        let row_kind = match &row_version.row.id.row_id {
+            RowKey::Int(_) => 0u8,
+            RowKey::Record(_) => 1u8,
+        };
+
+        // Build associated data (AD) from table_id, row_kind, record_type
+        let mut ad = Vec::with_capacity(10);
+        ad.extend_from_slice(&table_id_i64.to_be_bytes());
+        ad.push(row_kind);
+        ad.push(row_type.as_u8());
+
+        // Serialize the payload to be encrypted
+        let mut plaintext = Vec::new();
+        match &row_version.row.id.row_id {
+            RowKey::Int(rowid) => {
+                write_varint_to_vec(*rowid as u64, &mut plaintext);
+                let data = row_version.row.payload();
+                write_varint_to_vec(data.len() as u64, &mut plaintext);
+                plaintext.extend_from_slice(data);
+            }
+            RowKey::Record(sortable_key) => {
+                let key_bytes = sortable_key.key.as_blob();
+                write_varint_to_vec(key_bytes.len() as u64, &mut plaintext);
+                plaintext.extend_from_slice(key_bytes);
+            }
+        }
+
+        // Encrypt the payload
+        let (ciphertext, nonce) = self.encrypt_record(&plaintext, &ad)?;
+
+        // Write to buffer: table_id, row_kind, record_type (the AD), then nonce, then ciphertext size, then ciphertext
+        buffer.extend_from_slice(&table_id_i64.to_be_bytes());
+        buffer.push(row_kind);
+        buffer.push(row_type.as_u8());
+        buffer.extend_from_slice(&nonce);
+        buffer.extend_from_slice(&(ciphertext.len() as u64).to_be_bytes());
+        buffer.extend_from_slice(&ciphertext);
+
+        Ok(())
     }
 
     pub fn sync(&mut self) -> Result<Completion> {
@@ -276,13 +430,15 @@ pub struct StreamingLogicalLogReader {
     /// Offset to read from file
     pub offset: usize,
     /// Log Header
-    header: Option<Arc<LogHeader>>,
+    header: Option<Arc<RwLock<LogHeader>>>,
     /// Cached buffer after io read
     buffer: Arc<RwLock<Vec<u8>>>,
     /// Position to read from loaded buffer
     buffer_offset: usize,
     file_size: usize,
     state: StreamingState,
+    /// Optional encryption context for decrypting log records
+    encryption_ctx: Option<Arc<EncryptionContext>>,
 }
 
 impl StreamingLogicalLogReader {
@@ -296,14 +452,29 @@ impl StreamingLogicalLogReader {
             buffer_offset: 0,
             file_size,
             state: StreamingState::NeedTransactionStart,
+            encryption_ctx: None,
         }
+    }
+
+    /// Set the encryption context for decrypting log records.
+    pub fn set_encryption_context(&mut self, ctx: Arc<EncryptionContext>) {
+        self.encryption_ctx = Some(ctx);
+    }
+
+    /// Check if encryption is enabled (based on header).
+    pub fn is_encrypted(&self) -> bool {
+        self.header
+            .as_ref()
+            .map(|h| h.read().is_encrypted())
+            .unwrap_or(false)
     }
 
     pub fn read_header(&mut self) -> Result<Completion> {
         let header_buf = Arc::new(Buffer::new_temporary(LOG_HEADER_MAX_SIZE));
         let header = Arc::new(RwLock::new(LogHeader::default()));
+        let header_clone = header.clone();
+        self.header = Some(header_clone);
         let completion: Box<ReadComplete> = Box::new(move |res| {
-            let header = header.clone();
             let mut header = header.write();
             let Ok((buf, bytes_read)) = res else {
                 tracing::error!("couldn't ready log err={:?}", res,);
@@ -322,12 +493,140 @@ impl StreamingLogicalLogReader {
             header.salt = u64::from_be_bytes([
                 buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
             ]);
-            header.encrypted = buf[9];
+            header.cipher_id = buf[9];
             tracing::trace!("LogicalLog header={:?}", header);
         });
         let c = Completion::new_read(header_buf, completion);
         self.offset += LOG_HEADER_MAX_SIZE;
         self.file.pread(0, c)
+    }
+
+    /// Read and decrypt an encrypted payload
+    #[cfg(feature = "encryption")]
+    fn read_encrypted_payload(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+        ad: &[u8],
+    ) -> Result<(Vec<u8>, usize)> {
+        // Clone the Arc to avoid borrow checker issues
+        let ctx = self
+            .encryption_ctx
+            .clone()
+            .ok_or_else(|| LimboError::InternalError("Encryption context not set".into()))?;
+
+        let nonce_size = ctx.cipher_mode().nonce_size();
+
+        // Read nonce
+        let nonce = self.consume_buffer(io, nonce_size)?;
+
+        // Read encrypted payload size
+        let encrypted_size = self.consume_u64(io)? as usize;
+
+        // Read encrypted payload (ciphertext + tag)
+        let ciphertext = self.consume_buffer(io, encrypted_size)?;
+
+        // Decrypt
+        let plaintext = ctx.decrypt_raw_with_ad(&ciphertext, &nonce, ad)?;
+
+        // Total bytes read: nonce_size + 8 (payload_size) + encrypted_size
+        let bytes_read = nonce_size + 8 + encrypted_size;
+        Ok((plaintext, bytes_read))
+    }
+
+    /// Parse decrypted payload to build the row
+    fn parse_row_payload(
+        &self,
+        payload: &[u8],
+        table_id: MVTableId,
+        row_kind: u8,
+        record_type: LogRecordType,
+        get_index_info: &mut impl FnMut(MVTableId) -> Result<Arc<IndexInfo>>,
+    ) -> Result<StreamingResult> {
+        let is_table_row = row_kind == 0;
+
+        let mut offset = 0;
+        match record_type {
+            LogRecordType::DeleteRow => {
+                if is_table_row {
+                    let (rowid, nrowid) = read_varint(&payload[offset..])?;
+                    offset += nrowid;
+                    let (payload_size, npayload) = read_varint(&payload[offset..])?;
+                    offset += npayload;
+                    let buffer = payload[offset..offset + payload_size as usize].to_vec();
+                    let record = ImmutableRecord::from_bin_record(buffer.clone());
+                    let column_count = record.column_count();
+
+                    let row = Row::new_table_row(
+                        RowID::new(table_id, RowKey::Int(rowid as i64)),
+                        buffer,
+                        column_count,
+                    );
+                    Ok(StreamingResult::DeleteTableRow {
+                        rowid: RowID::new(table_id, RowKey::Int(rowid as i64)),
+                        row,
+                    })
+                } else {
+                    let (key_size, nkey) = read_varint(&payload[offset..])?;
+                    offset += nkey;
+                    let key_bytes = payload[offset..offset + key_size as usize].to_vec();
+
+                    let key_record = ImmutableRecord::from_bin_record(key_bytes);
+                    let column_count = key_record.column_count();
+
+                    let index_info = get_index_info(table_id)?;
+                    let key = SortableIndexKey::new_from_record(key_record, index_info);
+
+                    let row = Row::new_index_row(
+                        RowID::new(table_id, RowKey::Record(key.clone())),
+                        column_count,
+                    );
+                    Ok(StreamingResult::DeleteIndexRow {
+                        rowid: RowID::new(table_id, RowKey::Record(key)),
+                        row,
+                    })
+                }
+            }
+            LogRecordType::InsertRow => {
+                if is_table_row {
+                    let (rowid, nrowid) = read_varint(&payload[offset..])?;
+                    offset += nrowid;
+                    let (payload_size, npayload) = read_varint(&payload[offset..])?;
+                    offset += npayload;
+                    let buffer = payload[offset..offset + payload_size as usize].to_vec();
+                    let record = ImmutableRecord::from_bin_record(buffer.clone());
+                    let column_count = record.column_count();
+
+                    let row = Row::new_table_row(
+                        RowID::new(table_id, RowKey::Int(rowid as i64)),
+                        buffer,
+                        column_count,
+                    );
+                    Ok(StreamingResult::InsertTableRow {
+                        rowid: RowID::new(table_id, RowKey::Int(rowid as i64)),
+                        row,
+                    })
+                } else {
+                    let (key_size, nkey) = read_varint(&payload[offset..])?;
+                    offset += nkey;
+                    let key_bytes = payload[offset..offset + key_size as usize].to_vec();
+
+                    let key_record = ImmutableRecord::from_bin_record(key_bytes);
+                    let column_count = key_record.column_count();
+
+                    let index_info = get_index_info(table_id)?;
+                    let key = SortableIndexKey::new_from_record(key_record, index_info);
+
+                    let row = Row::new_index_row(
+                        RowID::new(table_id, RowKey::Record(key.clone())),
+                        column_count,
+                    );
+                    Ok(StreamingResult::InsertIndexRow {
+                        rowid: RowID::new(table_id, RowKey::Record(key)),
+                        row,
+                    })
+                }
+            }
+        }
     }
 
     /// Reads next record in log.
@@ -365,12 +664,12 @@ impl StreamingLogicalLogReader {
                         self.state = StreamingState::NeedTransactionStart;
                         continue;
                     }
+
+                    // Read common header: table_id, row_kind, record_type
                     let table_id_i64 = self.consume_i64(io)?;
                     let table_id = MVTableId::from(table_id_i64);
                     let row_kind = self.consume_u8(io)?;
-                    let record_type = self.consume_u8(io)?;
-                    let _payload_size = self.consume_u64(io)?;
-                    let mut bytes_read_on_row = 18; // table_id, row_kind, record_type and payload_size
+                    let record_type_u8 = self.consume_u8(io)?;
 
                     let is_table_row = row_kind == 0;
                     let is_index_row = row_kind == 1;
@@ -381,9 +680,53 @@ impl StreamingLogicalLogReader {
                         )));
                     }
 
-                    match LogRecordType::from_u8(record_type)
-                        .unwrap_or_else(|| panic!("invalid record type: {record_type}"))
-                    {
+                    let record_type = LogRecordType::from_u8(record_type_u8)
+                        .unwrap_or_else(|| panic!("invalid record type: {record_type_u8}"));
+
+                    // Check if encrypted
+                    #[cfg(feature = "encryption")]
+                    let is_encrypted = self.is_encrypted();
+                    #[cfg(not(feature = "encryption"))]
+                    let is_encrypted = false;
+
+                    #[cfg(feature = "encryption")]
+                    if is_encrypted {
+                        // Encrypted record: 10 bytes header read so far (table_id + row_kind + record_type)
+                        let mut bytes_read_on_row = 10;
+
+                        // Build AD from the header bytes
+                        let mut ad = Vec::with_capacity(10);
+                        ad.extend_from_slice(&table_id_i64.to_be_bytes());
+                        ad.push(row_kind);
+                        ad.push(record_type_u8);
+
+                        // Read and decrypt the payload
+                        let (payload, encrypted_bytes_read) =
+                            self.read_encrypted_payload(io, &ad)?;
+                        bytes_read_on_row += encrypted_bytes_read;
+
+                        self.state = StreamingState::NeedRow {
+                            transaction_size,
+                            transaction_read_bytes: transaction_read_bytes + bytes_read_on_row,
+                        };
+
+                        return self.parse_row_payload(
+                            &payload,
+                            table_id,
+                            row_kind,
+                            record_type,
+                            &mut get_index_info,
+                        );
+                    }
+
+                    // Unencrypted record (original logic)
+                    #[cfg(not(feature = "encryption"))]
+                    let _ = is_encrypted;
+
+                    let _payload_size = self.consume_u64(io)?;
+                    let mut bytes_read_on_row = 18; // table_id, row_kind, record_type and payload_size
+
+                    match record_type {
                         LogRecordType::DeleteRow => {
                             if is_table_row {
                                 let (rowid, nrowid) = self.consume_varint(io)?;

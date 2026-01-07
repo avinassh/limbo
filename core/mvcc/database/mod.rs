@@ -1201,6 +1201,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Set the encryption context for the MVCC storage.
+    pub fn set_encryption_context(
+        &self,
+        ctx: Arc<crate::storage::encryption::EncryptionContext>,
+    ) {
+        self.storage.set_encryption_context(ctx);
+    }
+
     /// Get the table ID from the root page.
     /// If the root page is negative, it is a non-checkpointed table and the table ID and root page are both the same negative value.
     /// If the root page is positive, it is a checkpointed table and there should be a corresponding table ID.
