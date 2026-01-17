@@ -3,6 +3,17 @@ export interface DatabaseOpts {
     fileMustExist?: boolean,
     timeout?: number
     tracing?: 'info' | 'debug' | 'trace'
+    /**
+     * Optional local encryption cipher algorithm
+     * Supported ciphers: 'aes128gcm', 'aes256gcm', 'aegis256', 'aegis256x2', 'aegis256x4', 'aegis128l', 'aegis128x2', 'aegis128x4'
+     * Requires encryptionHexkey to be set as well
+     */
+    encryptionCipher?: string,
+    /**
+     * Optional local encryption key as a hexadecimal string
+     * Requires encryptionCipher to be set as well
+     */
+    encryptionHexkey?: string
 }
 
 export interface NativeDatabase {

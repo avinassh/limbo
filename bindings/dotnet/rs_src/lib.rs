@@ -97,10 +97,64 @@ pub unsafe extern "C" fn db_open(
     path_ptr: *const c_char,
     error_ptr: *mut Error,
 ) -> *const Database {
+    db_open_with_encryption(path_ptr, null(), null(), error_ptr)
+}
+
+/// Opens a database at the specified path with optional encryption and returns a pointer to the database.
+/// If an error occurred, returns null and writes a pointer to a null-terminated string into `error_ptr`.
+///
+/// # Safety
+///
+/// - The returned database pointer must be freed with `db_close`.
+/// - Any error string written to `error_ptr` must be freed with `free_string`.
+/// - `path_ptr` must not be null and must point to a valid null-terminated UTF-8 string.
+/// - `cipher_ptr` and `hexkey_ptr` can be null (no encryption) or must point to valid null-terminated UTF-8 strings.
+/// - `error_ptr` must not be null and must point to a valid writable location.
+#[no_mangle]
+pub unsafe extern "C" fn db_open_with_encryption(
+    path_ptr: *const c_char,
+    cipher_ptr: *const c_char,
+    hexkey_ptr: *const c_char,
+    error_ptr: *mut Error,
+) -> *const Database {
     let path_cstr: &CStr = unsafe { CStr::from_ptr(path_ptr) };
     let path_str = path_cstr.to_str();
 
-    let connection_result = Connection::from_uri(path_str.unwrap(), DatabaseOpts::new());
+    // Build URI with encryption parameters if provided
+    let uri = if !cipher_ptr.is_null() && !hexkey_ptr.is_null() {
+        let cipher_cstr: &CStr = unsafe { CStr::from_ptr(cipher_ptr) };
+        let cipher_str = match cipher_cstr.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                unsafe {
+                    *error_ptr = allocate_string(format!("Invalid cipher parameter: {e}").as_str())
+                }
+                return null();
+            }
+        };
+
+        let hexkey_cstr: &CStr = unsafe { CStr::from_ptr(hexkey_ptr) };
+        let hexkey_str = match hexkey_cstr.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                unsafe {
+                    *error_ptr = allocate_string(format!("Invalid hexkey parameter: {e}").as_str())
+                }
+                return null();
+            }
+        };
+
+        format!(
+            "file:{}?cipher={}&hexkey={}",
+            path_str.unwrap(),
+            cipher_str,
+            hexkey_str
+        )
+    } else {
+        path_str.unwrap().to_string()
+    };
+
+    let connection_result = Connection::from_uri(&uri, DatabaseOpts::new());
     match connection_result {
         Ok((io, val)) => allocate(Database {
             io,

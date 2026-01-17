@@ -19,6 +19,17 @@ public static class TursoBindings
         return TursoDatabaseHandle.FromPtr(dbPtr);
     }
 
+    public static TursoDatabaseHandle OpenDatabase(string path, string? cipher, string? hexkey)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+
+        var dbPtr = TursoInterop.OpenDatabaseWithEncryption(path, cipher, hexkey, out var errorPtr);
+        if (errorPtr != IntPtr.Zero)
+            ThrowException(errorPtr);
+
+        return TursoDatabaseHandle.FromPtr(dbPtr);
+    }
+
     public static TursoStatementHandle PrepareStatement(TursoDatabaseHandle db, string sql)
     {
         db.ThrowIfInvalid();

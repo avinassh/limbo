@@ -123,6 +123,12 @@ pub struct DatabaseOpts {
     pub timeout: Option<u32>,
     pub file_must_exist: Option<bool>,
     pub tracing: Option<String>,
+    /// Optional local encryption cipher (e.g., "aegis256", "aes256gcm")
+    /// Requires encryption_hexkey to be set as well
+    pub encryption_cipher: Option<String>,
+    /// Optional local encryption key as a hexadecimal string
+    /// Requires encryption_cipher to be set as well
+    pub encryption_hexkey: Option<String>,
 }
 
 fn step_sync(stmt: &Arc<RefCell<turso_core::Statement>>) -> napi::Result<u32> {
@@ -162,6 +168,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
 
     let mut flags = turso_core::OpenFlags::Create;
     let mut busy_timeout = None;
+    let mut encryption_opts = None;
     if let Some(opts) = &db.opts {
         if opts.readonly == Some(true) {
             flags.set(turso_core::OpenFlags::ReadOnly, true);
@@ -173,6 +180,13 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         if let Some(timeout) = opts.timeout {
             busy_timeout = Some(std::time::Duration::from_millis(timeout as u64));
         }
+        // Parse encryption options if both cipher and hexkey are provided
+        if let (Some(cipher), Some(hexkey)) = (&opts.encryption_cipher, &opts.encryption_hexkey) {
+            encryption_opts = Some(turso_core::EncryptionOpts {
+                cipher: cipher.clone(),
+                hexkey: hexkey.clone(),
+            });
+        }
     }
     let io = &db.io;
     let db_core = turso_core::Database::open_file_with_flags(
@@ -180,7 +194,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         &db.path,
         flags,
         turso_core::DatabaseOpts::new(),
-        None,
+        encryption_opts,
     )
     .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
 

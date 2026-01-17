@@ -50,7 +50,9 @@ public class TursoConnectionOptions
         "Recursive Triggers",
         "Default Timeout",
         "Pooling",
-        "Vfs"
+        "Vfs",
+        "Encryption Cipher",
+        "Encryption Hexkey"
     ];
 
     public static TursoConnectionOptions Parse(string connectionString)

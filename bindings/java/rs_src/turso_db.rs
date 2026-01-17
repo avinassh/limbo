@@ -42,6 +42,8 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openUtf8<'local>(
     obj: JObject<'local>,
     file_path_byte_arr: JByteArray<'local>,
     _open_flags: jint,
+    cipher_byte_arr: JByteArray<'local>,
+    hexkey_byte_arr: JByteArray<'local>,
 ) -> jlong {
     let io = match turso_core::PlatformIO::new() {
         Ok(io) => Arc::new(io),
@@ -68,7 +70,54 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openUtf8<'local>(
         }
     };
 
-    let db = match Database::open_file(io.clone(), &path) {
+    // Parse encryption options if provided
+    let encryption_opts = if !cipher_byte_arr.is_null() && !hexkey_byte_arr.is_null() {
+        let cipher = match env
+            .convert_byte_array(cipher_byte_arr)
+            .map_err(|e| e.to_string())
+        {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+                    return -1;
+                }
+            },
+            Err(e) => {
+                set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+                return -1;
+            }
+        };
+
+        let hexkey = match env
+            .convert_byte_array(hexkey_byte_arr)
+            .map_err(|e| e.to_string())
+        {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+                    return -1;
+                }
+            },
+            Err(e) => {
+                set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+                return -1;
+            }
+        };
+
+        Some(turso_core::EncryptionOpts { cipher, hexkey })
+    } else {
+        None
+    };
+
+    let db = match Database::open_file_with_flags(
+        io.clone(),
+        &path,
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+        encryption_opts,
+    ) {
         Ok(db) => db,
         Err(e) => {
             set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
