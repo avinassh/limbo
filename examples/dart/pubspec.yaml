@@ -1,0 +1,13 @@
+name: turso_encryption_example
+description: Example demonstrating local database encryption with Turso Dart SDK
+version: 1.0.0
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  turso_dart:
+    path: ../../bindings/dart
+
+dev_dependencies:
+  lints: ^3.0.0

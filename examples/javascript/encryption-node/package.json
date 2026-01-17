@@ -1,0 +1,21 @@
+{
+  "name": "turso-encryption-example",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Example demonstrating local database encryption with Turso JavaScript SDK",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "keywords": [
+    "turso",
+    "database",
+    "encryption",
+    "sqlite"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@tursodatabase/database": "workspace:*"
+  }
+}
