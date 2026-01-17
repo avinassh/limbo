@@ -273,3 +273,54 @@ test('example-2', async () => {
         { name: 'Bob', email: 'bob@example.com' }
     ]);
 })
+
+test('local-encryption', async () => {
+    const path = `test-encrypted-${(Math.random() * 10000) | 0}.db`;
+    const cipher = 'aegis256';
+    const hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
+
+    try {
+        // Create and write to encrypted database
+        const db1 = await connect(path, {
+            encryptionCipher: cipher,
+            encryptionHexkey: hexkey
+        });
+
+        // Enable encryption experimental feature
+        await db1.exec("PRAGMA experimental_features = 'encryption'");
+
+        // Create table and insert data
+        await db1.exec("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)");
+        await db1.exec("INSERT INTO test (value) VALUES ('secret data')");
+
+        // Verify data can be read
+        const rows1 = await db1.prepare("SELECT * FROM test").all();
+        expect(rows1).toEqual([{ id: 1, value: 'secret data' }]);
+
+        // Flush to disk
+        await db1.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        db1.close();
+
+        // Reopen with correct encryption key
+        const db2 = await connect(path, {
+            encryptionCipher: cipher,
+            encryptionHexkey: hexkey
+        });
+
+        // Enable encryption experimental feature
+        await db2.exec("PRAGMA experimental_features = 'encryption'");
+
+        // Verify data can still be read
+        const rows2 = await db2.prepare("SELECT * FROM test").all();
+        expect(rows2).toEqual([{ id: 1, value: 'secret data' }]);
+
+        db2.close();
+    } finally {
+        try {
+            unlinkSync(path);
+        } catch (_) { }
+        try {
+            unlinkSync(`${path}-wal`);
+        } catch (_) { }
+    }
+})
