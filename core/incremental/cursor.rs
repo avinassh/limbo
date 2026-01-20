@@ -315,7 +315,6 @@ mod tests {
                 enable_autovacuum: false,
                 enable_triggers: false,
             },
-            None,
         )?;
         let conn = db.connect()?;
 

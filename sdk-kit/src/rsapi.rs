@@ -585,7 +585,6 @@ impl TursoDatabase {
             db_file,
             open_flags,
             opts,
-            self.config.encryption.clone(),
         )?;
         *inner_db = Some(db);
         Ok(())
@@ -601,6 +600,13 @@ impl TursoDatabase {
             ));
         };
         let connection = db.connect()?;
+
+        // Set encryption via PRAGMA if configured
+        if let Some(ref encryption) = self.config.encryption {
+            let _ = connection.pragma_update("cipher", format!("'{}'", encryption.cipher));
+            let _ = connection.pragma_update("hexkey", format!("'{}'", encryption.hexkey));
+        }
+
         Ok(TursoConnection::new(&self.config, connection))
     }
 

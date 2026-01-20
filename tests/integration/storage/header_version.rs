@@ -66,7 +66,6 @@ fn open_with_limbo_and_check(db_path: &Path, enable_mvcc: bool) -> (u8, u8) {
         db_path.to_str().unwrap(),
         OpenFlags::default(),
         opts,
-        None,
     )
     .expect("Failed to open database with limbo");
 
@@ -242,7 +241,6 @@ fn test_mvcc_db_opened_with_mvcc_stays_mvcc() {
 fn create_wal_db_with_pending_wal(db_path: &Path) {
     // Use exclusive locking mode to prevent automatic checkpoint on close
     let conn = rusqlite::Connection::open(db_path).unwrap();
-    conn.pragma_update(None, "journal_mode", "wal").unwrap();
     // Disable automatic checkpointing
     conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", ())
@@ -314,7 +312,6 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
             db_path.to_str().unwrap(),
             OpenFlags::default(),
             opts,
-            None,
         )
         .expect("Failed to open database with limbo (non-MVCC)");
 
@@ -347,7 +344,6 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
         db_path.to_str().unwrap(),
         OpenFlags::default(),
         opts,
-        None,
     )
     .expect("Failed to open database with limbo (MVCC enabled)");
 
@@ -423,7 +419,6 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
             db_path.to_str().unwrap(),
             OpenFlags::default(),
             opts,
-            None,
         )
         .expect("Failed to open database with limbo");
 
@@ -456,7 +451,6 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
         db_path.to_str().unwrap(),
         OpenFlags::default(),
         opts,
-        None,
     )
     .expect("Failed to open MVCC database with limbo");
 
@@ -532,7 +526,6 @@ fn test_pragma_journal_mode_multiple_switches() {
         db_path.to_str().unwrap(),
         OpenFlags::default(),
         opts,
-        None,
     )
     .expect("Failed to open database");
 
@@ -641,7 +634,6 @@ fn test_pragma_journal_mode_query() {
         db_path.to_str().unwrap(),
         OpenFlags::default(),
         opts,
-        None,
     )
     .expect("Failed to open database");
 
@@ -668,7 +660,6 @@ fn test_pragma_journal_mode_query() {
         db_path.to_str().unwrap(),
         OpenFlags::default(),
         opts,
-        None,
     )
     .expect("Failed to open database");
 
@@ -714,7 +705,6 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
             db_path.to_str().unwrap(),
             OpenFlags::default(),
             opts,
-            None,
         )
         .expect("Failed to open database");
 
@@ -742,7 +732,6 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
             db_path.to_str().unwrap(),
             OpenFlags::default(),
             opts,
-            None,
         )
         .expect("Failed to reopen database");
 
@@ -775,7 +764,6 @@ fn open_with_limbo_readonly_and_check(db_path: &Path, enable_mvcc: bool) -> (u8,
         db_path.to_str().unwrap(),
         OpenFlags::ReadOnly,
         opts,
-        None,
     )
     .expect("Failed to open database with limbo in readonly mode");
 
@@ -903,7 +891,6 @@ fn test_readonly_pragma_journal_mode_cannot_change() {
         db_path.to_str().unwrap(),
         OpenFlags::ReadOnly,
         opts,
-        None,
     )
     .expect("Failed to open database in readonly mode");
 
@@ -953,7 +940,6 @@ fn test_readonly_mvcc_db_can_be_read() {
             db_path.to_str().unwrap(),
             OpenFlags::default(),
             opts,
-            None,
         )
         .expect("Failed to open database");
 
@@ -985,7 +971,6 @@ fn test_readonly_mvcc_db_can_be_read() {
         db_path.to_str().unwrap(),
         OpenFlags::ReadOnly,
         opts,
-        None,
     )
     .expect("Failed to open MVCC database in readonly mode");
 

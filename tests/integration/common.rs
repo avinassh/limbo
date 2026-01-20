@@ -113,14 +113,8 @@ impl TempDatabaseBuilder {
         }
 
         let io = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            db_path.to_str().unwrap(),
-            flags,
-            opts,
-            None,
-        )
-        .unwrap();
+        let db = Database::open_file_with_flags(io.clone(), db_path.to_str().unwrap(), flags, opts)
+            .unwrap();
 
         // Enable MVCC via turso connection if requested
         if self.enable_mvcc {

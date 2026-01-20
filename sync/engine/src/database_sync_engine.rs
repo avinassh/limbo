@@ -500,7 +500,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             main_db_storage,
             OpenFlags::Create,
             turso_core::DatabaseOpts::new(),
-            None,
         )?;
         Self::open_db(coro, io, sync_engine_io, main_db, opts).await
     }
@@ -513,7 +512,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.db_file.clone(),
             OpenFlags::Create,
             turso_core::DatabaseOpts::new(),
-            None,
         )?;
         let conn = db.connect()?;
         conn.wal_auto_checkpoint_disable();

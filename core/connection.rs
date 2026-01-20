@@ -18,9 +18,9 @@ use crate::{
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTransactionState, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesMode, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    TransactionState, Trigger, Value, VirtualTable,
+    EncryptionKey, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode,
+    QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, TransactionState, Trigger,
+    Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap;
@@ -535,12 +535,12 @@ impl Connection {
         let flags = opts.get_flags()?;
         if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
             let io = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(io.clone(), MEMORY_PATH, flags, db_opts, None)?;
+            let db = Database::open_file_with_flags(io.clone(), MEMORY_PATH, flags, db_opts)?;
             let conn = db.connect()?;
             return Ok((io, conn));
         }
-        let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
-            (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
+        // Validate encryption parameters are complete if either is provided
+        match (&opts.cipher, &opts.hexkey) {
             (Some(_), None) => {
                 return Err(LimboError::InvalidArgument(
                     "hexkey is required when cipher is provided".to_string(),
@@ -551,20 +551,15 @@ impl Connection {
                     "cipher is required when hexkey is provided".to_string(),
                 ))
             }
-            (None, None) => None,
+            _ => {}
         };
-        let (io, db) = Database::open_new(
-            &opts.path,
-            opts.vfs.as_ref(),
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-        )?;
+        let (io, db) = Database::open_new(&opts.path, opts.vfs.as_ref(), flags, db_opts)?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof)?;
             std::fs::set_permissions(&opts.path, perms.permissions())?;
         }
         let conn = db.connect()?;
+        // Encryption is set via PRAGMA on the connection
         if let Some(cipher) = opts.cipher {
             let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
         }
@@ -587,7 +582,7 @@ impl Connection {
             flags |= OpenFlags::ReadOnly;
         }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts, None)?;
+        let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts)?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof)?;
             std::fs::set_permissions(&opts.path, perms.permissions())?;

@@ -272,10 +272,6 @@ pub struct Database {
 
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
-
-    // Encryption
-    encryption_key: RwLock<Option<EncryptionKey>>,
-    encryption_cipher_mode: AtomicCipherMode,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -343,7 +339,6 @@ impl Database {
         wal_path: impl Into<String>,
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
-        encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Self> {
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
@@ -358,17 +353,9 @@ impl Database {
             BufferPool::DEFAULT_ARENA_SIZE
         };
 
-        let (encryption_key, encryption_cipher_mode) =
-            if let Some(encryption_opts) = encryption_opts {
-                let key = EncryptionKey::from_hex_string(&encryption_opts.hexkey)?;
-                let cipher = CipherMode::try_from(encryption_opts.cipher.as_str())?;
-                (Some(key), Some(cipher))
-            } else {
-                (None, None)
-            };
-
+        // For empty databases, create a default page 1 (header is not encrypted)
         let init_page_1 = if db_size == 0 {
-            let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
+            let default_page_1 = pager::default_page1(None);
 
             Some(default_page_1)
         } else {
@@ -393,11 +380,6 @@ impl Database {
             n_connections: AtomicUsize::new(0),
 
             init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
-
-            encryption_key: RwLock::new(encryption_key),
-            encryption_cipher_mode: AtomicCipherMode::new(
-                encryption_cipher_mode.unwrap_or(CipherMode::None),
-            ),
         };
 
         db.register_global_builtin_extensions()
@@ -407,7 +389,7 @@ impl Database {
 
     #[cfg(feature = "fs")]
     pub fn open_file(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
-        Self::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)
+        Self::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new())
     }
 
     #[cfg(feature = "fs")]
@@ -416,11 +398,10 @@ impl Database {
         path: &str,
         flags: OpenFlags,
         opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
         let file = io.open_file(path, flags, true)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open_with_flags(io, path, db_file, flags, opts, encryption_opts)
+        Self::open_with_flags(io, path, db_file, flags, opts)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -429,14 +410,7 @@ impl Database {
         path: &str,
         db_file: Arc<dyn DatabaseStorage>,
     ) -> Result<Arc<Database>> {
-        Self::open_with_flags(
-            io,
-            path,
-            db_file,
-            OpenFlags::default(),
-            DatabaseOpts::new(),
-            None,
-        )
+        Self::open_with_flags(io, path, db_file, OpenFlags::default(), DatabaseOpts::new())
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -446,7 +420,6 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
         // turso-sync-engine create 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
@@ -458,7 +431,6 @@ impl Database {
                 db_file,
                 flags,
                 opts,
-                None,
             );
         }
 
@@ -469,38 +441,9 @@ impl Database {
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_else(|| path.to_string());
 
+        // Return cached database if available
         if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
             tracing::debug!("took database {canonical_path:?} from the registry");
-
-            // if we have encryption opts, let's ensure they match
-            {
-                let db_key_guard = db.encryption_key.read();
-                let db_key = db_key_guard.deref();
-
-                match (&encryption_opts, db_key) {
-                    (Some(enc_opts), Some(key)) => {
-                        let expected_key = EncryptionKey::from_hex_string(&enc_opts.hexkey)?;
-                        if expected_key.as_slice() != key.as_slice() {
-                            return Err(LimboError::InvalidArgument(
-                                "Encryption key does not match existing database encryption key"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                    // user provided encryption opts but cached database doesn't have encryption_key set.
-                    // This can happen when encryption was set via PRAGMA (which doesn't update db.encryption_key).
-                    (Some(_), None) => {}
-                    // database is encrypted but user didn't provide encryption opts
-                    (None, Some(_)) => {
-                        return Err(LimboError::InvalidArgument(
-                            "Database is encrypted but no encryption options provided".to_string(),
-                        ));
-                    }
-                    // neither has encryption - OK
-                    (None, None) => {}
-                }
-            }
-
             return Ok(db);
         }
         let db = Self::open_with_flags_bypass_registry_internal(
@@ -510,7 +453,6 @@ impl Database {
             db_file,
             flags,
             opts,
-            encryption_opts,
         )?;
         registry.insert(canonical_path, Arc::downgrade(&db));
         Ok(db)
@@ -525,17 +467,8 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
-        Self::open_with_flags_bypass_registry_internal(
-            io,
-            path,
-            wal_path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-        )
+        Self::open_with_flags_bypass_registry_internal(io, path, wal_path, db_file, flags, opts)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -546,17 +479,8 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
-        let mut db = Self::new(
-            opts,
-            flags,
-            path,
-            wal_path,
-            &io,
-            db_file,
-            encryption_opts.clone(),
-        )?;
+        let mut db = Self::new(opts, flags, path, wal_path, &io, db_file)?;
 
         let pager = db.header_validation()?;
         #[cfg(debug_assertions)]
@@ -806,9 +730,7 @@ impl Database {
             .unwrap_or_default()
             .get();
 
-        let encryption_key = self.encryption_key.read().clone();
-        let encrytion_cipher = self.encryption_cipher_mode.get();
-
+        // Encryption is set via PRAGMA on the connection - not inherited from Database
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
@@ -834,8 +756,8 @@ impl Database {
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
-            encryption_key: RwLock::new(encryption_key.clone()),
-            encryption_cipher_mode: AtomicCipherMode::new(encrytion_cipher),
+            encryption_key: RwLock::new(None),
+            encryption_cipher_mode: AtomicCipherMode::new(CipherMode::None),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
@@ -939,18 +861,10 @@ impl Database {
     }
 
     fn init_pager(&self, requested_page_size: Option<usize>) -> Result<Pager> {
-        let cipher = self.encryption_cipher_mode.get();
-        let encryption_key = self.encryption_key.read();
-        let reserved_bytes = self.maybe_get_reserved_space_bytes()?.or_else(|| {
-            if !matches!(cipher, CipherMode::None) {
-                // For encryption, use the cipher's metadata size
-                Some(cipher.metadata_size() as u8)
-            } else {
-                // For non-encrypted databases, don't set reserved_bytes here.
-                // This allows checksums to be enabled by default (disable_checksums will be false).
-                None
-            }
-        });
+        // Read reserved bytes from header if database is initialized.
+        // Note: Page 1 header is NOT encrypted, so we can read it without encryption keys.
+        // Encryption context is set via PRAGMA on the connection, not here.
+        let reserved_bytes = self.maybe_get_reserved_space_bytes()?;
         let disable_checksums = if let Some(reserved_bytes) = reserved_bytes {
             // if the required reserved bytes for checksums is not present, disable checksums
             reserved_bytes != CHECKSUM_REQUIRED_RESERVED_BYTES
@@ -993,11 +907,6 @@ impl Database {
         }
         if disable_checksums {
             pager.reset_checksum_context();
-        }
-        // Set encryption later after `disable_checksums` as it may reset the `pager.io_ctx`
-        if let Some(encryption_key) = encryption_key.as_ref() {
-            pager.enable_encryption(true);
-            pager.set_encryption_context(cipher, encryption_key)?;
         }
 
         Ok(pager)
@@ -1044,7 +953,6 @@ impl Database {
         vfs: Option<S>,
         flags: OpenFlags,
         opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
     ) -> Result<(Arc<dyn IO>, Arc<Database>)>
     where
         S: AsRef<str> + std::fmt::Display,
@@ -1054,7 +962,7 @@ impl Database {
             .or_else(|| Some(Self::io_for_path(path)))
             .transpose()?
             .unwrap();
-        let db = Self::open_file_with_flags(io.clone(), path, flags, opts, encryption_opts)?;
+        let db = Self::open_file_with_flags(io.clone(), path, flags, opts)?;
         Ok((io, db))
     }
 
@@ -1372,7 +1280,6 @@ mod tests {
                 db_path.to_str().unwrap(),
                 OpenFlags::default(),
                 opts,
-                None,
             )
             .unwrap();
 

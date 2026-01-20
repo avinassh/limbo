@@ -870,7 +870,6 @@ fn test_db_share_same_file() {
         db_file.clone(),
         turso_core::OpenFlags::Create,
         turso_core::DatabaseOpts::new(),
-        None,
     )
     .unwrap();
     let conn1 = db1.connect().unwrap();
@@ -897,7 +896,6 @@ fn test_db_share_same_file() {
         db_file.clone(),
         turso_core::OpenFlags::default(),
         turso_core::DatabaseOpts::new(),
-        None,
     )
     .unwrap();
     let conn2 = db2.connect().unwrap();

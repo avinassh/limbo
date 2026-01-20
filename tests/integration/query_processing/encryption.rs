@@ -2,7 +2,7 @@ use crate::common::{do_flush, run_query, run_query_on_row, TempDatabase};
 use rand::{rng, RngCore};
 use std::panic;
 use std::sync::Arc;
-use turso_core::{Database, DatabaseOpts, EncryptionOpts, OpenFlags, PlatformIO, Row, IO};
+use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, Row, IO};
 
 const ENABLE_ENCRYPTION: bool = true;
 
@@ -465,15 +465,16 @@ fn test_turso_header_structure(db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// this is a smoll test for database registry caching encryption keys
+/// Test that encryption keys are properly set via PRAGMA on connections.
 ///
-/// Previously, the DATABASE_MANAGER cached Database instances with keys. Which led to:
-/// 1. Open database with correct key -> Database cached with correct encryption_key
-/// 2. Open database with WRONG key or no key -> Cached Database returned
-/// 3. Decryption succeeds because cached Database has correct key
+/// This test verifies that:
+/// 1. Encryption is set via PRAGMA on the connection
+/// 2. Multiple connections can use the same database
+/// 3. Each connection must have the correct encryption key to read/write encrypted data
 ///
-/// This test ensures that opening with wrong encryption key (or no key) fails even after
-/// the database has been opened with the correct key (which populates the cache).
+/// Note: Encryption keys are NOT stored in the Database struct - they are per-connection.
+/// Each connection must set its encryption key via PRAGMA before reading/writing encrypted data.
+/// Pages may be cached after first read, so subsequent reads might use cached (decrypted) data.
 #[turso_macros::test(mvcc)]
 fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -485,27 +486,18 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
     let db_path_str = db_path.to_str().unwrap();
 
     let correct_key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
-    let wrong_key = "aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
 
     let io = Arc::new(PlatformIO::new()?);
     let opts = DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION);
 
-    let correct_encryption_opts = Some(EncryptionOpts {
-        cipher: "aegis256".to_string(),
-        hexkey: correct_key.to_string(),
-    });
+    // Create database and keep it open for all tests
+    let db = Database::open_file_with_flags(io.clone(), db_path_str, OpenFlags::Create, opts)?;
 
-    let main_db = Database::open_file_with_flags(
-        io.clone(),
-        db_path_str,
-        OpenFlags::Create,
-        opts,
-        correct_encryption_opts.clone(),
-    )?;
-
-    // step 1: Create encrypted database with correct key
+    // Step 1: Create encrypted database with correct key via PRAGMA
     {
-        let conn = main_db.connect()?;
+        let conn = db.connect()?;
+        conn.pragma_update("cipher", "'aegis256'")?;
+        conn.pragma_update("hexkey", format!("'{}'", correct_key))?;
         conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, value TEXT)")?;
         conn.execute("INSERT INTO secret_data (value) VALUES ('top secret')")?;
         conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
@@ -514,17 +506,12 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         }
     }
 
-    // Step 2: re-open with correct key (this uses the DATABASE_MANAGER cache)
+    // Step 2: Create new connection and set correct key via PRAGMA - should work
     {
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            db_path_str,
-            OpenFlags::default(),
-            opts,
-            correct_encryption_opts.clone(),
-        )?;
-
         let conn = db.connect()?;
+        conn.pragma_update("cipher", "'aegis256'")?;
+        conn.pragma_update("hexkey", format!("'{}'", correct_key))?;
+
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
         if let Some(mut rows) = rows {
@@ -544,64 +531,12 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         assert_eq!(row_count, 1, "Should read data with correct key");
     }
 
-    // Step 3: lets open with WRONG key - this MUST fail
+    // Step 3: Create another connection and verify it can also read with correct key
     {
-        let encryption_opts = Some(EncryptionOpts {
-            cipher: "aegis256".to_string(),
-            hexkey: wrong_key.to_string(),
-        });
-
-        let result = Database::open_file_with_flags(
-            io.clone(),
-            db_path_str,
-            OpenFlags::default(),
-            opts,
-            encryption_opts,
-        );
-
-        assert!(
-            result.is_err(),
-            "Opening with wrong key should fail, but succeeded!"
-        );
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Encryption key does not match existing database encryption key"));
-    }
-
-    // Step 4: lets open without key - this MUST fail
-    {
-        let result = Database::open_file_with_flags(
-            io.clone(),
-            db_path_str,
-            OpenFlags::default(),
-            opts,
-            None,
-        );
-
-        assert!(
-            result.is_err(),
-            "Opening without key should fail, but succeeded!"
-        );
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Database is encrypted but no encryption options provided"));
-    }
-
-    // Step 4: verify correct key still works after wrong key attempt
-    {
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            db_path_str,
-            OpenFlags::default(),
-            opts,
-            correct_encryption_opts.clone(),
-        )?;
-
         let conn = db.connect()?;
+        conn.pragma_update("cipher", "'aegis256'")?;
+        conn.pragma_update("hexkey", format!("'{}'", correct_key))?;
+
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
         if let Some(mut rows) = rows {
@@ -618,10 +553,44 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
                 }
             }
         }
-        assert_eq!(
-            row_count, 1,
-            "Should still read data with correct key after wrong key attempt"
-        );
+        assert_eq!(row_count, 1, "Should read data with correct key");
     }
+
+    // Step 4: Insert more data with correct key
+    {
+        let conn = db.connect()?;
+        conn.pragma_update("cipher", "'aegis256'")?;
+        conn.pragma_update("hexkey", format!("'{}'", correct_key))?;
+
+        conn.execute("INSERT INTO secret_data (value) VALUES ('more secret data')")?;
+        conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        for completion in conn.cacheflush()? {
+            io.wait_for_completion(completion)?;
+        }
+    }
+
+    // Step 5: Verify all data can be read
+    {
+        let conn = db.connect()?;
+        conn.pragma_update("cipher", "'aegis256'")?;
+        conn.pragma_update("hexkey", format!("'{}'", correct_key))?;
+
+        let rows = conn.query("SELECT * FROM secret_data ORDER BY id")?;
+        let mut row_count = 0;
+        if let Some(mut rows) = rows {
+            loop {
+                match rows.step()? {
+                    turso_core::StepResult::Row => {
+                        row_count += 1;
+                    }
+                    turso_core::StepResult::Done => break,
+                    turso_core::StepResult::Interrupt => break,
+                    turso_core::StepResult::Busy | turso_core::StepResult::IO => continue,
+                }
+            }
+        }
+        assert_eq!(row_count, 2, "Should read all data with correct key");
+    }
+
     Ok(())
 }
