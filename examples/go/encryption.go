@@ -37,8 +37,8 @@ const (
 func main() {
 	fmt.Println("=== Turso Local Encryption Example (Go) ===\n")
 
-	// Initialize the turso library
-	turso.InitLibrary(turso_libs.LoadTursoLibraryConfig{})
+	// Initialize the turso library with "mixed" strategy to support all platforms
+	turso.InitLibrary(turso_libs.LoadTursoLibraryConfig{LoadStrategy: "mixed"})
 
 	// Create an encrypted database
 	fmt.Println("1. Creating encrypted database...")
