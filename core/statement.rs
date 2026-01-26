@@ -112,6 +112,18 @@ impl Statement {
         self.program.connection.mv_store()
     }
 
+    /// Take the pending IO completions from this statement.
+    /// Returns None if no IO is pending.
+    /// This is used by async state machines that need to yield the completions.
+    pub fn take_io_completions(&mut self) -> Option<crate::types::IOCompletions> {
+        self.state.io_completions.take()
+    }
+
+    /// Check if this statement has pending IO completions.
+    pub fn has_pending_io(&self) -> bool {
+        self.state.io_completions.is_some()
+    }
+
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && !self
