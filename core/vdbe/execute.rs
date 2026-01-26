@@ -11413,8 +11413,12 @@ pub enum OpVacuumIntoSubState {
     QuerySchema,
     /// Step through schema query to collect rows
     CollectSchemaRows,
-    /// Execute CREATE statements on destination (one at a time)
-    CreateSchemaInDest {
+    /// Prepare CREATE statement on destination
+    PrepareDestSchema {
+        idx: usize,
+    },
+    /// Step through CREATE statement on destination (async)
+    StepDestSchema {
         idx: usize,
     },
     /// Start copying a table - prepare column info query
@@ -11429,8 +11433,16 @@ pub enum OpVacuumIntoSubState {
     StartSelectRows {
         table_idx: usize,
     },
-    /// Step through row selection and insert each row
-    CopyRows {
+    /// Step through source SELECT to get next row
+    StepSourceSelect {
+        table_idx: usize,
+    },
+    /// Prepare INSERT statement on destination for current row
+    PrepareDestInsert {
+        table_idx: usize,
+    },
+    /// Step through INSERT statement on destination (async)
+    StepDestInsert {
         table_idx: usize,
     },
     /// Operation complete
@@ -11450,12 +11462,20 @@ pub struct OpVacuumIntoState {
     pub table_names: Vec<String>,
     /// Column names for the current table being copied
     pub current_table_columns: Vec<String>,
+    // Source statements
     /// Statement for querying schema (boxed to avoid recursive type)
     pub schema_stmt: Option<Box<crate::Statement>>,
     /// Statement for querying column info (boxed to avoid recursive type)
     pub column_stmt: Option<Box<crate::Statement>>,
     /// Statement for selecting rows from source (boxed to avoid recursive type)
     pub select_stmt: Option<Box<crate::Statement>>,
+    // Destination statements
+    /// Statement for CREATE TABLE/INDEX on destination
+    pub dest_schema_stmt: Option<Box<crate::Statement>>,
+    /// Statement for INSERT on destination
+    pub dest_insert_stmt: Option<Box<crate::Statement>>,
+    /// Current row values for INSERT (stored between states)
+    pub current_row_values: Option<Vec<String>>,
 }
 
 /// VACUUM INTO - create a compacted copy of the database at the specified path.
@@ -11573,7 +11593,7 @@ fn op_vacuum_into_inner(
                             .collect();
 
                         state.op_vacuum_into_state.sub_state =
-                            OpVacuumIntoSubState::CreateSchemaInDest { idx: 0 };
+                            OpVacuumIntoSubState::PrepareDestSchema { idx: 0 };
                     }
                     crate::StepResult::IO => {
                         // Yield the IO completions
@@ -11587,7 +11607,7 @@ fn op_vacuum_into_inner(
                 }
             }
 
-            OpVacuumIntoSubState::CreateSchemaInDest { idx } => {
+            OpVacuumIntoSubState::PrepareDestSchema { idx } => {
                 let idx = *idx;
                 if idx >= state.op_vacuum_into_state.schema_rows.len() {
                     // Done creating schema, start copying data
@@ -11604,13 +11624,43 @@ fn op_vacuum_into_inner(
                         if !sql_str.contains("sqlite_sequence") {
                             let dest_conn =
                                 state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
-                            dest_conn.execute(sql_str)?;
+                            let dest_stmt = dest_conn.prepare(sql_str)?;
+                            state.op_vacuum_into_state.dest_schema_stmt =
+                                Some(Box::new(dest_stmt));
+                            state.op_vacuum_into_state.sub_state =
+                                OpVacuumIntoSubState::StepDestSchema { idx };
+                            continue;
                         }
                     }
                 }
 
+                // Skip this schema row (no SQL or sqlite_sequence)
                 state.op_vacuum_into_state.sub_state =
-                    OpVacuumIntoSubState::CreateSchemaInDest { idx: idx + 1 };
+                    OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
+            }
+
+            OpVacuumIntoSubState::StepDestSchema { idx } => {
+                let idx = *idx;
+                let dest_stmt = state.op_vacuum_into_state.dest_schema_stmt.as_mut().unwrap();
+
+                match dest_stmt.step()? {
+                    crate::StepResult::Row => {
+                        // CREATE statements don't return rows, but handle just in case
+                    }
+                    crate::StepResult::Done => {
+                        state.op_vacuum_into_state.dest_schema_stmt = None;
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
+                    }
+                    crate::StepResult::IO => {
+                        if let Some(io) = dest_stmt.take_io_completions() {
+                            return Ok(InsnFunctionStepResult::IO(io));
+                        }
+                    }
+                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                        return Err(LimboError::Busy);
+                    }
+                }
             }
 
             OpVacuumIntoSubState::StartCopyTable { table_idx } => {
@@ -11680,38 +11730,24 @@ fn op_vacuum_into_inner(
                 let select_stmt = program.connection.prepare(&select_sql)?;
                 state.op_vacuum_into_state.select_stmt = Some(Box::new(select_stmt));
                 state.op_vacuum_into_state.sub_state =
-                    OpVacuumIntoSubState::CopyRows { table_idx };
+                    OpVacuumIntoSubState::StepSourceSelect { table_idx };
             }
 
-            OpVacuumIntoSubState::CopyRows { table_idx } => {
+            OpVacuumIntoSubState::StepSourceSelect { table_idx } => {
                 let table_idx = *table_idx;
                 let select_stmt = state.op_vacuum_into_state.select_stmt.as_mut().unwrap();
 
                 match select_stmt.step()? {
                     crate::StepResult::Row => {
                         if let Some(row) = select_stmt.row() {
-                            // Build INSERT statement for this row
+                            // Collect row values for INSERT
                             let values: Vec<String> = (0..row.len())
                                 .map(|i| value_to_sql_literal(row.get_value(i)))
                                 .collect();
-
-                            let table_name =
-                                &state.op_vacuum_into_state.table_names[table_idx];
-                            let column_names =
-                                state.op_vacuum_into_state.current_table_columns.join(", ");
-
-                            let insert_sql = format!(
-                                "INSERT INTO \"{}\" ({}) VALUES ({})",
-                                table_name,
-                                column_names,
-                                values.join(", ")
-                            );
-
-                            let dest_conn =
-                                state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
-                            dest_conn.execute(&insert_sql)?;
+                            state.op_vacuum_into_state.current_row_values = Some(values);
+                            state.op_vacuum_into_state.sub_state =
+                                OpVacuumIntoSubState::PrepareDestInsert { table_idx };
                         }
-                        // Continue to get more rows (stay in same state)
                     }
                     crate::StepResult::Done => {
                         state.op_vacuum_into_state.select_stmt = None;
@@ -11723,6 +11759,53 @@ fn op_vacuum_into_inner(
                     }
                     crate::StepResult::IO => {
                         if let Some(io) = select_stmt.take_io_completions() {
+                            return Ok(InsnFunctionStepResult::IO(io));
+                        }
+                    }
+                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                        return Err(LimboError::Busy);
+                    }
+                }
+            }
+
+            OpVacuumIntoSubState::PrepareDestInsert { table_idx } => {
+                let table_idx = *table_idx;
+                let table_name = &state.op_vacuum_into_state.table_names[table_idx];
+                let column_names = state.op_vacuum_into_state.current_table_columns.join(", ");
+                let values = state
+                    .op_vacuum_into_state
+                    .current_row_values
+                    .as_ref()
+                    .unwrap()
+                    .join(", ");
+
+                let insert_sql =
+                    format!("INSERT INTO \"{table_name}\" ({column_names}) VALUES ({values})");
+
+                let dest_conn = state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
+                let dest_stmt = dest_conn.prepare(&insert_sql)?;
+                state.op_vacuum_into_state.dest_insert_stmt = Some(Box::new(dest_stmt));
+                state.op_vacuum_into_state.sub_state =
+                    OpVacuumIntoSubState::StepDestInsert { table_idx };
+            }
+
+            OpVacuumIntoSubState::StepDestInsert { table_idx } => {
+                let table_idx = *table_idx;
+                let dest_stmt = state.op_vacuum_into_state.dest_insert_stmt.as_mut().unwrap();
+
+                match dest_stmt.step()? {
+                    crate::StepResult::Row => {
+                        // INSERT doesn't return rows, but handle just in case
+                    }
+                    crate::StepResult::Done => {
+                        state.op_vacuum_into_state.dest_insert_stmt = None;
+                        state.op_vacuum_into_state.current_row_values = None;
+                        // Go back to get next row from source
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::StepSourceSelect { table_idx };
+                    }
+                    crate::StepResult::IO => {
+                        if let Some(io) = dest_stmt.take_io_completions() {
                             return Ok(InsnFunctionStepResult::IO(io));
                         }
                     }
