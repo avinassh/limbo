@@ -11403,6 +11403,177 @@ pub fn op_filter_add(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// VACUUM INTO - create a compacted copy of the database at the specified path.
+///
+/// This implementation:
+/// 1. Creates a new database at the destination path
+/// 2. Copies the schema (tables, indexes, triggers, views) from sqlite_schema
+/// 3. Copies data for each table using SELECT/INSERT
+pub fn op_vacuum_into(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(VacuumInto { dest_path }, insn);
+
+    // Check if we're in a transaction - VACUUM INTO should not be run inside a transaction
+    if !program.connection.auto_commit.load(Ordering::SeqCst) {
+        return Err(LimboError::InternalError(
+            "cannot VACUUM INTO from within a transaction".to_string(),
+        ));
+    }
+
+    // Get the IO from the source database
+    let io = program.connection.db.io.clone();
+
+    // Check if destination file already exists
+    if std::path::Path::new(dest_path).exists() {
+        return Err(LimboError::InternalError(format!(
+            "output file already exists: {dest_path}"
+        )));
+    }
+
+    // Create the destination database
+    let dest_db = crate::Database::open_file_with_flags(
+        io.clone(),
+        dest_path,
+        OpenFlags::Create,
+        crate::DatabaseOpts::new(),
+        None, // No encryption for now
+    )?;
+
+    let dest_conn = dest_db.connect()?;
+
+    // Query the source schema to get all CREATE statements
+    // We need to get tables, indexes, triggers, and views in the correct order
+    let schema_sql = "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END";
+
+    let mut schema_stmt = program.connection.prepare(schema_sql)?;
+    let schema_rows = schema_stmt.run_collect_rows()?;
+
+    // First pass: execute all CREATE statements on destination
+    for row in &schema_rows {
+        if row.len() >= 4 {
+            if let Value::Text(sql) = &row[3] {
+                let sql_str = sql.as_str();
+                // Skip sqlite_sequence as it's created automatically
+                if !sql_str.contains("sqlite_sequence") {
+                    dest_conn.execute(sql_str)?;
+                }
+            }
+        }
+    }
+
+    // Second pass: copy data for each table
+    for row in &schema_rows {
+        if row.len() >= 4 {
+            if let (Value::Text(type_val), Value::Text(name_val)) = (&row[0], &row[1]) {
+                if type_val.as_str() == "table" {
+                    let table_name = name_val.as_str();
+                    // Skip internal tables
+                    if table_name.starts_with("sqlite_") {
+                        continue;
+                    }
+                    copy_table_data(&program.connection, &dest_conn, table_name)?;
+                }
+            }
+        }
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Copy all data from a table in the source connection to the destination connection.
+fn copy_table_data(
+    src_conn: &Arc<Connection>,
+    dest_conn: &Arc<Connection>,
+    table_name: &str,
+) -> Result<()> {
+    // Get column info for the table to build proper INSERT statement
+    let pragma_sql = format!("PRAGMA table_info(\"{table_name}\")");
+    let mut pragma_stmt = src_conn.prepare(&pragma_sql)?;
+    let columns_info = pragma_stmt.run_collect_rows()?;
+
+    if columns_info.is_empty() {
+        return Ok(()); // No columns, nothing to copy
+    }
+
+    // Build column names list
+    let column_names: Vec<String> = columns_info
+        .iter()
+        .filter_map(|row| {
+            if row.len() >= 2 {
+                if let Value::Text(name) = &row[1] {
+                    let col_name = name.as_str();
+                    return Some(format!("\"{col_name}\""));
+                }
+            }
+            None
+        })
+        .collect();
+
+    if column_names.is_empty() {
+        return Ok(());
+    }
+
+    // Select all data from source table
+    let select_sql = format!("SELECT * FROM \"{table_name}\"");
+    let mut select_stmt = src_conn.prepare(&select_sql)?;
+
+    // Copy rows one by one
+    select_stmt.run_with_row_callback(|row| {
+        // Build VALUES for this row
+        let values: Vec<String> = (0..row.len())
+            .map(|i| value_to_sql_literal(row.get_value(i)))
+            .collect();
+
+        let row_insert_sql = format!(
+            "INSERT INTO \"{}\" ({}) VALUES ({})",
+            table_name,
+            column_names.join(", "),
+            values.join(", ")
+        );
+
+        dest_conn.execute(&row_insert_sql)?;
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+/// Convert a Value to its SQL literal representation for use in INSERT statements.
+fn value_to_sql_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => {
+            if f.is_nan() {
+                "NULL".to_string() // SQLite doesn't have NaN
+            } else if f.is_infinite() {
+                if f.is_sign_positive() {
+                    "9e999".to_string() // Large positive number that becomes Infinity
+                } else {
+                    "-9e999".to_string()
+                }
+            } else {
+                format!("{f}")
+            }
+        }
+        Value::Text(t) => {
+            // Escape single quotes by doubling them
+            let escaped = t.as_str().replace('\'', "''");
+            format!("'{escaped}'")
+        }
+        Value::Blob(b) => {
+            // Convert blob to hex literal X'...'
+            let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!("X'{hex}'")
+        }
+    }
+}
+
 fn with_header<T, F>(
     pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
