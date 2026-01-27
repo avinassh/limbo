@@ -264,20 +264,36 @@ Indexes are rebuilt during creation, which is actually what we want (defragmenta
 
 SQLite copies pages from temp back to main (rather than file rename) to preserve file handles and avoid issues with open connections.
 
+**Important**: SQLite does NOT have raw WAL insertion APIs. It uses normal pager APIs:
+```c
+// backup.c:255-269
+sqlite3PagerGet(pDestPager, iDest, &pDestPg, 0);  // Get dest page
+sqlite3PagerWrite(pDestPg);                        // Mark dirty
+memcpy(zOut, zIn, nCopy);                         // Copy content
+```
+
+At commit time, the pager routes dirty pages appropriately:
+- **WAL mode**: `pagerWalFrames()` writes to WAL, then checkpoint moves to main DB
+- **Rollback mode**: Pages go to main DB with journal protection
+
 ### Task 4.2: Implement Page Copy-Back
 
 **Read**: `core/storage/pager.rs`
 
 You need to:
 1. Lock both databases exclusively
-2. Copy pages from temp to main
+2. Copy pages from temp to main using pager APIs (not raw file I/O)
 3. Update page count in main header
 4. Sync to disk
+5. Checkpoint (for WAL mode) to flush to main DB file
 
-**Alternative (simpler)**: If you can guarantee single connection:
-1. Close main database
-2. File rename temp → main
-3. Reopen main
+**Why NOT atomic rename**: Each Turso connection creates its own pager with its own file handle. After rename:
+- Original file is deleted
+- Other connections' file handles point to non-existent inode
+- Those connections would crash or corrupt data
+
+From SQLite's vacuum.c comments:
+> "But that will not work if other processes are attached to the original database."
 
 ### Task 4.3: Invalidate Schema Cache
 
@@ -502,26 +518,37 @@ Phase 1-3: Building temp database (SAFE)
   └── temp file is orphaned garbage (deleted on next open)
 
 
-Phase 4: Page copy-back (PROTECTED BY JOURNALING)
+Phase 4: Page copy-back (PROTECTED BY WAL in Turso)
 ════════════════════════════════════════════════════════════════════
 
-  Before each page overwrite:
-  ┌─────────────────┐    ┌─────────────────┐
-  │  main.db        │───▶│ main.db-journal │  (original page saved)
-  │  page N         │    │ page N backup   │
-  └─────────────────┘    └─────────────────┘
-          │
-          ▼
-  ┌─────────────────┐
-  │  main.db        │  (new page from vacuum_db)
-  │  page N (new)   │
-  └─────────────────┘
+  In WAL mode (Turso is WAL-only):
 
-  CRASH HERE?
-  └── On recovery, SQLite sees "hot journal"
-  └── Rolls back main.db using journal
+  1. For each page to copy:
+     ┌─────────────────┐
+     │ pager.write()   │  ← Marks page dirty in cache
+     │ memcpy content  │
+     └─────────────────┘
+
+  2. At commit time:
+     ┌─────────────────┐    ┌─────────────────┐
+     │ Dirty pages     │───▶│   main.db-wal   │  (new pages written to WAL)
+     │ in cache        │    │   WAL frames    │
+     └─────────────────┘    └─────────────────┘
+
+  3. Checkpoint:
+     ┌─────────────────┐    ┌─────────────────┐
+     │   main.db-wal   │───▶│    main.db      │  (WAL frames → main DB)
+     │   WAL frames    │    │  (updated)      │
+     └─────────────────┘    └─────────────────┘
+
+  CRASH DURING COPY-BACK?
+  └── Dirty pages not yet in WAL → discarded on recovery
   └── Database returns to pre-VACUUM state
   └── VACUUM "never happened"
+
+  CRASH AFTER COMMIT, BEFORE CHECKPOINT?
+  └── Data is safe in WAL
+  └── Recovery replays WAL → VACUUM completed
 
 
 Phase 5: Commit (ATOMIC POINT)
@@ -532,8 +559,8 @@ Phase 5: Commit (ATOMIC POINT)
   Rollback mode: DELETE journal file  ←── atomic (filesystem guarantees)
   WAL mode:      Write commit frame   ←── atomic (single write)
 
-  Before this point: crash = rollback
-  After this point:  VACUUM succeeded
+  Before this point: crash = rollback/discard
+  After this point:  VACUUM committed (in WAL), checkpoint will finalize
 ```
 
 ### Failure Scenarios Table
@@ -599,12 +626,39 @@ fn vacuum(db: &Database) -> Result<()> {
 
 ### WAL Mode Considerations
 
+**Key Finding from SQLite Source**: SQLite does NOT switch to rollback journal mode for VACUUM in WAL mode.
+
+From `pager.c:6500-6517`:
+```c
+if( pagerUseWal(pPager) ){
+  // WAL MODE: write dirty pages to WAL file
+  pList = sqlite3PcacheDirtyList(pPager->pPCache);
+  rc = pagerWalFrames(pPager, pList, pPager->dbSize, 1);
+}else{
+  // ROLLBACK MODE: write to main DB with journal protection
+}
 ```
-Before VACUUM in WAL mode:
-1. Checkpoint WAL (flush all WAL frames to main db)
-2. Switch to exclusive lock (blocks all other connections)
-3. Proceed with VACUUM
-4. WAL is effectively reset after VACUUM
+
+**WAL mode VACUUM flow**:
+1. Create temp database (defragmented copy)
+2. Copy pages back to main using `sqlite3PagerWrite()` → marks pages dirty
+3. At commit, dirty pages go to WAL via `pagerWalFrames()`
+4. Checkpoint moves WAL pages to main DB file
+5. Database is now vacuumed
+
+**Crash safety in WAL mode**:
+- Before commit: crash = WAL rollback, original state restored
+- After commit, before checkpoint: data safe in WAL
+- After checkpoint: data in main DB file
+
+**For Turso (WAL-only)**:
+```
+1. Acquire exclusive lock (checkpoint with TRUNCATE mode)
+2. Create temp database via VACUUM INTO temp file
+3. Copy all pages from temp → main using pager APIs
+4. Commit (pages go to WAL)
+5. Checkpoint (pages go to main DB)
+6. Delete temp file
 ```
 
 **Read**: `sqlite/src/vacuum.c` lines 160-170 for WAL handling
@@ -656,7 +710,7 @@ The filesystem guarantees that file deletion is atomic. Once the journal is dele
 
 Given the complexity, implement in this order:
 
-### Step 1: VACUUM INTO (Simplest)
+### Step 1: VACUUM INTO (Simplest) ✓ DONE
 ```sql
 VACUUM INTO 'backup.db';
 ```
@@ -665,16 +719,54 @@ VACUUM INTO 'backup.db';
 - Just: create new file, copy everything, done
 - If crash: partial backup.db exists (user deletes it)
 
-### Step 2: Regular VACUUM (Simple Version)
-- Single connection only
-- Close main, rename temp → main, reopen
-- Works but doesn't preserve file handles
+### Step 2: Regular VACUUM (Full Version for WAL-only Turso)
 
-### Step 3: Regular VACUUM (Full Version)
-- Page copy-back through pager
-- Journal-protected
-- Handles multiple connections
-- Production-ready
+**Important**: Turso is WAL-only, so we cannot use the "simple version" approach of renaming files. Each connection has its own pager/file handle, and rename would break other connections.
+
+Implementation approach:
+1. VACUUM INTO temp file (reuse existing code)
+2. Copy pages from temp → main using pager APIs
+3. Commit (dirty pages go to WAL)
+4. Checkpoint (WAL frames go to main DB)
+5. Delete temp file
+
+```rust
+// Pseudocode for in-place VACUUM
+fn vacuum_in_place(conn: &Connection) -> Result<()> {
+    // 1. Require exclusive access
+    if conn.db.n_connections() > 1 {
+        return Err("cannot VACUUM with multiple connections");
+    }
+
+    // 2. VACUUM INTO temp file
+    let temp_path = format!("{}-vacuum-{}", db_path, random_id());
+    vacuum_into(&temp_path)?;
+
+    // 3. Copy pages from temp back to main via pager
+    let temp_db = Database::open(&temp_path)?;
+    for page_num in 1..=temp_db.page_count() {
+        let temp_page = temp_db.pager.read_page(page_num)?;
+        let main_page = conn.pager.get_page_for_write(page_num)?;
+        main_page.copy_from(&temp_page);
+    }
+
+    // 4. Commit (pages go to WAL)
+    conn.commit()?;
+
+    // 5. Checkpoint (WAL → main DB file)
+    conn.pager.checkpoint(CheckpointMode::Truncate)?;
+
+    // 6. Cleanup
+    std::fs::remove_file(&temp_path)?;
+
+    Ok(())
+}
+```
+
+**Why NOT atomic rename for Turso**:
+- Each connection creates its own pager with own file handle
+- Rename deletes original file
+- Other connections' file handles point to deleted inode → broken
 
 ---
 

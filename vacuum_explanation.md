@@ -475,27 +475,49 @@ Results:
 
 ## The Copy-Back Mechanism
 
-The copy-back uses SQLite's backup API internally:
+The copy-back uses SQLite's backup API internally via normal pager APIs (NOT raw WAL insertion):
 
 ```c
-// backup.c - Core copy loop
-for(iOff=iEnd-(i64)nSrcPgsz; iOff>=0 && p->rc==SQLITE_OK; iOff-=nSrcPgsz){
-  // Get source page
-  pSrcPg = sqlite3PagerLookup(pSrcPager, iSrcPg);
-
-  // Get or create destination page
-  rc = sqlite3PagerGet(pDestPager, iDestPg, &pDestPg, 0);
-
-  // Raw memory copy
-  memcpy(zOut, zIn, nCopy);
-
-  // Mark destination dirty (will be written to disk)
-  sqlite3PagerDirty(pDestPg);
+// backup.c:255-269 - backupOnePage()
+static int backupOnePage(sqlite3_backup *p, Pgno iSrcPg, const u8 *zSrcData, int bUpdate){
+  // For each destination page:
+  sqlite3PagerGet(pDestPager, iDest, &pDestPg, 0);  // Get dest page into cache
+  sqlite3PagerWrite(pDestPg);                        // Mark dirty (engages journal/WAL)
+  memcpy(zOut, zIn, nCopy);                         // Copy raw page content
   sqlite3PagerUnref(pDestPg);
 }
 ```
 
-**Key insight:** This is a raw page copy. The destination page gets the exact same bytes as the source page. All B-tree pointers within the page are preserved because they reference pages that will also be copied to the same relative positions.
+**Key insight:** SQLite does NOT have raw WAL insertion APIs. All writes go through the pager layer:
+1. `sqlite3PagerGet()` - fetches page into cache
+2. `sqlite3PagerWrite()` - marks page dirty
+3. `memcpy()` - copies the raw bytes
+4. At commit time, pager writes dirty pages to appropriate destination
+
+**WAL vs Rollback Mode Difference** (from `pager.c:6500-6517`):
+
+```c
+if( pagerUseWal(pPager) ){
+  // WAL MODE: dirty pages go to WAL file
+  pList = sqlite3PcacheDirtyList(pPager->pPCache);
+  rc = pagerWalFrames(pPager, pList, pPager->dbSize, 1);
+}else{
+  // ROLLBACK MODE: dirty pages go to main DB with journal protection
+  // (original pages saved to rollback journal first)
+}
+```
+
+**The rollback journal code path** (in `pager_write()`) has this assertion:
+```c
+assert( pagerUseWal(pPager)==0 );  // Only runs when NOT in WAL mode
+```
+
+This confirms: in WAL mode, no rollback journal is used. Dirty pages go to WAL, then checkpoint moves them to main DB.
+
+**Why not atomic rename?** From vacuum.c comments (lines 97-103):
+> "But that will not work if other processes are attached to the original database."
+
+Each connection has its own file handle. After rename, those handles point to a deleted inode → broken connections.
 
 ---
 
@@ -779,3 +801,58 @@ int sqlite3BtreeCopyFile(Btree *pTo, Btree *pFrom){
 5. **VACUUM INTO is less restrictive** - Only reads source, writes to new file, readers OK
 
 6. **The backup API does the heavy lifting** - Page-by-page copy handles the actual file replacement
+
+---
+
+## WAL Mode Specifics (Important for Turso)
+
+### No Rollback Journal in WAL Mode
+
+SQLite does NOT switch to rollback journal mode for VACUUM. The comment in vacuum.c about "2x disk space for rollback journal" applies only to rollback mode.
+
+In WAL mode:
+- `sqlite3PagerWrite()` marks pages dirty
+- At commit, `pagerWalFrames()` writes dirty pages to WAL
+- Checkpoint copies WAL pages to main DB file
+- No rollback journal needed
+
+### No Raw WAL Insertion APIs
+
+SQLite uses normal pager APIs for all page writes:
+```c
+sqlite3PagerGet()   // Get page into cache
+sqlite3PagerWrite() // Mark dirty
+memcpy()            // Copy content
+// At commit: pager routes to WAL or journal automatically
+```
+
+### Why Atomic Rename Doesn't Work
+
+From vacuum.c:
+> "But that will not work if other processes are attached to the original database."
+
+- Each connection has its own file handle
+- Rename deletes original file
+- Other connections' handles point to deleted inode
+- Result: crashes and data corruption
+
+### Turso Implementation Approach (WAL-only)
+
+```
+1. Acquire exclusive lock via checkpoint TRUNCATE mode
+2. VACUUM INTO temp file (creates defragmented copy)
+3. For each page in temp:
+   - pager.get_page(main_db, page_num)
+   - pager.write_page() → marks dirty
+   - copy temp page content to main page
+4. Commit → dirty pages go to WAL
+5. Checkpoint → WAL pages go to main DB file
+6. Delete temp file
+7. Schema cookie bump invalidates other connections' caches
+```
+
+This approach:
+- Preserves file handles (no rename)
+- Works with multiple connections
+- Uses existing async pager infrastructure
+- Crash-safe via WAL

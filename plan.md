@@ -135,6 +135,28 @@ if( sqlite3PagerGetJournalMode(sqlite3BtreePager(pMain))
 }
 ```
 
+### WAL Mode Copy-Back Mechanism (Important!)
+
+**SQLite does NOT switch to rollback journal mode for VACUUM.** In WAL mode, the copy-back phase works differently:
+
+1. **Dirty pages go to WAL, not rollback journal**: When `pagerUseWal(pPager) == true`, the pager writes dirty pages to WAL via `pagerWalFrames()` at commit time
+2. **No rollback journal needed**: The assertion in `pager.c:6092` confirms this: `assert( pagerUseWal(pPager)==0 )` - rollback journal code only runs when NOT in WAL mode
+3. **Checkpoint writes to main DB**: After commit, checkpoint copies WAL frames to the main database file
+
+From `pager.c:6500-6517`:
+```c
+if( pagerUseWal(pPager) ){
+  // WAL MODE: write dirty pages to WAL file
+  pList = sqlite3PcacheDirtyList(pPager->pPCache);
+  rc = pagerWalFrames(pPager, pList, pPager->dbSize, 1);  // → WAL
+}else{
+  // ROLLBACK MODE: write to main DB file with journal protection
+  ...
+}
+```
+
+**The comment in vacuum.c about "2x disk space for rollback journal" applies only to rollback mode.**
+
 ### VACUUM INTO is Different
 
 `VACUUM INTO 'file.db'` has relaxed locking:
@@ -169,6 +191,37 @@ For VACUUM implementation:
 3. **Must acquire exclusive write transaction** - Use `TransactionState::Write`
 4. **Must block/error new operations** - While VACUUM runs, reject new queries
 5. **VACUUM INTO can use read transaction** - Less restrictive
+
+### Turso Connection/Pager Architecture (Critical for VACUUM)
+
+Each connection creates its **own pager instance** (`core/lib.rs:816`):
+
+```rust
+fn _connect(...) -> Result<Arc<Connection>> {
+    let pager = if let Some(pager) = pager {
+        pager
+    } else {
+        Arc::new(self._init()?)  // NEW pager instance for each connection
+    };
+    // ...
+}
+```
+
+This means:
+- `Database.connect()` → new Pager₁ (own file handle, own cache)
+- `Database.connect()` → new Pager₂ (own file handle, own cache)
+- `Database.connect()` → new Pager₃ (own file handle, own cache)
+
+**Implication for in-place VACUUM**: After copying pages back from temp to main:
+- The connection that ran VACUUM sees the new data (same file handle)
+- Other connections also see the new data (same underlying file)
+- File handles remain valid because we're overwriting the same file, not renaming
+
+**Implication for atomic rename (why it won't work)**:
+- After rename, other connections' file handles point to deleted inode
+- Those connections would be broken
+
+The database tracks connection count via `n_connections: AtomicUsize`, but this is just a counter - there's no registry to iterate connections.
 
 ### Summary Table
 
@@ -438,6 +491,36 @@ int sqlite3BtreeCopyFile(Btree *pTo, Btree *pFrom){
 - Copies pages sequentially from page 1
 - Handles page size differences (rare)
 - Handles the "pending byte page" specially (reserved page at 1GB offset)
+
+### How Page Copy Works (No Raw WAL API)
+
+SQLite does NOT have raw WAL insertion APIs. The `backupOnePage()` function (backup.c:226-279) uses normal pager APIs:
+
+```c
+static int backupOnePage(sqlite3_backup *p, Pgno iSrcPg, const u8 *zSrcData, int bUpdate){
+  // For each destination page:
+  sqlite3PagerGet(pDestPager, iDest, &pDestPg, 0);  // Get dest page
+  sqlite3PagerWrite(pDestPg);                        // Mark dirty
+  memcpy(zOut, zIn, nCopy);                         // Copy content
+  sqlite3PagerUnref(pDestPg);
+}
+```
+
+At commit time, the pager automatically routes dirty pages to the appropriate destination:
+- **WAL mode**: `pagerWalFrames()` writes dirty pages to WAL
+- **Rollback mode**: Pages go to main DB file with journal protection
+
+### Why Atomic Rename Doesn't Work
+
+From vacuum.c comments (lines 97-103):
+> "Only 1x temporary space and only 1x writes would be required if the copy of step (3) were replaced by **deleting the original database and renaming** the transient database as the original. **But that will not work if other processes are attached** to the original database. And a power loss in between deleting the original and renaming the transient would cause the database file to appear to be deleted following reboot."
+
+**Critical issue for Turso**: Each connection has its own pager with its own file handle. After atomic rename:
+- The original file is deleted
+- File handles in other connections now point to a non-existent inode
+- Those connections would be broken, causing crashes or data corruption
+
+This is why SQLite copies pages BACK to the original file rather than renaming.
 
 ### OP_Vacuum Handler (vdbe.c:8098-8103)
 
@@ -917,9 +1000,15 @@ Virtual tables store only schema, no data pages.
 
 #### 8. Disk Space Requirements
 
-VACUUM requires approximately 2x database size:
+**Rollback mode**: VACUUM requires approximately 2x database size:
 - 1x for the temp database
 - 1x for the rollback journal when copying back
+
+**WAL mode** (Turso): VACUUM requires approximately 1-2x database size:
+- 1x for the temp database
+- WAL file grows during copy-back (dirty pages go to WAL)
+- After checkpoint, WAL can be truncated
+- No rollback journal needed
 
 #### 9. Schema Version Increment
 
