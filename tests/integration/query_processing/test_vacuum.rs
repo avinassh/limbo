@@ -117,6 +117,62 @@ fn test_vacuum_into_existing_file_fails(tmp_db: TempDatabase) -> anyhow::Result<
         "VACUUM INTO existing file should fail with an error"
     );
 
+    // Verify the error message mentions the file exists
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("already exists") || err_msg.contains("output file"),
+        "Error message should mention file already exists, got: {err_msg}"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_into_within_transaction_fails(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Insert some data
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    // Start a transaction
+    conn.execute("BEGIN")?;
+
+    // Insert more data within the transaction
+    conn.execute("INSERT INTO t VALUES (2)")?;
+
+    // Create destination path
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    // VACUUM INTO should fail within a transaction
+    let result = conn.execute(&format!("VACUUM INTO '{dest_path_str}'"));
+    assert!(
+        result.is_err(),
+        "VACUUM INTO should fail when called within a transaction"
+    );
+
+    // Verify the error message mentions transaction
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("transaction") || err_msg.contains("VACUUM"),
+        "Error message should mention transaction restriction, got: {err_msg}"
+    );
+
+    // Verify the destination file was not created
+    assert!(
+        !dest_path.exists(),
+        "Destination file should not be created when VACUUM fails"
+    );
+
+    // Rollback and verify data is still intact
+    conn.execute("ROLLBACK")?;
+
+    // Original data should still be there
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t ORDER BY a");
+    assert_eq!(rows, vec![(1,)], "Only committed data should remain after rollback");
+
     Ok(())
 }
 

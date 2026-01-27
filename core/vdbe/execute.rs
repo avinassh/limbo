@@ -11518,8 +11518,9 @@ fn op_vacuum_into_inner(
         match &state.op_vacuum_into_state.sub_state {
             OpVacuumIntoSubState::Init => {
                 // Check if we're in a transaction
+                // Use TxError so abort() doesn't rollback the existing transaction
                 if !program.connection.auto_commit.load(Ordering::SeqCst) {
-                    return Err(LimboError::InternalError(
+                    return Err(LimboError::TxError(
                         "cannot VACUUM INTO from within a transaction".to_string(),
                     ));
                 }
