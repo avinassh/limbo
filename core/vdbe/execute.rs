@@ -11532,13 +11532,19 @@ fn op_vacuum_into_inner(
                     )));
                 }
 
-                // Create the destination database
+                // Create the destination database with same options as source
                 let io = program.connection.db.io.clone();
+                let source_db = &program.connection.db;
+                let dest_opts = crate::DatabaseOpts::new()
+                    .with_views(source_db.experimental_views_enabled())
+                    .with_triggers(source_db.experimental_triggers_enabled())
+                    .with_index_method(source_db.experimental_index_method_enabled())
+                    .with_strict(source_db.experimental_strict_enabled());
                 let dest_db = crate::Database::open_file_with_flags(
                     io,
                     dest_path,
                     OpenFlags::Create,
-                    crate::DatabaseOpts::new(),
+                    dest_opts,
                     None,
                 )?;
                 let dest_conn = dest_db.connect()?;
