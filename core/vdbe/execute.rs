@@ -11414,37 +11414,27 @@ pub enum OpVacuumIntoSubState {
     /// Step through schema query to collect rows
     CollectSchemaRows,
     /// Prepare CREATE statement on destination
-    PrepareDestSchema {
-        idx: usize,
-    },
+    PrepareDestSchema { idx: usize },
     /// Step through CREATE statement on destination (async)
-    StepDestSchema {
-        idx: usize,
-    },
+    StepDestSchema { idx: usize },
     /// Start copying a table - prepare column info query
-    StartCopyTable {
-        table_idx: usize,
-    },
+    StartCopyTable { table_idx: usize },
     /// Collect column info for current table
-    CollectColumnInfo {
-        table_idx: usize,
-    },
+    CollectColumnInfo { table_idx: usize },
     /// Start selecting rows from source table
-    StartSelectRows {
-        table_idx: usize,
-    },
+    StartSelectRows { table_idx: usize },
     /// Step through source SELECT to get next row
-    StepSourceSelect {
-        table_idx: usize,
-    },
+    StepSourceSelect { table_idx: usize },
     /// Prepare INSERT statement on destination for current row
-    PrepareDestInsert {
-        table_idx: usize,
-    },
+    PrepareDestInsert { table_idx: usize },
     /// Step through INSERT statement on destination (async)
-    StepDestInsert {
-        table_idx: usize,
-    },
+    StepDestInsert { table_idx: usize },
+    /// Copy meta values (user_version, application_id) from source to destination
+    CopyMetaValues,
+    /// Create triggers and views after data copy (to avoid triggers firing during copy)
+    PrepareTriggersViews { idx: usize },
+    /// Step through CREATE TRIGGER/VIEW statement on destination
+    StepTriggersViews { idx: usize },
     /// Operation complete
     Done,
 }
@@ -11476,6 +11466,9 @@ pub struct OpVacuumIntoState {
     pub dest_insert_stmt: Option<Box<crate::Statement>>,
     /// Current row values for INSERT (stored between states)
     pub current_row_values: Option<Vec<String>>,
+    /// Meta values read from source database header
+    pub source_user_version: i32,
+    pub source_application_id: i32,
 }
 
 /// VACUUM INTO - create a compacted copy of the database at the specified path.
@@ -11540,6 +11533,31 @@ fn op_vacuum_into_inner(
                     .with_triggers(source_db.experimental_triggers_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled())
                     .with_strict(source_db.experimental_strict_enabled());
+                // Read source meta values using pragma queries
+                // (using SQL ensures we see any recent pragma updates)
+                let user_version_rows = program.connection.pragma_query("user_version")?;
+                let application_id_rows = program.connection.pragma_query("application_id")?;
+
+                let user_version = user_version_rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(|v| match v {
+                        Value::Integer(i) => Some(*i as i32),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                let application_id = application_id_rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(|v| match v {
+                        Value::Integer(i) => Some(*i as i32),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+
+                state.op_vacuum_into_state.source_user_version = user_version;
+                state.op_vacuum_into_state.source_application_id = application_id;
+
                 let dest_db = crate::Database::open_file_with_flags(
                     io,
                     dest_path,
@@ -11625,15 +11643,24 @@ fn op_vacuum_into_inner(
 
                 let row = &state.op_vacuum_into_state.schema_rows[idx];
                 if row.len() >= 4 {
+                    // Skip triggers and views - they'll be created after data copy
+                    // to avoid triggers firing during data copy
+                    if let Value::Text(type_val) = &row[0] {
+                        let type_str = type_val.as_str();
+                        if type_str == "trigger" || type_str == "view" {
+                            state.op_vacuum_into_state.sub_state =
+                                OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
+                            continue;
+                        }
+                    }
+
                     if let Value::Text(sql) = &row[3] {
                         let sql_str = sql.as_str();
                         // Skip sqlite_sequence as it's created automatically
                         if !sql_str.contains("sqlite_sequence") {
-                            let dest_conn =
-                                state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
+                            let dest_conn = state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
                             let dest_stmt = dest_conn.prepare(sql_str)?;
-                            state.op_vacuum_into_state.dest_schema_stmt =
-                                Some(Box::new(dest_stmt));
+                            state.op_vacuum_into_state.dest_schema_stmt = Some(Box::new(dest_stmt));
                             state.op_vacuum_into_state.sub_state =
                                 OpVacuumIntoSubState::StepDestSchema { idx };
                             continue;
@@ -11648,7 +11675,11 @@ fn op_vacuum_into_inner(
 
             OpVacuumIntoSubState::StepDestSchema { idx } => {
                 let idx = *idx;
-                let dest_stmt = state.op_vacuum_into_state.dest_schema_stmt.as_mut().unwrap();
+                let dest_stmt = state
+                    .op_vacuum_into_state
+                    .dest_schema_stmt
+                    .as_mut()
+                    .unwrap();
 
                 match dest_stmt.step()? {
                     crate::StepResult::Row => {
@@ -11673,8 +11704,8 @@ fn op_vacuum_into_inner(
             OpVacuumIntoSubState::StartCopyTable { table_idx } => {
                 let table_idx = *table_idx;
                 if table_idx >= state.op_vacuum_into_state.table_names.len() {
-                    // Done copying all tables
-                    state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::Done;
+                    // Done copying all tables, now copy meta values
+                    state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::CopyMetaValues;
                     continue;
                 }
 
@@ -11798,7 +11829,11 @@ fn op_vacuum_into_inner(
 
             OpVacuumIntoSubState::StepDestInsert { table_idx } => {
                 let table_idx = *table_idx;
-                let dest_stmt = state.op_vacuum_into_state.dest_insert_stmt.as_mut().unwrap();
+                let dest_stmt = state
+                    .op_vacuum_into_state
+                    .dest_insert_stmt
+                    .as_mut()
+                    .unwrap();
 
                 match dest_stmt.step()? {
                     crate::StepResult::Row => {
@@ -11810,6 +11845,83 @@ fn op_vacuum_into_inner(
                         // Go back to get next row from source
                         state.op_vacuum_into_state.sub_state =
                             OpVacuumIntoSubState::StepSourceSelect { table_idx };
+                    }
+                    crate::StepResult::IO => {
+                        if let Some(io) = dest_stmt.take_io_completions() {
+                            return Ok(InsnFunctionStepResult::IO(io));
+                        }
+                    }
+                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                        return Err(LimboError::Busy);
+                    }
+                }
+            }
+
+            OpVacuumIntoSubState::CopyMetaValues => {
+                // Copy user_version and application_id to destination database
+                let dest_conn = state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
+                let user_version = state.op_vacuum_into_state.source_user_version;
+                let application_id = state.op_vacuum_into_state.source_application_id;
+
+                // Use pragma_update to set the meta values
+                dest_conn.pragma_update("user_version", user_version.to_string())?;
+                dest_conn.pragma_update("application_id", application_id.to_string())?;
+
+                // Now create triggers and views (after data copy to avoid triggers firing)
+                state.op_vacuum_into_state.sub_state =
+                    OpVacuumIntoSubState::PrepareTriggersViews { idx: 0 };
+            }
+
+            OpVacuumIntoSubState::PrepareTriggersViews { idx } => {
+                let idx = *idx;
+                if idx >= state.op_vacuum_into_state.schema_rows.len() {
+                    // Done creating triggers and views
+                    state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::Done;
+                    continue;
+                }
+
+                let row = &state.op_vacuum_into_state.schema_rows[idx];
+                if row.len() >= 4 {
+                    // Only process triggers and views in this phase
+                    if let Value::Text(type_val) = &row[0] {
+                        let type_str = type_val.as_str();
+                        if type_str == "trigger" || type_str == "view" {
+                            if let Value::Text(sql) = &row[3] {
+                                let sql_str = sql.as_str();
+                                let dest_conn =
+                                    state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
+                                let dest_stmt = dest_conn.prepare(sql_str)?;
+                                state.op_vacuum_into_state.dest_schema_stmt =
+                                    Some(Box::new(dest_stmt));
+                                state.op_vacuum_into_state.sub_state =
+                                    OpVacuumIntoSubState::StepTriggersViews { idx };
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Skip non-trigger/view entries
+                state.op_vacuum_into_state.sub_state =
+                    OpVacuumIntoSubState::PrepareTriggersViews { idx: idx + 1 };
+            }
+
+            OpVacuumIntoSubState::StepTriggersViews { idx } => {
+                let idx = *idx;
+                let dest_stmt = state
+                    .op_vacuum_into_state
+                    .dest_schema_stmt
+                    .as_mut()
+                    .unwrap();
+
+                match dest_stmt.step()? {
+                    crate::StepResult::Row => {
+                        // CREATE statements don't return rows, but handle just in case
+                    }
+                    crate::StepResult::Done => {
+                        state.op_vacuum_into_state.dest_schema_stmt = None;
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::PrepareTriggersViews { idx: idx + 1 };
                     }
                     crate::StepResult::IO => {
                         if let Some(io) = dest_stmt.take_io_completions() {
