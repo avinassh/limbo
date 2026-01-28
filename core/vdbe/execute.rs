@@ -11520,7 +11520,7 @@ fn op_vacuum_into_inner(
 
                 // Check if destination file already exists
                 if std::path::Path::new(dest_path).exists() {
-                    return Err(LimboError::InternalError(format!(
+                    return Err(LimboError::ParseError(format!(
                         "output file already exists: {dest_path}"
                     )));
                 }
@@ -11546,7 +11546,11 @@ fn op_vacuum_into_inner(
                         Value::Integer(i) => Some(*i as i32),
                         _ => None,
                     })
-                    .unwrap_or(0);
+                    .ok_or_else(|| {
+                        LimboError::InternalError(
+                            "VACUUM INTO: failed to read user_version from source".into(),
+                        )
+                    })?;
                 let application_id = application_id_rows
                     .first()
                     .and_then(|row| row.first())
@@ -11554,7 +11558,11 @@ fn op_vacuum_into_inner(
                         Value::Integer(i) => Some(*i as i32),
                         _ => None,
                     })
-                    .unwrap_or(0);
+                    .ok_or_else(|| {
+                        LimboError::InternalError(
+                            "VACUUM INTO: failed to read application_id from source".into(),
+                        )
+                    })?;
                 let page_size = page_size_rows
                     .first()
                     .and_then(|row| row.first())
@@ -11562,7 +11570,11 @@ fn op_vacuum_into_inner(
                         Value::Integer(i) => Some(*i as u32),
                         _ => None,
                     })
-                    .unwrap_or(4096);
+                    .ok_or_else(|| {
+                        LimboError::InternalError(
+                            "VACUUM INTO: failed to read page_size from source".into(),
+                        )
+                    })?;
 
                 state.op_vacuum_into_state.source_user_version = user_version;
                 state.op_vacuum_into_state.source_application_id = application_id;
@@ -11698,7 +11710,7 @@ fn op_vacuum_into_inner(
 
                 match dest_stmt.step()? {
                     crate::StepResult::Row => {
-                        // CREATE statements don't return rows, but handle just in case
+                        unreachable!("CREATE statement unexpectedly returned a row");
                     }
                     crate::StepResult::Done => {
                         state.op_vacuum_into_state.dest_schema_stmt = None;
@@ -11852,7 +11864,7 @@ fn op_vacuum_into_inner(
 
                 match dest_stmt.step()? {
                     crate::StepResult::Row => {
-                        // INSERT doesn't return rows, but handle just in case
+                        unreachable!("INSERT statement unexpectedly returned a row");
                     }
                     crate::StepResult::Done => {
                         state.op_vacuum_into_state.dest_insert_stmt = None;
@@ -11934,7 +11946,7 @@ fn op_vacuum_into_inner(
 
                 match dest_stmt.step()? {
                     crate::StepResult::Row => {
-                        // CREATE statements don't return rows, but handle just in case
+                        unreachable!("CREATE TRIGGER/VIEW statement unexpectedly returned a row");
                     }
                     crate::StepResult::Done => {
                         state.op_vacuum_into_state.dest_schema_stmt = None;
