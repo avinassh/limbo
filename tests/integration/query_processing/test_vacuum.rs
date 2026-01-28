@@ -928,3 +928,59 @@ fn test_vacuum_into_special_table_names(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
+/// Test VACUUM INTO preserves float precision
+#[turso_macros::test]
+fn test_vacuum_into_preserves_float_precision(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE floats (id INTEGER PRIMARY KEY, value REAL)")?;
+
+    // Insert various floats that require high precision
+    // These values are chosen to test edge cases in float representation
+    let test_values: Vec<f64> = vec![
+        0.1,                          // Classic binary representation issue
+        0.123456789012345,            // Many decimal places
+        1.0000000000000002,           // Smallest increment above 1.0
+        std::f64::consts::PI,         // Pi (3.141592653589793)
+        std::f64::consts::E,          // Euler's number (2.718281828459045)
+        1e-10,                        // Very small number
+        1e15,                         // Large number
+        -0.999999999999999,           // Negative with many 9s
+        123456789.123456789,          // Large with decimals
+    ];
+
+    for (i, &val) in test_values.iter().enumerate() {
+        conn.execute(&format!("INSERT INTO floats VALUES ({}, {:.17})", i + 1, val))?;
+    }
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify float precision is preserved
+    let rows: Vec<(i64, f64)> = dest_conn.exec_rows("SELECT id, value FROM floats ORDER BY id");
+    assert_eq!(rows.len(), test_values.len());
+
+    for (i, &expected) in test_values.iter().enumerate() {
+        let actual = rows[i].1;
+        assert!(
+            (actual - expected).abs() < 1e-15 || actual == expected,
+            "Float precision lost for value {}: expected {:.17}, got {:.17}",
+            i + 1,
+            expected,
+            actual
+        );
+    }
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    Ok(())
+}
+
