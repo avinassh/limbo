@@ -624,6 +624,54 @@ fn test_vacuum_into_preserves_boundary_meta_values(tmp_db: TempDatabase) -> anyh
     Ok(())
 }
 
+/// Test VACUUM INTO preserves non-default page_size (8192)
+#[turso_macros::test]
+fn test_vacuum_into_preserves_page_size(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    // Create a new empty database and set page_size before creating tables
+    let source_db = TempDatabase::new_empty();
+    let conn = source_db.connect_limbo();
+
+    // Set non-default page_size (must be done before any tables are created)
+    conn.reset_page_size(8192)?;
+
+    // Create table and insert data
+    conn.execute("CREATE TABLE t (a INTEGER, b TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world')")?;
+
+    // Verify source has non-default page_size
+    let source_page_size: Vec<(i64,)> = conn.exec_rows("PRAGMA page_size");
+    assert_eq!(
+        source_page_size[0].0, 8192,
+        "Source database should have page_size of 8192"
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify page_size is preserved
+    let dest_page_size: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_size");
+    assert_eq!(
+        dest_page_size[0].0, 8192,
+        "page_size should be preserved as 8192 in destination database"
+    );
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    // Verify data was copied
+    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, b FROM t ORDER BY a");
+    assert_eq!(rows, vec![(1, "hello".to_string()), (2, "world".to_string())]);
+
+    Ok(())
+}
+
 /// Test VACUUM INTO with empty tables (schema only, no data)
 #[turso_macros::test]
 fn test_vacuum_into_empty_tables(tmp_db: TempDatabase) -> anyhow::Result<()> {

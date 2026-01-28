@@ -11537,6 +11537,7 @@ fn op_vacuum_into_inner(
                 // (using SQL ensures we see any recent pragma updates)
                 let user_version_rows = program.connection.pragma_query("user_version")?;
                 let application_id_rows = program.connection.pragma_query("application_id")?;
+                let page_size_rows = program.connection.pragma_query("page_size")?;
 
                 let user_version = user_version_rows
                     .first()
@@ -11554,6 +11555,14 @@ fn op_vacuum_into_inner(
                         _ => None,
                     })
                     .unwrap_or(0);
+                let page_size = page_size_rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(|v| match v {
+                        Value::Integer(i) => Some(*i as u32),
+                        _ => None,
+                    })
+                    .unwrap_or(4096);
 
                 state.op_vacuum_into_state.source_user_version = user_version;
                 state.op_vacuum_into_state.source_application_id = application_id;
@@ -11566,6 +11575,9 @@ fn op_vacuum_into_inner(
                     None,
                 )?;
                 let dest_conn = dest_db.connect()?;
+
+                // Set page_size on destination before any schema is created
+                dest_conn.reset_page_size(page_size)?;
 
                 state.op_vacuum_into_state.dest_db = Some(dest_db);
                 state.op_vacuum_into_state.dest_conn = Some(dest_conn);
