@@ -789,3 +789,64 @@ fn test_vacuum_into_view_queries_copied_data(tmp_db: TempDatabase) -> anyhow::Re
 
     Ok(())
 }
+
+/// Test VACUUM INTO preserves AUTOINCREMENT counters (sqlite_sequence)
+#[turso_macros::test]
+fn test_vacuum_into_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create table with AUTOINCREMENT
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)")?;
+
+    // Insert some rows to advance the counter
+    conn.execute("INSERT INTO t (name) VALUES ('first')")?;
+    conn.execute("INSERT INTO t (name) VALUES ('second')")?;
+    conn.execute("INSERT INTO t (name) VALUES ('third')")?;
+
+    // Delete rows to create a gap
+    conn.execute("DELETE FROM t WHERE id = 2")?;
+
+    // Verify sqlite_sequence has the counter
+    let seq_before: Vec<(String, i64)> =
+        conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
+    assert_eq!(
+        seq_before,
+        vec![("t".to_string(), 3)],
+        "sqlite_sequence should have counter value 3"
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify sqlite_sequence was copied
+    let seq_after: Vec<(String, i64)> =
+        dest_conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
+    assert_eq!(
+        seq_after,
+        vec![("t".to_string(), 3)],
+        "sqlite_sequence should be preserved in destination"
+    );
+
+    // Insert a new row and verify it gets id = 4 (not 1 or 3)
+    dest_conn.execute("INSERT INTO t (name) VALUES ('fourth')")?;
+    let new_row: Vec<(i64, String)> =
+        dest_conn.exec_rows("SELECT id, name FROM t WHERE name = 'fourth'");
+    assert_eq!(
+        new_row,
+        vec![(4, "fourth".to_string())],
+        "New row should get id = 4 (AUTOINCREMENT counter preserved)"
+    );
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    Ok(())
+}
+

@@ -11609,6 +11609,7 @@ fn op_vacuum_into_inner(
                         state.op_vacuum_into_state.schema_stmt = None;
 
                         // Extract table names for data copy phase
+                        // Include sqlite_sequence for AUTOINCREMENT counters, but not other sqlite_ tables
                         state.op_vacuum_into_state.table_names = state
                             .op_vacuum_into_state
                             .schema_rows
@@ -11618,10 +11619,12 @@ fn op_vacuum_into_inner(
                                     if let (Value::Text(type_val), Value::Text(name_val)) =
                                         (&row[0], &row[1])
                                     {
+                                        let name = name_val.as_str();
                                         if type_val.as_str() == "table"
-                                            && !name_val.as_str().starts_with("sqlite_")
+                                            && (!name.starts_with("sqlite_")
+                                                || name == "sqlite_sequence")
                                         {
-                                            return Some(name_val.as_str().to_string());
+                                            return Some(name.to_string());
                                         }
                                     }
                                 }
@@ -11870,12 +11873,15 @@ fn op_vacuum_into_inner(
             }
 
             OpVacuumIntoSubState::CopyMetaValues => {
-                // Copy user_version and application_id to destination database
+                // Copy meta values to destination database
                 let dest_conn = state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
                 let user_version = state.op_vacuum_into_state.source_user_version;
                 let application_id = state.op_vacuum_into_state.source_application_id;
 
-                // Use pragma_update to set the meta values
+                // Use pragma_update to set user_version and application_id
+                // Note: schema_version is not copied - VACUUM INTO creates a new file so
+                // there's no cache to invalidate. The destination will have its own
+                // schema_version based on the schema operations performed.
                 dest_conn.pragma_update("user_version", user_version.to_string())?;
                 dest_conn.pragma_update("application_id", application_id.to_string())?;
 
