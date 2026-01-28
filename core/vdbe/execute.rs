@@ -11609,12 +11609,12 @@ fn op_vacuum_into_inner(
                 let schema_stmt = state.op_vacuum_into_state.schema_stmt.as_mut().unwrap();
                 match schema_stmt.step()? {
                     crate::StepResult::Row => {
-                        // Collect this row
-                        if let Some(row) = schema_stmt.row() {
-                            let values: Vec<Value> = row.get_values().cloned().collect();
-                            state.op_vacuum_into_state.schema_rows.push(values);
-                        }
-                        // Continue in same state to get more rows
+                        let row = schema_stmt
+                            .row()
+                            .expect("StepResult::Row but row() returned None");
+                        let values: Vec<Value> = row.get_values().cloned().collect();
+                        state.op_vacuum_into_state.schema_rows.push(values);
+                        continue; // Get more rows
                     }
                     crate::StepResult::Done => {
                         // Done collecting schema rows
@@ -11669,40 +11669,44 @@ fn op_vacuum_into_inner(
                 }
 
                 let row = &state.op_vacuum_into_state.schema_rows[idx];
-                if row.len() >= 4 {
-                    // Skip triggers and views - they'll be created after data copy
-                    // to avoid triggers firing during data copy
-                    if let Value::Text(type_val) = &row[0] {
-                        let type_str = type_val.as_str();
-                        if type_str == "trigger" || type_str == "view" {
-                            state.op_vacuum_into_state.sub_state =
-                                OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
-                            continue;
-                        }
-                    }
+                if row.len() < 4 {
+                    return Err(LimboError::Corrupt(
+                        "Invalid schema row: expected at least 4 columns".into(),
+                    ));
+                }
 
-                    // Skip sqlite_sequence - it's auto-created when AUTOINCREMENT is used
-                    // (we still copy its data in the data copy phase)
-                    if let Value::Text(name_val) = &row[1] {
-                        if name_val.as_str() == "sqlite_sequence" {
-                            state.op_vacuum_into_state.sub_state =
-                                OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
-                            continue;
-                        }
-                    }
-
-                    if let Value::Text(sql) = &row[3] {
-                        let sql_str = sql.as_str();
-                        let dest_conn = state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
-                        let dest_stmt = dest_conn.prepare(sql_str)?;
-                        state.op_vacuum_into_state.dest_schema_stmt = Some(Box::new(dest_stmt));
+                // Skip triggers and views - they'll be created after data copy
+                // to avoid triggers firing during data copy
+                if let Value::Text(type_val) = &row[0] {
+                    let type_str = type_val.as_str();
+                    if type_str == "trigger" || type_str == "view" {
                         state.op_vacuum_into_state.sub_state =
-                            OpVacuumIntoSubState::StepDestSchema { idx };
+                            OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
                         continue;
                     }
                 }
 
-                // Skip this schema row (no SQL or sqlite_sequence)
+                // Skip sqlite_sequence - it's auto-created when AUTOINCREMENT is used
+                // (we still copy its data in the data copy phase)
+                if let Value::Text(name_val) = &row[1] {
+                    if name_val.as_str() == "sqlite_sequence" {
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
+                        continue;
+                    }
+                }
+
+                if let Value::Text(sql) = &row[3] {
+                    let sql_str = sql.as_str();
+                    let dest_conn = state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
+                    let dest_stmt = dest_conn.prepare(sql_str)?;
+                    state.op_vacuum_into_state.dest_schema_stmt = Some(Box::new(dest_stmt));
+                    state.op_vacuum_into_state.sub_state =
+                        OpVacuumIntoSubState::StepDestSchema { idx };
+                    continue;
+                }
+
+                // Skip this schema row (no SQL)
                 state.op_vacuum_into_state.sub_state =
                     OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
             }
@@ -11761,19 +11765,20 @@ fn op_vacuum_into_inner(
 
                 match column_stmt.step()? {
                     crate::StepResult::Row => {
-                        if let Some(row) = column_stmt.row() {
-                            // Column name is at index 1
-                            if let Value::Text(name) = row.get_value(1) {
-                                // Escape double quotes in column name for safe SQL
-                                let escaped_name = name.as_str().replace('"', "\"\"");
-                                let col_name = format!("\"{escaped_name}\"");
-                                state
-                                    .op_vacuum_into_state
-                                    .current_table_columns
-                                    .push(col_name);
-                            }
+                        let row = column_stmt
+                            .row()
+                            .expect("StepResult::Row but row() returned None");
+                        // Column name is at index 1
+                        if let Value::Text(name) = row.get_value(1) {
+                            // Escape double quotes in column name for safe SQL
+                            let escaped_name = name.as_str().replace('"', "\"\"");
+                            let col_name = format!("\"{escaped_name}\"");
+                            state
+                                .op_vacuum_into_state
+                                .current_table_columns
+                                .push(col_name);
                         }
-                        // Continue to get more columns
+                        continue; // Get more columns
                     }
                     crate::StepResult::Done => {
                         state.op_vacuum_into_state.column_stmt = None;
@@ -11819,15 +11824,16 @@ fn op_vacuum_into_inner(
 
                 match select_stmt.step()? {
                     crate::StepResult::Row => {
-                        if let Some(row) = select_stmt.row() {
-                            // Collect row values for INSERT
-                            let values: Vec<String> = (0..row.len())
-                                .map(|i| value_to_sql_literal(row.get_value(i)))
-                                .collect();
-                            state.op_vacuum_into_state.current_row_values = Some(values);
-                            state.op_vacuum_into_state.sub_state =
-                                OpVacuumIntoSubState::PrepareDestInsert { table_idx };
-                        }
+                        let row = select_stmt
+                            .row()
+                            .expect("StepResult::Row but row() returned None");
+                        // Collect row values for INSERT
+                        let values: Vec<String> = (0..row.len())
+                            .map(|i| value_to_sql_literal(row.get_value(i)))
+                            .collect();
+                        state.op_vacuum_into_state.current_row_values = Some(values);
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::PrepareDestInsert { table_idx };
                     }
                     crate::StepResult::Done => {
                         state.op_vacuum_into_state.select_stmt = None;
@@ -12008,7 +12014,12 @@ fn value_to_sql_literal(value: &Value) -> String {
                     "-9e999".to_string()
                 }
             } else {
-                format!("{f}")
+                // Use 17 significant digits to preserve full f64 precision
+                // (IEEE 754 double requires at most 17 digits for round-trip)
+                format!("{:.17}", f)
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    .to_string()
             }
         }
         Value::Text(t) => {
