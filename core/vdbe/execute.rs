@@ -11588,6 +11588,7 @@ fn op_vacuum_into_inner(
                 state.op_vacuum_into_state.dest_db = Some(dest_db);
                 state.op_vacuum_into_state.dest_conn = Some(dest_conn);
                 state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::QuerySchema;
+                continue;
             }
 
             OpVacuumIntoSubState::QuerySchema => {
@@ -11599,6 +11600,7 @@ fn op_vacuum_into_inner(
                 let schema_stmt = program.connection.prepare(schema_sql)?;
                 state.op_vacuum_into_state.schema_stmt = Some(Box::new(schema_stmt));
                 state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::CollectSchemaRows;
+                continue;
             }
 
             OpVacuumIntoSubState::CollectSchemaRows => {
@@ -11649,6 +11651,7 @@ fn op_vacuum_into_inner(
 
                         state.op_vacuum_into_state.sub_state =
                             OpVacuumIntoSubState::PrepareDestSchema { idx: 0 };
+                        continue;
                     }
                     crate::StepResult::IO => {
                         let io = schema_stmt
@@ -11728,6 +11731,7 @@ fn op_vacuum_into_inner(
                 let dest_stmt = dest_conn.prepare(sql_str)?;
                 state.op_vacuum_into_state.dest_schema_stmt = Some(Box::new(dest_stmt));
                 state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::StepDestSchema { idx };
+                continue;
             }
 
             OpVacuumIntoSubState::StepDestSchema { idx } => {
@@ -11789,6 +11793,7 @@ fn op_vacuum_into_inner(
                 state.op_vacuum_into_state.current_table_columns.clear();
                 state.op_vacuum_into_state.sub_state =
                     OpVacuumIntoSubState::CollectColumnInfo { table_idx };
+                continue;
             }
 
             OpVacuumIntoSubState::CollectColumnInfo { table_idx } => {
@@ -11857,6 +11862,7 @@ fn op_vacuum_into_inner(
                 state.op_vacuum_into_state.select_stmt = Some(Box::new(select_stmt));
                 state.op_vacuum_into_state.sub_state =
                     OpVacuumIntoSubState::StepSourceSelect { table_idx };
+                continue;
             }
 
             OpVacuumIntoSubState::StepSourceSelect { table_idx } => {
@@ -11877,6 +11883,7 @@ fn op_vacuum_into_inner(
                         state.op_vacuum_into_state.current_row_values = Some(values);
                         state.op_vacuum_into_state.sub_state =
                             OpVacuumIntoSubState::PrepareDestInsert { table_idx };
+                        continue;
                     }
                     crate::StepResult::Done => {
                         state.op_vacuum_into_state.select_stmt = None;
@@ -11943,6 +11950,7 @@ fn op_vacuum_into_inner(
                 state.op_vacuum_into_state.dest_insert_stmt = Some(Box::new(dest_stmt));
                 state.op_vacuum_into_state.sub_state =
                     OpVacuumIntoSubState::StepDestInsert { table_idx };
+                continue;
             }
 
             OpVacuumIntoSubState::StepDestInsert { table_idx } => {
@@ -11997,6 +12005,7 @@ fn op_vacuum_into_inner(
                 // Now create triggers and views (after data copy to avoid triggers firing)
                 state.op_vacuum_into_state.sub_state =
                     OpVacuumIntoSubState::PrepareTriggersViews { idx: 0 };
+                continue;
             }
 
             OpVacuumIntoSubState::PrepareTriggersViews { idx } => {
@@ -12004,7 +12013,7 @@ fn op_vacuum_into_inner(
                 let schema_rows_len = state.op_vacuum_into_state.schema_rows.len();
                 turso_assert!(
                     idx <= schema_rows_len,
-                    "PrepareTriggersViews idx {} exceeds schema_rows length {}",
+                    "idx {} incremented past end of schema_rows (len {})",
                     idx,
                     schema_rows_len
                 );
@@ -12014,7 +12023,7 @@ fn op_vacuum_into_inner(
                     continue;
                 }
 
-                // We validated row.len() >= 4 in PrepareDestSchema, so this is safe
+                // We validated row.len() == 4 in PrepareDestSchema
                 let row = &state.op_vacuum_into_state.schema_rows[idx];
 
                 // Only process triggers and views in this phase
