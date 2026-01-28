@@ -11465,7 +11465,7 @@ pub struct OpVacuumIntoState {
     /// Statement for INSERT on destination
     pub dest_insert_stmt: Option<Box<crate::Statement>>,
     /// Current row values for INSERT (stored between states)
-    pub current_row_values: Option<Vec<String>>,
+    pub current_row_values: Option<Vec<Value>>,
     /// Meta values read from source database header
     pub source_user_version: i32,
     pub source_application_id: i32,
@@ -11827,10 +11827,8 @@ fn op_vacuum_into_inner(
                         let row = select_stmt
                             .row()
                             .expect("StepResult::Row but row() returned None");
-                        // Collect row values for INSERT
-                        let values: Vec<String> = (0..row.len())
-                            .map(|i| value_to_sql_literal(row.get_value(i)))
-                            .collect();
+                        // Collect row values for INSERT (store actual Values, not strings)
+                        let values: Vec<Value> = row.get_values().cloned().collect();
                         state.op_vacuum_into_state.current_row_values = Some(values);
                         state.op_vacuum_into_state.sub_state =
                             OpVacuumIntoSubState::PrepareDestInsert { table_idx };
@@ -11862,18 +11860,30 @@ fn op_vacuum_into_inner(
                 let escaped_table_name = table_name.replace('"', "\"\"");
                 // Column names are already escaped when collected
                 let column_names = state.op_vacuum_into_state.current_table_columns.join(", ");
-                let values = state
+                let row_values = state
                     .op_vacuum_into_state
                     .current_row_values
                     .as_ref()
-                    .unwrap()
+                    .unwrap();
+
+                // Generate placeholders for parameter binding (?, ?, ...)
+                let placeholders: String = (0..row_values.len())
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
                     .join(", ");
 
                 let insert_sql =
-                    format!("INSERT INTO \"{escaped_table_name}\" ({column_names}) VALUES ({values})");
+                    format!("INSERT INTO \"{escaped_table_name}\" ({column_names}) VALUES ({placeholders})");
 
                 let dest_conn = state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
-                let dest_stmt = dest_conn.prepare(&insert_sql)?;
+                let mut dest_stmt = dest_conn.prepare(&insert_sql)?;
+
+                // Bind actual values - no string conversion needed
+                for (i, value) in row_values.iter().enumerate() {
+                    let index = std::num::NonZero::new(i + 1).unwrap();
+                    dest_stmt.bind_at(index, value.clone());
+                }
+
                 state.op_vacuum_into_state.dest_insert_stmt = Some(Box::new(dest_stmt));
                 state.op_vacuum_into_state.sub_state =
                     OpVacuumIntoSubState::StepDestInsert { table_idx };
@@ -11999,44 +12009,6 @@ fn op_vacuum_into_inner(
     }
 }
 
-/// Convert a Value to its SQL literal representation for use in INSERT statements.
-fn value_to_sql_literal(value: &Value) -> String {
-    match value {
-        Value::Null => "NULL".to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Float(f) => {
-            if f.is_nan() {
-                "NULL".to_string() // SQLite doesn't have NaN
-            } else if f.is_infinite() {
-                if f.is_sign_positive() {
-                    "9e999".to_string() // Large positive number that becomes Infinity
-                } else {
-                    "-9e999".to_string()
-                }
-            } else {
-                // Use 17 significant digits to preserve full f64 precision
-                // (IEEE 754 double requires at most 17 digits for round-trip)
-                let s = format!("{:.17}", f).trim_end_matches('0').to_string();
-                // Ensure there's always a decimal point so SQLite interprets as float
-                if !s.contains('.') {
-                    format!("{}.0", s)
-                } else {
-                    s.trim_end_matches('.').to_string()
-                }
-            }
-        }
-        Value::Text(t) => {
-            // Escape single quotes by doubling them
-            let escaped = t.as_str().replace('\'', "''");
-            format!("'{escaped}'")
-        }
-        Value::Blob(b) => {
-            // Convert blob to hex literal X'...'
-            let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
-            format!("X'{hex}'")
-        }
-    }
-}
 
 fn with_header<T, F>(
     pager: &Pager,
