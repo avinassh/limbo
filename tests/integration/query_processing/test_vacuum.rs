@@ -947,6 +947,10 @@ fn test_vacuum_into_preserves_float_precision(tmp_db: TempDatabase) -> anyhow::R
         1e15,                         // Large number
         -0.999999999999999,           // Negative with many 9s
         123456789.123456789,          // Large with decimals
+        1.0,                          // Integer-like float (must stay float, not become int)
+        -2.0,                         // Negative integer-like float
+        0.0,                          // Zero as float
+        100.0,                        // Larger integer-like float
     ];
 
     for (i, &val) in test_values.iter().enumerate() {

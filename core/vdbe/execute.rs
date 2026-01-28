@@ -11936,23 +11936,23 @@ fn op_vacuum_into_inner(
                     continue;
                 }
 
+                // We validated row.len() >= 4 in PrepareDestSchema, so this is safe
                 let row = &state.op_vacuum_into_state.schema_rows[idx];
-                if row.len() >= 4 {
-                    // Only process triggers and views in this phase
-                    if let Value::Text(type_val) = &row[0] {
-                        let type_str = type_val.as_str();
-                        if type_str == "trigger" || type_str == "view" {
-                            if let Value::Text(sql) = &row[3] {
-                                let sql_str = sql.as_str();
-                                let dest_conn =
-                                    state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
-                                let dest_stmt = dest_conn.prepare(sql_str)?;
-                                state.op_vacuum_into_state.dest_schema_stmt =
-                                    Some(Box::new(dest_stmt));
-                                state.op_vacuum_into_state.sub_state =
-                                    OpVacuumIntoSubState::StepTriggersViews { idx };
-                                continue;
-                            }
+
+                // Only process triggers and views in this phase
+                if let Value::Text(type_val) = &row[0] {
+                    let type_str = type_val.as_str();
+                    if type_str == "trigger" || type_str == "view" {
+                        if let Value::Text(sql) = &row[3] {
+                            let sql_str = sql.as_str();
+                            let dest_conn =
+                                state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
+                            let dest_stmt = dest_conn.prepare(sql_str)?;
+                            state.op_vacuum_into_state.dest_schema_stmt =
+                                Some(Box::new(dest_stmt));
+                            state.op_vacuum_into_state.sub_state =
+                                OpVacuumIntoSubState::StepTriggersViews { idx };
+                            continue;
                         }
                     }
                 }
@@ -12016,10 +12016,13 @@ fn value_to_sql_literal(value: &Value) -> String {
             } else {
                 // Use 17 significant digits to preserve full f64 precision
                 // (IEEE 754 double requires at most 17 digits for round-trip)
-                format!("{:.17}", f)
-                    .trim_end_matches('0')
-                    .trim_end_matches('.')
-                    .to_string()
+                let s = format!("{:.17}", f).trim_end_matches('0').to_string();
+                // Ensure there's always a decimal point so SQLite interprets as float
+                if !s.contains('.') {
+                    format!("{}.0", s)
+                } else {
+                    s.trim_end_matches('.').to_string()
+                }
             }
         }
         Value::Text(t) => {
