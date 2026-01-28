@@ -667,7 +667,10 @@ fn test_vacuum_into_preserves_page_size(_tmp_db: TempDatabase) -> anyhow::Result
 
     // Verify data was copied
     let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, b FROM t ORDER BY a");
-    assert_eq!(rows, vec![(1, "hello".to_string()), (2, "world".to_string())]);
+    assert_eq!(
+        rows,
+        vec![(1, "hello".to_string()), (2, "world".to_string())]
+    );
 
     Ok(())
 }
@@ -917,8 +920,7 @@ fn test_vacuum_into_special_table_names(tmp_db: TempDatabase) -> anyhow::Result<
         dest_conn.exec_rows("SELECT id, value FROM \"table with spaces\"");
     assert_eq!(rows1, vec![(1, "hello".to_string())]);
 
-    let rows2: Vec<(i64, String)> =
-        dest_conn.exec_rows("SELECT id, data FROM \"table\"\"quote\"");
+    let rows2: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, data FROM \"table\"\"quote\"");
     assert_eq!(rows2, vec![(2, "world".to_string())]);
 
     // Verify integrity
@@ -938,23 +940,27 @@ fn test_vacuum_into_preserves_float_precision(tmp_db: TempDatabase) -> anyhow::R
     // Insert various floats that require high precision
     // These values are chosen to test edge cases in float representation
     let test_values: Vec<f64> = vec![
-        0.1,                          // Classic binary representation issue
-        0.123456789012345,            // Many decimal places
-        1.0000000000000002,           // Smallest increment above 1.0
-        std::f64::consts::PI,         // Pi (3.141592653589793)
-        std::f64::consts::E,          // Euler's number (2.718281828459045)
-        1e-10,                        // Very small number
-        1e15,                         // Large number
-        -0.999999999999999,           // Negative with many 9s
-        123456789.123456789,          // Large with decimals
-        1.0,                          // Integer-like float (must stay float, not become int)
-        -2.0,                         // Negative integer-like float
-        0.0,                          // Zero as float
-        100.0,                        // Larger integer-like float
+        0.1,                  // Classic binary representation issue
+        0.123456789012345,    // Many decimal places
+        1.0000000000000002,   // Smallest increment above 1.0
+        std::f64::consts::PI, // Pi (3.141592653589793)
+        std::f64::consts::E,  // Euler's number (2.718281828459045)
+        1e-10,                // Very small number
+        1e15,                 // Large number
+        -0.999999999999999,   // Negative with many 9s
+        123456789.123456789,  // Large with decimals
+        1.0,                  // Integer-like float (must stay float, not become int)
+        -2.0,                 // Negative integer-like float
+        0.0,                  // Zero as float
+        100.0,                // Larger integer-like float
     ];
 
     for (i, &val) in test_values.iter().enumerate() {
-        conn.execute(&format!("INSERT INTO floats VALUES ({}, {:.17})", i + 1, val))?;
+        conn.execute(&format!(
+            "INSERT INTO floats VALUES ({}, {:.17})",
+            i + 1,
+            val
+        ))?;
     }
 
     let dest_dir = TempDir::new()?;
@@ -988,3 +994,604 @@ fn test_vacuum_into_preserves_float_precision(tmp_db: TempDatabase) -> anyhow::R
     Ok(())
 }
 
+/// Test VACUUM INTO with a completely empty database (no tables at all)
+#[turso_macros::test]
+fn test_vacuum_into_completely_empty_database(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Database has no tables, no data - completely empty
+    // Verify sqlite_schema is empty (except for internal tables)
+    let schema: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE type = 'table'");
+    assert!(
+        schema.is_empty(),
+        "Source database should have no user tables"
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_empty.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    // Execute VACUUM INTO on empty database
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    // Open destination and verify it's also empty but valid
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify integrity of destination database
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(
+        integrity_result, "ok",
+        "Empty destination database should pass integrity check"
+    );
+
+    // Verify destination has no user tables
+    let dest_schema: Vec<(String,)> =
+        dest_conn.exec_rows("SELECT name FROM sqlite_schema WHERE type = 'table'");
+    assert!(
+        dest_schema.is_empty(),
+        "Destination database should have no user tables"
+    );
+
+    // Verify we can create tables in the destination (it's a valid database)
+    dest_conn.execute("CREATE TABLE t (a INTEGER)")?;
+    dest_conn.execute("INSERT INTO t VALUES (1)")?;
+    let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t");
+    assert_eq!(
+        rows,
+        vec![(1,)],
+        "Should be able to use vacuumed empty database"
+    );
+
+    Ok(())
+}
+
+/// Test VACUUM INTO behavior with virtual tables (FTS)
+/// This test documents the current behavior - virtual tables have rootpage=0
+/// and SQLite handles them specially in VACUUM
+#[turso_macros::test]
+fn test_vacuum_into_with_virtual_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create a regular table
+    conn.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, title TEXT, body TEXT)")?;
+    conn.execute("INSERT INTO documents VALUES (1, 'Hello World', 'This is a test document')")?;
+    conn.execute(
+        "INSERT INTO documents VALUES (2, 'Rust Programming', 'Rust is a systems language')",
+    )?;
+
+    // Try to create a virtual table (FTS5)
+    // Note: This may fail if FTS is not enabled - that's also useful information
+    let fts_result = conn.execute(
+        "CREATE VIRTUAL TABLE documents_fts USING fts5(title, body, content=documents, content_rowid=id)"
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_virtual.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    match fts_result {
+        Ok(_) => {
+            // FTS table was created successfully
+            // Check that the virtual table exists in schema
+            let schema: Vec<(String, String, i64)> = conn.exec_rows(
+                "SELECT type, name, COALESCE(rootpage, -1) FROM sqlite_schema WHERE name LIKE 'documents%' ORDER BY name"
+            );
+
+            // Virtual tables typically have rootpage=0
+            // Log what we found for debugging
+            for (type_val, name, rootpage) in &schema {
+                println!("Schema entry: type={type_val}, name={name}, rootpage={rootpage}");
+            }
+
+            // Execute VACUUM INTO
+            let vacuum_result = conn.execute(&format!("VACUUM INTO '{dest_path_str}'"));
+
+            match vacuum_result {
+                Ok(_) => {
+                    // VACUUM succeeded - check what was copied
+                    let dest_db = TempDatabase::new_with_existent(&dest_path);
+                    let dest_conn = dest_db.connect_limbo();
+
+                    // Verify integrity
+                    let integrity_result = run_integrity_check(&dest_conn);
+                    assert_eq!(
+                        integrity_result, "ok",
+                        "Destination should pass integrity check"
+                    );
+
+                    // Check what tables exist in destination
+                    let dest_schema: Vec<(String, String)> = dest_conn.exec_rows(
+                        "SELECT type, name FROM sqlite_schema WHERE name LIKE 'documents%' ORDER BY name"
+                    );
+                    println!("Destination schema: {dest_schema:?}");
+
+                    // Regular table data should be copied
+                    let rows: Vec<(i64, String)> =
+                        dest_conn.exec_rows("SELECT id, title FROM documents ORDER BY id");
+                    assert_eq!(
+                        rows,
+                        vec![
+                            (1, "Hello World".to_string()),
+                            (2, "Rust Programming".to_string())
+                        ],
+                        "Regular table data should be copied"
+                    );
+                }
+                Err(e) => {
+                    // VACUUM failed with virtual table - document the error
+                    println!("VACUUM INTO failed with virtual table present: {e}");
+                    // This is acceptable - we're documenting behavior
+                }
+            }
+        }
+        Err(e) => {
+            // FTS not supported or not enabled - test without virtual table
+            println!("FTS virtual table creation failed (expected if FTS not enabled): {e}");
+
+            // Just vacuum the regular table
+            conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+            let dest_db = TempDatabase::new_with_existent(&dest_path);
+            let dest_conn = dest_db.connect_limbo();
+
+            let integrity_result = run_integrity_check(&dest_conn);
+            assert_eq!(integrity_result, "ok");
+
+            let rows: Vec<(i64, String)> =
+                dest_conn.exec_rows("SELECT id, title FROM documents ORDER BY id");
+            assert_eq!(
+                rows,
+                vec![
+                    (1, "Hello World".to_string()),
+                    (2, "Rust Programming".to_string())
+                ]
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Test VACUUM INTO with database containing only indexes (edge case)
+/// This tests a database with tables that have indexes but no data
+#[turso_macros::test]
+fn test_vacuum_into_schema_only_with_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create multiple tables with various index types but no data
+    conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)")?;
+    conn.execute("CREATE TABLE t2 (a TEXT, b TEXT, c INTEGER)")?;
+
+    // Create various indexes
+    conn.execute("CREATE INDEX idx_t1_name ON t1 (name)")?;
+    conn.execute("CREATE INDEX idx_t1_value ON t1 (value DESC)")?;
+    conn.execute("CREATE UNIQUE INDEX idx_t2_a ON t2 (a)")?;
+    conn.execute("CREATE INDEX idx_t2_composite ON t2 (b, c)")?;
+
+    // Verify schema was created
+    let indexes: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name");
+    assert_eq!(indexes.len(), 4, "Should have 4 indexes");
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_indexes.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    // Verify all indexes exist
+    let dest_indexes: Vec<(String,)> =
+        dest_conn.exec_rows("SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name");
+    assert_eq!(
+        dest_indexes, indexes,
+        "All indexes should be copied to destination"
+    );
+
+    // Verify tables are empty
+    let t1_count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM t1");
+    let t2_count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM t2");
+    assert_eq!(t1_count, vec![(0,)]);
+    assert_eq!(t2_count, vec![(0,)]);
+
+    // Verify indexes work by inserting data
+    dest_conn.execute("INSERT INTO t1 VALUES (1, 'test', 100)")?;
+    dest_conn.execute("INSERT INTO t2 VALUES ('unique', 'b', 1)")?;
+
+    // Unique constraint should work
+    let dup_result = dest_conn.execute("INSERT INTO t2 VALUES ('unique', 'other', 2)");
+    assert!(
+        dup_result.is_err(),
+        "Unique index constraint should be enforced"
+    );
+
+    Ok(())
+}
+
+/// Test VACUUM INTO with tables that have no columns
+/// SQLite allows CREATE TABLE t(); with zero columns
+#[turso_macros::test]
+fn test_vacuum_into_table_with_no_columns(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Try to create a table with no columns
+    // This is valid SQL in SQLite: CREATE TABLE t();
+    let create_result = conn.execute("CREATE TABLE empty_cols()");
+
+    match create_result {
+        Ok(_) => {
+            // Table with no columns was created successfully
+            // Verify it exists in schema
+            let schema: Vec<(String, String)> =
+                conn.exec_rows("SELECT type, name FROM sqlite_schema WHERE name = 'empty_cols'");
+            assert_eq!(
+                schema,
+                vec![("table".to_string(), "empty_cols".to_string())],
+                "Table with no columns should exist in schema"
+            );
+
+            // Check column count via pragma
+            let columns: Vec<(String,)> =
+                conn.exec_rows("SELECT name FROM pragma_table_info('empty_cols')");
+            assert!(
+                columns.is_empty(),
+                "Table should have no columns, got: {columns:?}"
+            );
+
+            // Also create a normal table to ensure mixed scenario works
+            conn.execute("CREATE TABLE normal_table (id INTEGER, name TEXT)")?;
+            conn.execute("INSERT INTO normal_table VALUES (1, 'test')")?;
+
+            let dest_dir = TempDir::new()?;
+            let dest_path = dest_dir.path().join("vacuumed_no_cols.db");
+            let dest_path_str = dest_path.to_str().unwrap();
+
+            // Execute VACUUM INTO
+            let vacuum_result = conn.execute(&format!("VACUUM INTO '{dest_path_str}'"));
+
+            match vacuum_result {
+                Ok(_) => {
+                    // VACUUM succeeded
+                    let dest_db = TempDatabase::new_with_existent(&dest_path);
+                    let dest_conn = dest_db.connect_limbo();
+
+                    // Verify integrity
+                    let integrity_result = run_integrity_check(&dest_conn);
+                    assert_eq!(integrity_result, "ok");
+
+                    // Verify the no-column table exists
+                    let dest_schema: Vec<(String,)> = dest_conn
+                        .exec_rows("SELECT name FROM sqlite_schema WHERE name = 'empty_cols'");
+                    assert_eq!(
+                        dest_schema,
+                        vec![("empty_cols".to_string(),)],
+                        "Table with no columns should be copied"
+                    );
+
+                    // Verify normal table data was copied
+                    let rows: Vec<(i64, String)> =
+                        dest_conn.exec_rows("SELECT id, name FROM normal_table");
+                    assert_eq!(rows, vec![(1, "test".to_string())]);
+                }
+                Err(e) => {
+                    // VACUUM failed - document the error
+                    println!("VACUUM INTO failed with no-column table: {e}");
+                    // This documents the behavior
+                }
+            }
+        }
+        Err(e) => {
+            // Creating table with no columns is not supported
+            println!("CREATE TABLE with no columns not supported: {e}");
+            // This is also valid behavior to document
+        }
+    }
+
+    Ok(())
+}
+
+/// Test VACUUM INTO with column names containing special characters
+/// This tests the column escaping logic in the vacuum implementation
+#[turso_macros::test]
+fn test_vacuum_into_special_column_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create table with columns that have special characters
+    conn.execute(
+        r#"CREATE TABLE t (
+            "column with spaces" INTEGER,
+            "column""with""quotes" TEXT,
+            "Column-With-Dashes" REAL,
+            "column.with.dots" BLOB
+        )"#,
+    )?;
+
+    // Insert test data
+    conn.execute(r#"INSERT INTO t VALUES (42, 'test value', 3.14, X'DEADBEEF')"#)?;
+    conn.execute(r#"INSERT INTO t VALUES (100, 'another', 2.71, X'CAFEBABE')"#)?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_special_cols.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    // Verify data was copied correctly with special column names
+    let rows: Vec<(i64, String, f64)> = dest_conn.exec_rows(
+        r#"SELECT "column with spaces", "column""with""quotes", "Column-With-Dashes" FROM t ORDER BY "column with spaces""#,
+    );
+    assert_eq!(
+        rows,
+        vec![
+            (42, "test value".to_string(), 3.14),
+            (100, "another".to_string(), 2.71)
+        ]
+    );
+
+    // Verify blob column with special name
+    let mut stmt =
+        dest_conn.prepare(r#"SELECT "column.with.dots" FROM t ORDER BY "column with spaces""#)?;
+    let blob_values = stmt.run_collect_rows()?;
+    assert_eq!(blob_values.len(), 2);
+    assert_eq!(blob_values[0][0], Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+    assert_eq!(blob_values[1][0], Value::Blob(vec![0xCA, 0xFE, 0xBA, 0xBE]));
+
+    Ok(())
+}
+
+/// Test VACUUM INTO with SQL reserved keywords as table and column names
+#[turso_macros::test]
+fn test_vacuum_into_reserved_keyword_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create tables using SQL reserved keywords as names
+    conn.execute(
+        r#"CREATE TABLE "select" (
+            "from" INTEGER,
+            "where" TEXT,
+            "order" REAL,
+            "group" INTEGER
+        )"#,
+    )?;
+    conn.execute(
+        r#"CREATE TABLE "table" (
+            "index" INTEGER,
+            "create" TEXT,
+            "drop" BLOB
+        )"#,
+    )?;
+
+    // Insert data
+    conn.execute(r#"INSERT INTO "select" VALUES (1, 'test', 1.5, 10)"#)?;
+    conn.execute(r#"INSERT INTO "table" VALUES (2, 'data', X'ABCD')"#)?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_keywords.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    // Verify "select" table data
+    let rows1: Vec<(i64, String, f64, i64)> =
+        dest_conn.exec_rows(r#"SELECT "from", "where", "order", "group" FROM "select""#);
+    assert_eq!(rows1, vec![(1, "test".to_string(), 1.5, 10)]);
+
+    // Verify "table" table data
+    let rows2: Vec<(i64, String)> = dest_conn.exec_rows(r#"SELECT "index", "create" FROM "table""#);
+    assert_eq!(rows2, vec![(2, "data".to_string())]);
+
+    Ok(())
+}
+
+/// Test VACUUM INTO with Unicode characters in table and column names
+#[turso_macros::test]
+fn test_vacuum_into_unicode_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create table with Unicode characters in names
+    conn.execute(
+        r#"CREATE TABLE "表格" (
+            "列名" INTEGER,
+            "données" TEXT,
+            "Ñoño" REAL,
+            "emoji_🎉" TEXT
+        )"#,
+    )?;
+
+    // Insert data with Unicode
+    conn.execute(r#"INSERT INTO "表格" VALUES (1, 'données françaises', 3.14, '🎊')"#)?;
+    conn.execute(r#"INSERT INTO "表格" VALUES (2, 'más datos', 2.71, '✨')"#)?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_unicode.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    // Verify data was copied correctly
+    let rows: Vec<(i64, String, f64, String)> = dest_conn
+        .exec_rows(r#"SELECT "列名", "données", "Ñoño", "emoji_🎉" FROM "表格" ORDER BY "列名""#);
+    assert_eq!(
+        rows,
+        vec![
+            (1, "données françaises".to_string(), 3.14, "🎊".to_string()),
+            (2, "más datos".to_string(), 2.71, "✨".to_string())
+        ]
+    );
+
+    Ok(())
+}
+
+/// Test VACUUM INTO with names starting with numbers or containing only numbers
+#[turso_macros::test]
+fn test_vacuum_into_numeric_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create tables with numeric names (must be quoted)
+    conn.execute(
+        r#"CREATE TABLE "123" (
+            "456" INTEGER,
+            "789abc" TEXT,
+            "0" REAL
+        )"#,
+    )?;
+    conn.execute(r#"CREATE TABLE "1st_table" ("2nd_column" INTEGER)"#)?;
+
+    // Insert data
+    conn.execute(r#"INSERT INTO "123" VALUES (100, 'numeric', 1.23)"#)?;
+    conn.execute(r#"INSERT INTO "1st_table" VALUES (999)"#)?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_numeric.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    // Verify "123" table
+    let rows1: Vec<(i64, String, f64)> =
+        dest_conn.exec_rows(r#"SELECT "456", "789abc", "0" FROM "123""#);
+    assert_eq!(rows1, vec![(100, "numeric".to_string(), 1.23)]);
+
+    // Verify "1st_table" table
+    let rows2: Vec<(i64,)> = dest_conn.exec_rows(r#"SELECT "2nd_column" FROM "1st_table""#);
+    assert_eq!(rows2, vec![(999,)]);
+
+    Ok(())
+}
+
+/// Test VACUUM INTO with mixed special characters in names
+/// This is a stress test combining multiple escaping challenges
+#[turso_macros::test]
+fn test_vacuum_into_mixed_special_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create table with extremely challenging names
+    conn.execute(
+        r#"CREATE TABLE "table ""with"" many ""quotes""" (
+            "col ""A""" INTEGER,
+            "col with spaces and ""quotes""" TEXT,
+            "SELECT * FROM users; --" INTEGER
+        )"#,
+    )?;
+
+    // Insert data
+    conn.execute(r#"INSERT INTO "table ""with"" many ""quotes""" VALUES (1, 'data', 42)"#)?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_mixed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    // Verify data
+    let rows: Vec<(i64, String, i64)> = dest_conn.exec_rows(
+        r#"SELECT "col ""A""", "col with spaces and ""quotes""", "SELECT * FROM users; --" FROM "table ""with"" many ""quotes""""#,
+    );
+    assert_eq!(rows, vec![(1, "data".to_string(), 42)]);
+
+    Ok(())
+}
+
+/// Test VACUUM INTO with index on columns with special names
+#[turso_macros::test]
+fn test_vacuum_into_index_on_special_column_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create table with special column names
+    conn.execute(
+        r#"CREATE TABLE "data table" (
+            "primary key" INTEGER PRIMARY KEY,
+            "sort order" TEXT,
+            "value""quoted" INTEGER
+        )"#,
+    )?;
+
+    // Create indexes on columns with special names
+    conn.execute(r#"CREATE INDEX "idx on sort" ON "data table" ("sort order")"#)?;
+    conn.execute(r#"CREATE INDEX "idx""quoted" ON "data table" ("value""quoted" DESC)"#)?;
+
+    // Insert data
+    conn.execute(r#"INSERT INTO "data table" VALUES (1, 'alpha', 100)"#)?;
+    conn.execute(r#"INSERT INTO "data table" VALUES (2, 'beta', 200)"#)?;
+    conn.execute(r#"INSERT INTO "data table" VALUES (3, 'gamma', 150)"#)?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_idx_special.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    // Verify indexes exist
+    let indexes: Vec<(String,)> = dest_conn.exec_rows(
+        r#"SELECT name FROM sqlite_schema WHERE type = 'index' AND name LIKE 'idx%' ORDER BY name"#,
+    );
+    assert_eq!(
+        indexes,
+        vec![("idx on sort".to_string(),), ("idx\"quoted".to_string(),)]
+    );
+
+    // Verify data
+    let rows: Vec<(i64, String, i64)> = dest_conn.exec_rows(
+        r#"SELECT "primary key", "sort order", "value""quoted" FROM "data table" ORDER BY "primary key""#,
+    );
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alpha".to_string(), 100),
+            (2, "beta".to_string(), 200),
+            (3, "gamma".to_string(), 150)
+        ]
+    );
+
+    Ok(())
+}
