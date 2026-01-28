@@ -850,3 +850,81 @@ fn test_vacuum_into_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+/// Test that a table with "sqlite_sequence" in its SQL (e.g., default value) is NOT skipped
+#[turso_macros::test]
+fn test_vacuum_into_table_with_sqlite_sequence_in_sql(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create a table that mentions "sqlite_sequence" in a default value
+    // This should NOT be skipped during schema copy
+    conn.execute(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, content TEXT DEFAULT 'see sqlite_sequence')",
+    )?;
+
+    conn.execute("INSERT INTO notes (id) VALUES (1)")?;
+    conn.execute("INSERT INTO notes (id, content) VALUES (2, 'custom')")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify the table was created and data was copied
+    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, content FROM notes ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            (1, "see sqlite_sequence".to_string()),
+            (2, "custom".to_string())
+        ],
+        "Table with 'sqlite_sequence' in SQL should be created and data copied"
+    );
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    Ok(())
+}
+
+/// Test VACUUM INTO with table names containing special characters (double quotes)
+#[turso_macros::test]
+fn test_vacuum_into_special_table_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create tables with special characters in names
+    conn.execute("CREATE TABLE \"table with spaces\" (id INTEGER, value TEXT)")?;
+    conn.execute("CREATE TABLE \"table\"\"quote\" (id INTEGER, data TEXT)")?;
+
+    conn.execute("INSERT INTO \"table with spaces\" VALUES (1, 'hello')")?;
+    conn.execute("INSERT INTO \"table\"\"quote\" VALUES (2, 'world')")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    // Verify tables with special names were copied
+    let rows1: Vec<(i64, String)> =
+        dest_conn.exec_rows("SELECT id, value FROM \"table with spaces\"");
+    assert_eq!(rows1, vec![(1, "hello".to_string())]);
+
+    let rows2: Vec<(i64, String)> =
+        dest_conn.exec_rows("SELECT id, data FROM \"table\"\"quote\"");
+    assert_eq!(rows2, vec![(2, "world".to_string())]);
+
+    // Verify integrity
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(integrity_result, "ok");
+
+    Ok(())
+}
+

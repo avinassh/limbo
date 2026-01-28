@@ -11648,10 +11648,10 @@ fn op_vacuum_into_inner(
                             OpVacuumIntoSubState::PrepareDestSchema { idx: 0 };
                     }
                     crate::StepResult::IO => {
-                        // Yield the IO completions
-                        if let Some(io) = schema_stmt.take_io_completions() {
-                            return Ok(InsnFunctionStepResult::IO(io));
-                        }
+                        let io = schema_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
                         return Err(LimboError::Busy);
@@ -11681,17 +11681,24 @@ fn op_vacuum_into_inner(
                         }
                     }
 
-                    if let Value::Text(sql) = &row[3] {
-                        let sql_str = sql.as_str();
-                        // Skip sqlite_sequence as it's created automatically
-                        if !sql_str.contains("sqlite_sequence") {
-                            let dest_conn = state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
-                            let dest_stmt = dest_conn.prepare(sql_str)?;
-                            state.op_vacuum_into_state.dest_schema_stmt = Some(Box::new(dest_stmt));
+                    // Skip sqlite_sequence - it's auto-created when AUTOINCREMENT is used
+                    // (we still copy its data in the data copy phase)
+                    if let Value::Text(name_val) = &row[1] {
+                        if name_val.as_str() == "sqlite_sequence" {
                             state.op_vacuum_into_state.sub_state =
-                                OpVacuumIntoSubState::StepDestSchema { idx };
+                                OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
                             continue;
                         }
+                    }
+
+                    if let Value::Text(sql) = &row[3] {
+                        let sql_str = sql.as_str();
+                        let dest_conn = state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
+                        let dest_stmt = dest_conn.prepare(sql_str)?;
+                        state.op_vacuum_into_state.dest_schema_stmt = Some(Box::new(dest_stmt));
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::StepDestSchema { idx };
+                        continue;
                     }
                 }
 
@@ -11718,9 +11725,10 @@ fn op_vacuum_into_inner(
                             OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
                     }
                     crate::StepResult::IO => {
-                        if let Some(io) = dest_stmt.take_io_completions() {
-                            return Ok(InsnFunctionStepResult::IO(io));
-                        }
+                        let io = dest_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
                         return Err(LimboError::Busy);
@@ -11737,7 +11745,9 @@ fn op_vacuum_into_inner(
                 }
 
                 let table_name = &state.op_vacuum_into_state.table_names[table_idx];
-                let pragma_sql = format!("PRAGMA table_info(\"{table_name}\")");
+                // Escape double quotes in table name for safe SQL
+                let escaped_table_name = table_name.replace('"', "\"\"");
+                let pragma_sql = format!("PRAGMA table_info(\"{escaped_table_name}\")");
                 let column_stmt = program.connection.prepare(&pragma_sql)?;
                 state.op_vacuum_into_state.column_stmt = Some(Box::new(column_stmt));
                 state.op_vacuum_into_state.current_table_columns.clear();
@@ -11754,7 +11764,9 @@ fn op_vacuum_into_inner(
                         if let Some(row) = column_stmt.row() {
                             // Column name is at index 1
                             if let Value::Text(name) = row.get_value(1) {
-                                let col_name = format!("\"{}\"", name.as_str());
+                                // Escape double quotes in column name for safe SQL
+                                let escaped_name = name.as_str().replace('"', "\"\"");
+                                let col_name = format!("\"{escaped_name}\"");
                                 state
                                     .op_vacuum_into_state
                                     .current_table_columns
@@ -11778,9 +11790,10 @@ fn op_vacuum_into_inner(
                         }
                     }
                     crate::StepResult::IO => {
-                        if let Some(io) = column_stmt.take_io_completions() {
-                            return Ok(InsnFunctionStepResult::IO(io));
-                        }
+                        let io = column_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
                         return Err(LimboError::Busy);
@@ -11791,7 +11804,9 @@ fn op_vacuum_into_inner(
             OpVacuumIntoSubState::StartSelectRows { table_idx } => {
                 let table_idx = *table_idx;
                 let table_name = &state.op_vacuum_into_state.table_names[table_idx];
-                let select_sql = format!("SELECT * FROM \"{table_name}\"");
+                // Escape double quotes in table name for safe SQL
+                let escaped_table_name = table_name.replace('"', "\"\"");
+                let select_sql = format!("SELECT * FROM \"{escaped_table_name}\"");
                 let select_stmt = program.connection.prepare(&select_sql)?;
                 state.op_vacuum_into_state.select_stmt = Some(Box::new(select_stmt));
                 state.op_vacuum_into_state.sub_state =
@@ -11823,9 +11838,10 @@ fn op_vacuum_into_inner(
                             };
                     }
                     crate::StepResult::IO => {
-                        if let Some(io) = select_stmt.take_io_completions() {
-                            return Ok(InsnFunctionStepResult::IO(io));
-                        }
+                        let io = select_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
                         return Err(LimboError::Busy);
@@ -11836,6 +11852,9 @@ fn op_vacuum_into_inner(
             OpVacuumIntoSubState::PrepareDestInsert { table_idx } => {
                 let table_idx = *table_idx;
                 let table_name = &state.op_vacuum_into_state.table_names[table_idx];
+                // Escape double quotes in table name for safe SQL
+                let escaped_table_name = table_name.replace('"', "\"\"");
+                // Column names are already escaped when collected
                 let column_names = state.op_vacuum_into_state.current_table_columns.join(", ");
                 let values = state
                     .op_vacuum_into_state
@@ -11845,7 +11864,7 @@ fn op_vacuum_into_inner(
                     .join(", ");
 
                 let insert_sql =
-                    format!("INSERT INTO \"{table_name}\" ({column_names}) VALUES ({values})");
+                    format!("INSERT INTO \"{escaped_table_name}\" ({column_names}) VALUES ({values})");
 
                 let dest_conn = state.op_vacuum_into_state.dest_conn.as_ref().unwrap();
                 let dest_stmt = dest_conn.prepare(&insert_sql)?;
@@ -11874,9 +11893,10 @@ fn op_vacuum_into_inner(
                             OpVacuumIntoSubState::StepSourceSelect { table_idx };
                     }
                     crate::StepResult::IO => {
-                        if let Some(io) = dest_stmt.take_io_completions() {
-                            return Ok(InsnFunctionStepResult::IO(io));
-                        }
+                        let io = dest_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
                         return Err(LimboError::Busy);
@@ -11954,9 +11974,10 @@ fn op_vacuum_into_inner(
                             OpVacuumIntoSubState::PrepareTriggersViews { idx: idx + 1 };
                     }
                     crate::StepResult::IO => {
-                        if let Some(io) = dest_stmt.take_io_completions() {
-                            return Ok(InsnFunctionStepResult::IO(io));
-                        }
+                        let io = dest_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
                         return Err(LimboError::Busy);
