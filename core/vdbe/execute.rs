@@ -11601,6 +11601,12 @@ fn op_vacuum_into_inner(
                 // must be set before page 1 is allocated (before any schema operations)
                 dest_conn.set_reserved_bytes(reserved_space)?;
 
+                // Enable MVCC on destination if source has it enabled
+                // Must be done before any schema operations to ensure the log file is created
+                if program.connection.db.mvcc_enabled() {
+                    dest_conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")?;
+                }
+
                 state.op_vacuum_into_state.dest_db = Some(dest_db);
                 state.op_vacuum_into_state.dest_conn = Some(dest_conn);
                 state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::QuerySchema;

@@ -23,7 +23,7 @@ fn run_integrity_check(conn: &Arc<Connection>) -> String {
         .join("\n")
 }
 
-#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER, b TEXT, c BLOB);")]
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER, b TEXT, c BLOB);")]
 fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
@@ -90,7 +90,7 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// Test VACUUM INTO error cases: plain VACUUM, existing file, within transaction
-#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
@@ -140,7 +140,7 @@ fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_multiple_tables(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
@@ -179,7 +179,7 @@ fn test_vacuum_into_multiple_tables(tmp_db: TempDatabase) -> anyhow::Result<()> 
     Ok(())
 }
 
-#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
@@ -223,6 +223,7 @@ fn test_vacuum_into_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// Test VACUUM INTO with views (simple and complex views with aggregations)
+/// Note: Views are not yet supported with MVCC
 #[turso_macros::test]
 fn test_vacuum_into_with_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -309,6 +310,7 @@ fn test_vacuum_into_with_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
 /// Test VACUUM INTO with triggers (single and multiple).
 /// Verifies that trigger definitions are preserved in the vacuumed database
 /// and that data inserted by triggers during initial inserts is copied correctly.
+/// Note: Triggers are not yet fully supported with MVCC
 #[turso_macros::test]
 fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
@@ -400,6 +402,7 @@ fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
 }
 
 /// Test VACUUM INTO preserves meta values: user_version, application_id
+/// Note: Some pragmas don't work correctly with MVCC yet
 #[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -450,7 +453,7 @@ fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Resul
     Ok(())
 }
 
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_preserves_page_size(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     // create a new empty database and set page_size before creating tables
     let source_db = TempDatabase::new_empty();
@@ -495,7 +498,7 @@ fn test_vacuum_into_preserves_page_size(_tmp_db: TempDatabase) -> anyhow::Result
 }
 
 /// Test VACUUM INTO with edge cases: empty tables with indexes, completely empty database
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_empty_edge_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let dest_dir = TempDir::new()?;
 
@@ -561,7 +564,7 @@ fn test_vacuum_into_empty_edge_cases(tmp_db: TempDatabase) -> anyhow::Result<()>
 }
 
 /// Test VACUUM INTO preserves AUTOINCREMENT counters (sqlite_sequence)
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -623,7 +626,7 @@ fn test_vacuum_into_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Res
 }
 
 /// Test that a table with "sqlite_sequence" in its SQL (e.g., default value) is NOT skipped
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_table_with_sqlite_sequence_in_sql(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -666,7 +669,7 @@ fn test_vacuum_into_table_with_sqlite_sequence_in_sql(tmp_db: TempDatabase) -> a
 
 /// Test VACUUM INTO with table names containing special characters
 /// tests for: spaces, quotes, SQL keywords, unicode, numeric names, and mixed special chars
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_special_table_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -740,7 +743,7 @@ fn test_vacuum_into_special_table_names(tmp_db: TempDatabase) -> anyhow::Result<
 }
 
 /// Test VACUUM INTO preserves float precision
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_preserves_float_precision(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -809,7 +812,7 @@ fn test_vacuum_into_preserves_float_precision(tmp_db: TempDatabase) -> anyhow::R
 /// Test VACUUM INTO with column names containing special characters
 /// Consolidates tests for: spaces, quotes, SQL keywords, unicode, numeric, dashes, dots,
 /// mixed special chars, and indexes on special columns
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_special_column_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -899,6 +902,7 @@ fn test_vacuum_into_special_column_names(tmp_db: TempDatabase) -> anyhow::Result
 
 /// Test VACUUM INTO with large data spanning multiple B-tree pages
 /// This verifies that page copying works correctly for multi-page tables
+/// Note: page_count pragma doesn't work correctly with MVCC yet
 #[turso_macros::test]
 fn test_vacuum_into_large_data_multi_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -977,7 +981,7 @@ fn test_vacuum_into_large_data_multi_page(tmp_db: TempDatabase) -> anyhow::Resul
     Ok(())
 }
 
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_with_foreign_keys(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -1040,7 +1044,7 @@ fn test_vacuum_into_with_foreign_keys(tmp_db: TempDatabase) -> anyhow::Result<()
 }
 
 /// Test VACUUM INTO with composite primary keys
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_with_composite_primary_key(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -1124,7 +1128,7 @@ fn test_vacuum_into_with_composite_primary_key(tmp_db: TempDatabase) -> anyhow::
 
 /// Test VACUUM INTO with data populated using table-valued functions
 /// (generate_series, json_each, json_tree)
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_with_table_valued_functions(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -1191,7 +1195,7 @@ fn test_vacuum_into_with_table_valued_functions(tmp_db: TempDatabase) -> anyhow:
 
 /// Test VACUUM INTO preserves reserved_space bytes from source database.
 /// Reserved space is used by encryption extensions and checksums.
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_preserves_reserved_space(tmp_db: TempDatabase) -> anyhow::Result<()> {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
@@ -1259,6 +1263,7 @@ fn test_vacuum_into_preserves_reserved_space(tmp_db: TempDatabase) -> anyhow::Re
 
 /// Test VACUUM INTO with partial indexes (CREATE INDEX ... WHERE)
 /// NOTE: There is a bug with partial indexes which fails integrity_check on the destination.
+/// Note: Partial indexes are not supported with MVCC
 #[turso_macros::test]
 fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -1347,6 +1352,57 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
     Ok(())
 }
 
+/// Test VACUUM INTO preserves MVCC journal mode from source database.
+/// If source has experimental_mvcc enabled, destination should too.
+#[turso_macros::test]
+fn test_vacuum_into_preserves_mvcc(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")?;
+    let source_mode: Vec<(String,)> = conn.exec_rows("PRAGMA journal_mode");
+    assert_eq!(
+        source_mode,
+        vec![("experimental_mvcc".to_string(),)],
+        "Source should have MVCC enabled"
+    );
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'hello')")?;
+    conn.execute("INSERT INTO t VALUES (2, 'world')")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_mvcc.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    let dest_mode: Vec<(String,)> = dest_conn.exec_rows("PRAGMA journal_mode");
+    assert_eq!(
+        dest_mode,
+        vec![("experimental_mvcc".to_string(),)],
+        "Destination should have MVCC enabled (inherited from source)"
+    );
+
+    // verify the .db-log file was created for destination
+    let log_path = dest_dir.path().join("vacuumed_mvcc.db-log");
+    assert!(
+        log_path.exists(),
+        "MVCC log file should exist at {:?}",
+        log_path
+    );
+
+    // verify data was copied correctly
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, data FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![(1, "hello".to_string()), (2, "world".to_string())]
+    );
+
+    Ok(())
+}
+
 // test for future stuff, as turso db does not support yet:
 // 1. CHECK constraints
 // 2. WITHOUT ROWID tables
@@ -1354,7 +1410,7 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
 
 /// Test VACUUM INTO with CHECK constraints
 /// Skips if CHECK constraints are not supported.
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_with_check_constraints(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -1423,7 +1479,7 @@ fn test_vacuum_into_with_check_constraints(tmp_db: TempDatabase) -> anyhow::Resu
 
 /// Test VACUUM INTO with WITHOUT ROWID tables
 /// Skips if WITHOUT ROWID is not supported.
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_with_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -1503,7 +1559,7 @@ fn test_vacuum_into_with_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<(
 /// Test VACUUM INTO with tables that have no columns
 /// SQLite allows CREATE TABLE t(); with zero columns.
 /// Skips if no-column tables are not supported.
-#[turso_macros::test]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_table_with_no_columns(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
