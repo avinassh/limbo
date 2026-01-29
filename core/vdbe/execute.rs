@@ -11607,6 +11607,17 @@ fn op_vacuum_into_inner(
                     dest_conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")?;
                 }
 
+                // Performance optimizations for destination database:
+                // 1. Disable fsync - destination is a new file, if crash occurs we just delete it
+                // 2. Disable foreign key checks - source data is already consistent
+                // These match SQLite's vacuum.c optimizations (PAGER_SYNCHRONOUS_OFF, ~SQLITE_ForeignKeys)
+                dest_conn.execute("PRAGMA synchronous = OFF")?;
+                dest_conn.execute("PRAGMA foreign_keys = OFF")?;
+
+                // Wrap all operations in a single transaction for atomicity and performance.
+                // This batches all writes and ensures destination is either empty or complete.
+                dest_conn.execute("BEGIN")?;
+
                 state.op_vacuum_into_state.dest_db = Some(dest_db);
                 state.op_vacuum_into_state.dest_conn = Some(dest_conn);
                 state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::QuerySchema;
@@ -12108,6 +12119,14 @@ fn op_vacuum_into_inner(
             }
 
             OpVacuumIntoSubState::Done => {
+                // Commit the transaction that was started in Init state
+                let dest_conn = state
+                    .op_vacuum_into_state
+                    .dest_conn
+                    .as_ref()
+                    .expect("dest_conn must be set in Init state");
+                dest_conn.execute("COMMIT")?;
+
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
             }
