@@ -1,7 +1,7 @@
 use crate::common::{compute_dbhash, ExecRows, TempDatabase};
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{Connection, Value};
+use turso_core::{CheckpointMode, Connection, Value};
 
 /// Helper to run integrity_check and return the result string
 fn run_integrity_check(conn: &Arc<Connection>) -> String {
@@ -72,6 +72,19 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_eq!(blob_values[0][0], Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
     assert_eq!(blob_values[1][0], Value::Blob(vec![0xCA, 0xFE, 0xBA, 0xBE]));
     assert_eq!(blob_values[2][0], Value::Null);
+
+    // verify destination also has zero reserved_space (the default value)
+    {
+        use std::fs::File;
+        use std::io::{Read, Seek, SeekFrom};
+        const RESERVED_SPACE_OFFSET: u64 = 20;
+
+        let mut file = File::open(&dest_path)?;
+        file.seek(SeekFrom::Start(RESERVED_SPACE_OFFSET))?;
+        let mut buf = [0u8; 1];
+        file.read_exact(&mut buf)?;
+        assert_eq!(buf[0], 0, "Destination should have reserved_space=0");
+    }
 
     Ok(())
 }
@@ -1173,6 +1186,74 @@ fn test_vacuum_into_with_table_valued_functions(tmp_db: TempDatabase) -> anyhow:
         "Should have root path"
     );
 
+    Ok(())
+}
+
+/// Test VACUUM INTO preserves reserved_space bytes from source database.
+/// Reserved space is used by encryption extensions and checksums.
+#[turso_macros::test]
+fn test_vacuum_into_preserves_reserved_space(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    const RESERVED_BYTES: u8 = 32;
+    const RESERVED_SPACE_OFFSET: u64 = 20; // Offset in SQLite header
+
+    let conn = tmp_db.connect_limbo();
+
+    // set reserved_bytes BEFORE any table creation (must be done on uninitialized db)
+    conn.set_reserved_bytes(RESERVED_BYTES)?;
+    conn.execute("CREATE TABLE encrypted_data (id INTEGER PRIMARY KEY, secret TEXT)")?;
+    conn.execute("INSERT INTO encrypted_data VALUES (1, 'confidential')")?;
+    conn.execute("INSERT INTO encrypted_data VALUES (2, 'private')")?;
+
+    // verify source has reserved_space set
+    assert_eq!(
+        conn.get_reserved_bytes(),
+        Some(RESERVED_BYTES),
+        "Source should have reserved_bytes={RESERVED_BYTES}"
+    );
+
+    let source_hash = compute_dbhash(&tmp_db);
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_reserved.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+    conn.execute(&format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(
+        source_hash.hash,
+        compute_dbhash(&dest_db).hash,
+        "Source and destination should have same content hash"
+    );
+
+    assert_eq!(
+        dest_conn.get_reserved_bytes(),
+        Some(RESERVED_BYTES),
+        "Destination should have reserved_bytes={RESERVED_BYTES}"
+    );
+
+    // verify reserved_space in destination file header
+    {
+        let mut file = File::open(&dest_path)?;
+        file.seek(SeekFrom::Start(RESERVED_SPACE_OFFSET))?;
+        let mut buf = [0u8; 1];
+        file.read_exact(&mut buf)?;
+        assert_eq!(
+            buf[0], RESERVED_BYTES,
+            "Destination file header should have reserved_space={RESERVED_BYTES}"
+        );
+    }
+
+    let rows: Vec<(i64, String)> =
+        dest_conn.exec_rows("SELECT id, secret FROM encrypted_data ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![(1, "confidential".to_string()), (2, "private".to_string())]
+    );
     Ok(())
 }
 

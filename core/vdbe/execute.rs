@@ -11484,6 +11484,8 @@ pub struct OpVacuumIntoState {
     /// Meta values read from source database header
     pub source_user_version: i32,
     pub source_application_id: i32,
+    /// Reserved space bytes from source database (for encryption, checksum or other extensions)
+    pub source_reserved_space: u8,
 }
 
 /// VACUUM INTO - create a compacted copy of the database at the specified path.
@@ -11572,8 +11574,18 @@ fn op_vacuum_into_inner(
                     "page_size",
                 )?;
 
+                let reserved_space = {
+                    let pager = program.connection.pager.load();
+                    let reserved_space: u8 = match program.connection.get_reserved_bytes() {
+                        Some(val) => val,
+                        None => io.block(|| pager.with_header(|header| header.reserved_space))?,
+                    };
+                    reserved_space
+                };
+
                 state.op_vacuum_into_state.source_user_version = user_version;
                 state.op_vacuum_into_state.source_application_id = application_id;
+                state.op_vacuum_into_state.source_reserved_space = reserved_space;
 
                 let dest_db = crate::Database::open_file_with_flags(
                     io,
@@ -11584,6 +11596,10 @@ fn op_vacuum_into_inner(
                 )?;
                 let dest_conn = dest_db.connect()?;
                 dest_conn.reset_page_size(page_size)?;
+                // set reserved_space on destination to match source
+                // this is important for databases using encryption or checksums
+                // must be set before page 1 is allocated (before any schema operations)
+                dest_conn.set_reserved_bytes(reserved_space)?;
 
                 state.op_vacuum_into_state.dest_db = Some(dest_db);
                 state.op_vacuum_into_state.dest_conn = Some(dest_conn);
