@@ -1,10 +1,16 @@
 /// Whopper CLI - The Turso deterministic simulator
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use clap::{Parser, ValueEnum};
 use rand::{Rng, RngCore};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-use turso_whopper::{StepResult, Whopper, WhopperOpts, properties::*, workloads::*};
+use turso_whopper::{
+    StepResult, Whopper, WhopperOpts,
+    hermitage::{self, HermitageConfig, P4Tracker},
+    properties::*,
+    workloads::*,
+};
 
 /// Elle consistency model to use
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -47,6 +53,9 @@ struct Args {
     /// Dump database files to simulator-output directory after run
     #[arg(long)]
     dump_db: bool,
+    /// Enable hermitage anomaly testing (P4, G-single, G1a)
+    #[arg(long)]
+    hermitage: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -66,10 +75,25 @@ fn main() -> anyhow::Result<()> {
     println!("mode = {}", args.mode);
     println!("seed = {seed}");
 
-    let opts = build_opts(&args, seed)?;
+    let hermitage_config = if args.hermitage {
+        Some(HermitageConfig::default())
+    } else {
+        None
+    };
+
+    let p4_tracker = hermitage_config
+        .as_ref()
+        .map(|config| Arc::new(Mutex::new(P4Tracker::new(config.num_counters))));
+
+    let hermitage_arg = hermitage_config.as_ref().zip(p4_tracker.clone());
+    let opts = build_opts(&args, seed, hermitage_arg)?;
 
     if opts.cosmic_ray_probability > 0.0 {
         println!("cosmic ray probability = {}", opts.cosmic_ray_probability);
+    }
+
+    if args.hermitage {
+        println!("hermitage anomaly testing enabled (P4, G-single, G1a)");
     }
 
     let mut whopper = Whopper::new(opts)?;
@@ -119,6 +143,42 @@ fn main() -> anyhow::Result<()> {
     // Finalize properties (e.g., export Elle history)
     whopper.finalize_properties()?;
 
+    // Verify hermitage P4 invariant: each counter value == committed increments
+    if let Some(tracker) = p4_tracker {
+        let config = hermitage_config.as_ref().unwrap();
+        let conn = whopper.first_connection();
+        let tracker = tracker.lock().unwrap();
+
+        println!("\n--- Hermitage P4 verification ---");
+        for i in 0..config.num_counters {
+            let mut stmt =
+                conn.prepare(format!("SELECT counter FROM hermitage_p4 WHERE id = {i}"))?;
+            // Step until we get a row
+            loop {
+                match stmt.step()? {
+                    turso_core::StepResult::Row => {
+                        if let Some(row) = stmt.row() {
+                            let actual = row.get_values().next().unwrap().as_int().unwrap();
+                            let expected = tracker.committed_increments[i] as i64;
+                            assert_eq!(
+                                actual, expected,
+                                "P4 VIOLATION (lost update): counter {i} has value {actual}, \
+                                 but {expected} increments were committed",
+                            );
+                            println!("  counter[{i}]: {actual} == {expected} (OK)");
+                        }
+                        break;
+                    }
+                    turso_core::StepResult::Done => {
+                        panic!("P4: counter {i} row not found");
+                    }
+                    _ => continue,
+                }
+            }
+        }
+        println!("P4: all counters correct");
+    }
+
     // Dump database files if requested
     if args.dump_db {
         whopper.dump_db_files()?;
@@ -133,7 +193,11 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
+fn build_opts(
+    args: &Args,
+    seed: u64,
+    hermitage: Option<(&HermitageConfig, Arc<Mutex<P4Tracker>>)>,
+) -> anyhow::Result<WhopperOpts> {
     let mut base_opts = match args.mode.as_str() {
         "fast" => WhopperOpts::fast(),
         "chaos" => WhopperOpts::chaos(),
@@ -190,15 +254,26 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         (w, p)
     };
 
-    let opts = base_opts
+    // Hermitage tests require MVCC (BEGIN CONCURRENT)
+    let enable_mvcc = args.enable_mvcc || hermitage.is_some();
+
+    let mut opts = base_opts
         .with_seed(seed)
         .with_max_connections(args.max_connections)
         .with_keep_files(args.keep)
-        .with_enable_mvcc(args.enable_mvcc)
+        .with_enable_mvcc(enable_mvcc)
         .with_enable_encryption(args.enable_encryption)
         .with_elle_enabled(args.elle.is_some())
         .with_workloads(workloads)
         .with_properties(properties);
+
+    if let Some((config, tracker)) = hermitage {
+        let setup_sql = hermitage::hermitage_setup_sql(config);
+        let profiles = hermitage::hermitage_profiles(config, tracker);
+        opts = opts
+            .with_setup_sql(setup_sql)
+            .with_hermitage_profiles(profiles);
+    }
 
     Ok(opts)
 }
