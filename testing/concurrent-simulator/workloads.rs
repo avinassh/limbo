@@ -13,7 +13,7 @@ use sql_generation::{
     },
 };
 
-use crate::elle::{ELLE_KEY_COUNT, elle_key_name};
+use crate::elle::{ELLE_LIST_APPEND_KEY_COUNT, ELLE_RW_REGISTER_KEY_COUNT, elle_key_name};
 use crate::operations::Operation;
 use crate::{FiberState, SimulatorState};
 
@@ -321,7 +321,7 @@ impl Workload for ElleAppendWorkload {
             return None;
         }
         let table_name = ctx.sim_state.elle_tables.pick(rng)?.0.clone();
-        let key = elle_key_name(rng.random_range(0..ELLE_KEY_COUNT));
+        let key = elle_key_name(rng.random_range(0..ELLE_LIST_APPEND_KEY_COUNT));
         let value = self
             .value_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -343,7 +343,7 @@ impl Workload for ElleReadWorkload {
             return None;
         }
         let table_name = ctx.sim_state.elle_tables.pick(rng)?.0.clone();
-        let key = elle_key_name(rng.random_range(0..ELLE_KEY_COUNT));
+        let key = elle_key_name(rng.random_range(0..ELLE_LIST_APPEND_KEY_COUNT));
 
         Some(Operation::ElleRead { table_name, key })
     }
@@ -374,7 +374,7 @@ impl Workload for ElleRwWriteWorkload {
             return None;
         }
         let table_name = ctx.sim_state.elle_tables.pick(rng)?.0.clone();
-        let key = elle_key_name(rng.random_range(0..ELLE_KEY_COUNT));
+        let key = elle_key_name(rng.random_range(0..ELLE_RW_REGISTER_KEY_COUNT));
         let value = self
             .value_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -396,7 +396,7 @@ impl Workload for ElleRwReadWorkload {
             return None;
         }
         let table_name = ctx.sim_state.elle_tables.pick(rng)?.0.clone();
-        let key = elle_key_name(rng.random_range(0..ELLE_KEY_COUNT));
+        let key = elle_key_name(rng.random_range(0..ELLE_RW_REGISTER_KEY_COUNT));
 
         Some(Operation::ElleRwRead { table_name, key })
     }

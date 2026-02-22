@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 
-use crate::elle::{ELLE_KEY_COUNT, elle_key_name};
+use crate::elle::{ELLE_LIST_APPEND_KEY_COUNT, ELLE_RW_REGISTER_KEY_COUNT, elle_key_name};
 use crate::operations::{OpResult, Operation};
 
 /// A chaotic workload instance (one per fiber, drives a single transaction).
@@ -154,16 +154,24 @@ impl ChaoticElleProfile {
         self.value_counter.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Key count for this model.
+    fn key_count(&self) -> usize {
+        match self.model {
+            ElleModelKind::ListAppend => ELLE_LIST_APPEND_KEY_COUNT,
+            ElleModelKind::RwRegister => ELLE_RW_REGISTER_KEY_COUNT,
+        }
+    }
+
     /// Pick a random Elle key.
-    fn random_key(rng: &mut ChaCha8Rng) -> String {
-        elle_key_name(rng.random_range(0..ELLE_KEY_COUNT))
+    fn random_key(&self, rng: &mut ChaCha8Rng) -> String {
+        elle_key_name(rng.random_range(0..self.key_count()))
     }
 
     /// Pick N distinct random Elle keys.
-    fn distinct_keys(rng: &mut ChaCha8Rng, n: usize) -> Vec<String> {
+    fn distinct_keys(&self, rng: &mut ChaCha8Rng, n: usize) -> Vec<String> {
         let mut keys = Vec::with_capacity(n);
         while keys.len() < n {
-            let k = Self::random_key(rng);
+            let k = self.random_key(rng);
             if !keys.contains(&k) {
                 keys.push(k);
             }
@@ -174,7 +182,7 @@ impl ChaoticElleProfile {
     /// Template: Read X, then Append Y (different key).
     /// Creates rw-dependency chains (G-single, G2).
     fn build_read_then_write_elsewhere(&self, rng: &mut ChaCha8Rng) -> Vec<PlannedOp> {
-        let keys = Self::distinct_keys(rng, 2);
+        let keys = self.distinct_keys(rng, 2);
         vec![
             PlannedOp::Begin,
             PlannedOp::Read {
@@ -192,7 +200,7 @@ impl ChaoticElleProfile {
     /// Detects snapshot inconsistency.
     fn build_multi_key_reader(&self, rng: &mut ChaCha8Rng) -> Vec<PlannedOp> {
         let n = rng.random_range(2..=4);
-        let keys = Self::distinct_keys(rng, n);
+        let keys = self.distinct_keys(rng, n);
         let mut ops = vec![PlannedOp::Begin];
         for key in keys {
             ops.push(PlannedOp::Read { key });
@@ -204,7 +212,7 @@ impl ChaoticElleProfile {
     /// Template: Read X, then Append X (same key).
     /// Creates lost-update potential (G0, G2).
     fn build_read_modify_write(&self, rng: &mut ChaCha8Rng) -> Vec<PlannedOp> {
-        let key = Self::random_key(rng);
+        let key = self.random_key(rng);
         vec![
             PlannedOp::Begin,
             PlannedOp::Read { key: key.clone() },
@@ -223,7 +231,7 @@ impl ChaoticElleProfile {
         let mut ops = vec![PlannedOp::Begin];
         for _ in 0..n {
             ops.push(PlannedOp::Write {
-                key: Self::random_key(rng),
+                key: self.random_key(rng),
                 value: self.next_value(),
             });
         }
@@ -234,13 +242,13 @@ impl ChaoticElleProfile {
     /// Template: Read X, do middle ops, re-read X.
     /// Tests snapshot stability within a transaction.
     fn build_long_reader(&self, rng: &mut ChaCha8Rng) -> Vec<PlannedOp> {
-        let key = Self::random_key(rng);
+        let key = self.random_key(rng);
         let mut ops = vec![PlannedOp::Begin, PlannedOp::Read { key: key.clone() }];
 
         // 1-3 middle operations on other keys
         let middle_count = rng.random_range(1..=3);
         for _ in 0..middle_count {
-            let other_key = Self::random_key(rng);
+            let other_key = self.random_key(rng);
             if rng.random_bool(0.5) {
                 ops.push(PlannedOp::Read { key: other_key });
             } else {
@@ -264,7 +272,7 @@ impl ChaoticElleProfile {
         let mut ops = vec![PlannedOp::Begin];
         for _ in 0..n {
             ops.push(PlannedOp::Write {
-                key: Self::random_key(rng),
+                key: self.random_key(rng),
                 value: self.next_value(),
             });
         }
@@ -278,7 +286,7 @@ impl ChaoticElleProfile {
         let n = rng.random_range(2..=5);
         let mut ops = vec![PlannedOp::Begin];
         for _ in 0..n {
-            let key = Self::random_key(rng);
+            let key = self.random_key(rng);
             if rng.random_bool(0.5) {
                 ops.push(PlannedOp::Read { key });
             } else {
@@ -295,14 +303,28 @@ impl ChaoticElleProfile {
 
 impl ChaoticWorkloadProfile for ChaoticElleProfile {
     fn generate(&self, mut rng: ChaCha8Rng, _fiber_id: usize) -> Box<dyn ChaoticWorkload> {
-        let ops = match rng.random_range(0..7u32) {
-            0 => self.build_read_then_write_elsewhere(&mut rng),
-            1 => self.build_multi_key_reader(&mut rng),
-            2 => self.build_read_modify_write(&mut rng),
-            3 => self.build_aborter(&mut rng),
-            4 => self.build_long_reader(&mut rng),
-            5 => self.build_blind_multi_writer(&mut rng),
-            _ => self.build_mixed_read_write(&mut rng),
+        // For rw-register, weight ReadModifyWrite (read-then-write-same-key) heavily
+        // since it creates both rw and wr dependencies on a single key — the "2rw rule"
+        // that rw-register needs for cycle detection.
+        let ops = match self.model {
+            ElleModelKind::RwRegister => match rng.random_range(0..9u32) {
+                0..=2 => self.build_read_modify_write(&mut rng), // 3/9
+                3 => self.build_read_then_write_elsewhere(&mut rng), // 1/9
+                4 => self.build_multi_key_reader(&mut rng),      // 1/9
+                5 => self.build_aborter(&mut rng),               // 1/9
+                6 => self.build_long_reader(&mut rng),           // 1/9
+                7 => self.build_blind_multi_writer(&mut rng),    // 1/9
+                _ => self.build_mixed_read_write(&mut rng),      // 1/9
+            },
+            ElleModelKind::ListAppend => match rng.random_range(0..7u32) {
+                0 => self.build_read_then_write_elsewhere(&mut rng),
+                1 => self.build_multi_key_reader(&mut rng),
+                2 => self.build_read_modify_write(&mut rng),
+                3 => self.build_aborter(&mut rng),
+                4 => self.build_long_reader(&mut rng),
+                5 => self.build_blind_multi_writer(&mut rng),
+                _ => self.build_mixed_read_write(&mut rng),
+            },
         };
 
         Box::new(ChaoticElleWorkload::new(

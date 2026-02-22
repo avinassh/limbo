@@ -5,7 +5,12 @@ use std::sync::Arc;
 use clap::{Parser, ValueEnum};
 use rand::{Rng, RngCore};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-use turso_whopper::{StepResult, Whopper, WhopperOpts, properties::*, workloads::*};
+use turso_whopper::{
+    StepResult, Whopper, WhopperOpts,
+    chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
+    properties::*,
+    workloads::*,
+};
 
 /// Elle consistency model to use
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -148,7 +153,8 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
     }
 
     // Build workloads and properties based on Elle mode
-    let (workloads, properties, elle_tables) = if let Some(elle_model) = args.elle {
+    let (workloads, properties, elle_tables, chaotic_profiles) = if let Some(elle_model) = args.elle
+    {
         // Shared counter ensures globally unique values across all Elle workloads
         let elle_counter = Arc::new(std::sync::atomic::AtomicI64::new(1));
 
@@ -163,6 +169,21 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
                 "CREATE TABLE IF NOT EXISTS elle_rw (key TEXT PRIMARY KEY, val INTEGER)",
             ),
         };
+
+        let model_kind = match elle_model {
+            ElleModel::ListAppend => ElleModelKind::ListAppend,
+            ElleModel::RwRegister => ElleModelKind::RwRegister,
+        };
+
+        let chaotic: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)> = vec![(
+            0.3,
+            "chaotic-elle",
+            Box::new(ChaoticElleProfile::new(
+                table_name.to_string(),
+                model_kind,
+                elle_counter.clone(),
+            )),
+        )];
 
         let w: Vec<(u32, Box<dyn Workload>)> = match elle_model {
             ElleModel::ListAppend => vec![
@@ -189,7 +210,7 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
 
         let et = vec![(table_name.to_string(), create_sql.to_string())];
 
-        (w, p, et)
+        (w, p, et, chaotic)
     } else {
         // Normal mode: all workloads
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
@@ -215,7 +236,7 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
             Box::new(SimpleKeysDoNotDisappear::new()),
         ];
 
-        (w, p, vec![])
+        (w, p, vec![], vec![])
     };
 
     // Elle workloads require MVCC (BEGIN CONCURRENT)
@@ -229,7 +250,8 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_enable_encryption(args.enable_encryption)
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
-        .with_properties(properties);
+        .with_properties(properties)
+        .with_chaotic_profiles(chaotic_profiles);
 
     Ok(opts)
 }

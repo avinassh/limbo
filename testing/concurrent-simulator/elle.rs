@@ -208,8 +208,11 @@ fn escape_edn_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Number of Elle keys to use (small key space ensures conflicts).
-pub const ELLE_KEY_COUNT: usize = 10;
+/// Number of Elle keys for list-append model (larger space is fine — appends always create version deps).
+pub const ELLE_LIST_APPEND_KEY_COUNT: usize = 10;
+
+/// Number of Elle keys for rw-register model (small space increases contention for wfr/wfw edges).
+pub const ELLE_RW_REGISTER_KEY_COUNT: usize = 4;
 
 /// Generate an Elle key name from an index.
 pub fn elle_key_name(index: usize) -> String {

@@ -231,18 +231,24 @@ struct BufferedElleEvent {
     event_type: ElleEventType,
     process: usize,
     ops: Vec<ElleOp>,
+    /// Monotonic execution ID used as :time for realtime edge inference.
+    time: u64,
 }
 
 /// Pending transaction state: invoke index and accumulated operations.
 struct PendingTxn {
     /// Index reserved when the first operation executes (None for deferred transactions until first op)
     invoke_index: Option<u64>,
+    /// Exec ID at invoke time (for :time field)
+    invoke_time: Option<u64>,
     ops: Vec<ElleOp>,
 }
 
 /// Pending auto-commit operation state: invoke index and the operation.
 struct PendingAutoCommit {
     invoke_index: u64,
+    /// Exec ID at invoke time (for :time field)
+    invoke_time: u64,
     op: ElleOp,
 }
 
@@ -296,12 +302,14 @@ impl ElleHistoryRecorder {
         event_type: ElleEventType,
         process: usize,
         ops: Vec<ElleOp>,
+        time: u64,
     ) {
         self.events.push(BufferedElleEvent {
             index,
             event_type,
             process,
             ops,
+            time,
         });
     }
 
@@ -316,11 +324,12 @@ impl ElleHistoryRecorder {
         for event in sorted_events {
             let ops_str: Vec<String> = event.ops.iter().map(|op| op.to_edn()).collect();
             let line = format!(
-                "{{:type {}, :f :txn, :value [{}], :process {}, :index {}}}\n",
+                "{{:type {}, :f :txn, :value [{}], :process {}, :index {}, :time {}}}\n",
                 event.event_type,
                 ops_str.join(" "),
                 event.process,
-                event.index
+                event.index,
+                event.time
             );
             file.write_all(line.as_bytes())?;
         }
@@ -334,7 +343,7 @@ impl Property for ElleHistoryRecorder {
         _step: usize,
         fiber_id: usize,
         txn_id: Option<u64>,
-        _exec_id: u64,
+        exec_id: u64,
         op: &Operation,
     ) -> anyhow::Result<()> {
         match op {
@@ -342,15 +351,16 @@ impl Property for ElleHistoryRecorder {
                 // For BEGIN and BEGIN DEFERRED, defer index reservation until first operation
                 // For BEGIN IMMEDIATE/EXCLUSIVE, reserve index now since they acquire locks immediately
                 let is_deferred = mode == "BEGIN" || mode.to_uppercase().contains("DEFERRED");
-                let invoke_index = if is_deferred {
-                    None
+                let (invoke_index, invoke_time) = if is_deferred {
+                    (None, None)
                 } else {
-                    Some(self.next_index())
+                    (Some(self.next_index()), Some(exec_id))
                 };
                 self.pending_txns.insert(
                     fiber_id,
                     PendingTxn {
                         invoke_index,
+                        invoke_time,
                         ops: Vec::new(),
                     },
                 );
@@ -362,6 +372,7 @@ impl Property for ElleHistoryRecorder {
                     fiber_id,
                     PendingAutoCommit {
                         invoke_index,
+                        invoke_time: exec_id,
                         op: ElleOp::Append {
                             key: key.clone(),
                             value: *value,
@@ -376,6 +387,7 @@ impl Property for ElleHistoryRecorder {
                     fiber_id,
                     PendingAutoCommit {
                         invoke_index,
+                        invoke_time: exec_id,
                         op: ElleOp::Read {
                             key: key.clone(),
                             result: None, // Will be filled in finish_op
@@ -389,6 +401,7 @@ impl Property for ElleHistoryRecorder {
                     fiber_id,
                     PendingAutoCommit {
                         invoke_index,
+                        invoke_time: exec_id,
                         op: ElleOp::Write {
                             key: key.clone(),
                             value: *value,
@@ -402,6 +415,7 @@ impl Property for ElleHistoryRecorder {
                     fiber_id,
                     PendingAutoCommit {
                         invoke_index,
+                        invoke_time: exec_id,
                         op: ElleOp::RwRead {
                             key: key.clone(),
                             result: None,
@@ -419,11 +433,28 @@ impl Property for ElleHistoryRecorder {
         _step: usize,
         fiber_id: usize,
         txn_id: Option<u64>,
-        _start_exec_id: u64,
-        _end_exec_id: u64,
+        start_exec_id: u64,
+        end_exec_id: u64,
         op: &Operation,
         result: &OpResult,
     ) -> anyhow::Result<()> {
+        // Helper closure: nil out read results for invoke events
+        let nil_reads = |ops: &[ElleOp]| -> Vec<ElleOp> {
+            ops.iter()
+                .map(|o| match o {
+                    ElleOp::Read { key, .. } => ElleOp::Read {
+                        key: key.clone(),
+                        result: None,
+                    },
+                    ElleOp::RwRead { key, .. } => ElleOp::RwRead {
+                        key: key.clone(),
+                        result: None,
+                    },
+                    other => other.clone(),
+                })
+                .collect()
+        };
+
         match op {
             Operation::Begin { .. } => {
                 // If Begin failed, clean up pending txn
@@ -433,31 +464,20 @@ impl Property for ElleHistoryRecorder {
             }
             Operation::Commit => {
                 if let Some(pending) = self.pending_txns.remove(&fiber_id) {
-                    // Only emit events if we have operations and an invoke index was reserved
                     let Some(invoke_index) = pending.invoke_index else {
-                        // If invoke_index is None, the transaction had no Elle operations - nothing to record
                         return Ok(());
                     };
                     if !pending.ops.is_empty() {
-                        // Invoke with nil results for reads
-                        let invoke_ops: Vec<ElleOp> = pending
-                            .ops
-                            .iter()
-                            .map(|o| match o {
-                                ElleOp::Read { key, .. } => ElleOp::Read {
-                                    key: key.clone(),
-                                    result: None,
-                                },
-                                ElleOp::RwRead { key, .. } => ElleOp::RwRead {
-                                    key: key.clone(),
-                                    result: None,
-                                },
-                                other => other.clone(),
-                            })
-                            .collect();
-                        self.add_event(invoke_index, ElleEventType::Invoke, fiber_id, invoke_ops);
+                        let invoke_time = pending.invoke_time.unwrap_or(0);
+                        let invoke_ops = nil_reads(&pending.ops);
+                        self.add_event(
+                            invoke_index,
+                            ElleEventType::Invoke,
+                            fiber_id,
+                            invoke_ops,
+                            invoke_time,
+                        );
 
-                        // Ok or Fail with new index
                         let completion_index = self.next_index();
                         if result.is_ok() {
                             self.add_event(
@@ -465,6 +485,7 @@ impl Property for ElleHistoryRecorder {
                                 ElleEventType::Ok,
                                 fiber_id,
                                 pending.ops,
+                                end_exec_id,
                             );
                         } else {
                             self.add_event(
@@ -472,6 +493,7 @@ impl Property for ElleHistoryRecorder {
                                 ElleEventType::Fail,
                                 fiber_id,
                                 pending.ops,
+                                end_exec_id,
                             );
                         }
                     }
@@ -479,45 +501,33 @@ impl Property for ElleHistoryRecorder {
             }
             Operation::Rollback => {
                 if let Some(pending) = self.pending_txns.remove(&fiber_id) {
-                    // Only emit events if we have operations and an invoke index was reserved
                     let Some(invoke_index) = pending.invoke_index else {
-                        // If invoke_index is None, the transaction had no Elle operations - nothing to record
                         return Ok(());
                     };
                     if !pending.ops.is_empty() {
-                        // Invoke with nil results for reads
-                        let invoke_ops: Vec<ElleOp> = pending
-                            .ops
-                            .iter()
-                            .map(|o| match o {
-                                ElleOp::Read { key, .. } => ElleOp::Read {
-                                    key: key.clone(),
-                                    result: None,
-                                },
-                                ElleOp::RwRead { key, .. } => ElleOp::RwRead {
-                                    key: key.clone(),
-                                    result: None,
-                                },
-                                other => other.clone(),
-                            })
-                            .collect();
-                        self.add_event(invoke_index, ElleEventType::Invoke, fiber_id, invoke_ops);
+                        let invoke_time = pending.invoke_time.unwrap_or(0);
+                        let invoke_ops = nil_reads(&pending.ops);
+                        self.add_event(
+                            invoke_index,
+                            ElleEventType::Invoke,
+                            fiber_id,
+                            invoke_ops,
+                            invoke_time,
+                        );
 
-                        // Rollback always means fail
                         let completion_index = self.next_index();
                         self.add_event(
                             completion_index,
                             ElleEventType::Fail,
                             fiber_id,
                             pending.ops,
+                            end_exec_id,
                         );
                     }
                 }
             }
             Operation::ElleAppend { key, value, .. } => {
                 if txn_id.is_some() {
-                    // In a transaction - accumulate the op
-                    // Check if we need to reserve index before getting mutable borrow
                     let needs_index = self
                         .pending_txns
                         .get(&fiber_id)
@@ -529,9 +539,9 @@ impl Property for ElleHistoryRecorder {
                     };
                     if let Some(pending) = self.pending_txns.get_mut(&fiber_id) {
                         if result.is_ok() {
-                            // Reserve invoke index on first operation for deferred transactions
                             if let Some(idx) = new_index {
                                 pending.invoke_index = Some(idx);
+                                pending.invoke_time = Some(start_exec_id);
                             }
                             pending.ops.push(ElleOp::Append {
                                 key: key.clone(),
@@ -539,32 +549,32 @@ impl Property for ElleHistoryRecorder {
                             });
                         }
                     }
-                } else {
-                    // Auto-commit: emit invoke and ok/fail
-                    if let Some(pending) = self.pending_auto_commits.remove(&fiber_id) {
-                        self.add_event(
-                            pending.invoke_index,
-                            ElleEventType::Invoke,
-                            fiber_id,
-                            vec![pending.op.clone()],
-                        );
+                } else if let Some(pending) = self.pending_auto_commits.remove(&fiber_id) {
+                    self.add_event(
+                        pending.invoke_index,
+                        ElleEventType::Invoke,
+                        fiber_id,
+                        vec![pending.op.clone()],
+                        pending.invoke_time,
+                    );
 
-                        let completion_index = self.next_index();
-                        if result.is_ok() {
-                            self.add_event(
-                                completion_index,
-                                ElleEventType::Ok,
-                                fiber_id,
-                                vec![pending.op],
-                            );
-                        } else {
-                            self.add_event(
-                                completion_index,
-                                ElleEventType::Fail,
-                                fiber_id,
-                                vec![pending.op],
-                            );
-                        }
+                    let completion_index = self.next_index();
+                    if result.is_ok() {
+                        self.add_event(
+                            completion_index,
+                            ElleEventType::Ok,
+                            fiber_id,
+                            vec![pending.op],
+                            end_exec_id,
+                        );
+                    } else {
+                        self.add_event(
+                            completion_index,
+                            ElleEventType::Fail,
+                            fiber_id,
+                            vec![pending.op],
+                            end_exec_id,
+                        );
                     }
                 }
             }
@@ -583,6 +593,7 @@ impl Property for ElleHistoryRecorder {
                         if result.is_ok() {
                             if let Some(idx) = new_index {
                                 pending.invoke_index = Some(idx);
+                                pending.invoke_time = Some(start_exec_id);
                             }
                             pending.ops.push(ElleOp::Write {
                                 key: key.clone(),
@@ -596,6 +607,7 @@ impl Property for ElleHistoryRecorder {
                         ElleEventType::Invoke,
                         fiber_id,
                         vec![pending.op.clone()],
+                        pending.invoke_time,
                     );
 
                     let completion_index = self.next_index();
@@ -605,6 +617,7 @@ impl Property for ElleHistoryRecorder {
                             ElleEventType::Ok,
                             fiber_id,
                             vec![pending.op],
+                            end_exec_id,
                         );
                     } else {
                         self.add_event(
@@ -612,6 +625,7 @@ impl Property for ElleHistoryRecorder {
                             ElleEventType::Fail,
                             fiber_id,
                             vec![pending.op],
+                            end_exec_id,
                         );
                     }
                 }
@@ -631,6 +645,7 @@ impl Property for ElleHistoryRecorder {
                         if result.is_ok() {
                             if let Some(idx) = new_index {
                                 pending.invoke_index = Some(idx);
+                                pending.invoke_time = Some(start_exec_id);
                             }
                             let rw_result = parse_rw_read_result(result);
                             pending.ops.push(ElleOp::RwRead {
@@ -640,12 +655,12 @@ impl Property for ElleHistoryRecorder {
                         }
                     }
                 } else if let Some(pending) = self.pending_auto_commits.remove(&fiber_id) {
-                    // Invoke has nil result
                     self.add_event(
                         pending.invoke_index,
                         ElleEventType::Invoke,
                         fiber_id,
                         vec![pending.op],
+                        pending.invoke_time,
                     );
 
                     let completion_index = self.next_index();
@@ -659,6 +674,7 @@ impl Property for ElleHistoryRecorder {
                                 key: key.clone(),
                                 result: rw_result,
                             }],
+                            end_exec_id,
                         );
                     } else {
                         self.add_event(
@@ -669,14 +685,13 @@ impl Property for ElleHistoryRecorder {
                                 key: key.clone(),
                                 result: None,
                             }],
+                            end_exec_id,
                         );
                     }
                 }
             }
             Operation::ElleRead { key, .. } => {
                 if txn_id.is_some() {
-                    // In a transaction - accumulate the op with result
-                    // Check if we need to reserve index before getting mutable borrow
                     let needs_index = self
                         .pending_txns
                         .get(&fiber_id)
@@ -688,9 +703,9 @@ impl Property for ElleHistoryRecorder {
                     };
                     if let Some(pending) = self.pending_txns.get_mut(&fiber_id) {
                         if result.is_ok() {
-                            // Reserve invoke index on first operation for deferred transactions
                             if let Some(idx) = new_index {
                                 pending.invoke_index = Some(idx);
+                                pending.invoke_time = Some(start_exec_id);
                             }
                             let read_result = parse_read_result(result);
                             pending.ops.push(ElleOp::Read {
@@ -699,40 +714,39 @@ impl Property for ElleHistoryRecorder {
                             });
                         }
                     }
-                } else {
-                    // Auto-commit: emit invoke and ok/fail
-                    if let Some(pending) = self.pending_auto_commits.remove(&fiber_id) {
-                        // Invoke has nil result
-                        self.add_event(
-                            pending.invoke_index,
-                            ElleEventType::Invoke,
-                            fiber_id,
-                            vec![pending.op],
-                        );
+                } else if let Some(pending) = self.pending_auto_commits.remove(&fiber_id) {
+                    self.add_event(
+                        pending.invoke_index,
+                        ElleEventType::Invoke,
+                        fiber_id,
+                        vec![pending.op],
+                        pending.invoke_time,
+                    );
 
-                        let completion_index = self.next_index();
-                        if result.is_ok() {
-                            let read_result = parse_read_result(result);
-                            self.add_event(
-                                completion_index,
-                                ElleEventType::Ok,
-                                fiber_id,
-                                vec![ElleOp::Read {
-                                    key: key.clone(),
-                                    result: read_result,
-                                }],
-                            );
-                        } else {
-                            self.add_event(
-                                completion_index,
-                                ElleEventType::Fail,
-                                fiber_id,
-                                vec![ElleOp::Read {
-                                    key: key.clone(),
-                                    result: None,
-                                }],
-                            );
-                        }
+                    let completion_index = self.next_index();
+                    if result.is_ok() {
+                        let read_result = parse_read_result(result);
+                        self.add_event(
+                            completion_index,
+                            ElleEventType::Ok,
+                            fiber_id,
+                            vec![ElleOp::Read {
+                                key: key.clone(),
+                                result: read_result,
+                            }],
+                            end_exec_id,
+                        );
+                    } else {
+                        self.add_event(
+                            completion_index,
+                            ElleEventType::Fail,
+                            fiber_id,
+                            vec![ElleOp::Read {
+                                key: key.clone(),
+                                result: None,
+                            }],
+                            end_exec_id,
+                        );
                     }
                 }
             }
@@ -746,13 +760,11 @@ impl Property for ElleHistoryRecorder {
         // Emit :info events for any pending transactions (incomplete)
         let pending_txns: Vec<_> = self.pending_txns.drain().collect();
         for (fiber_id, pending) in pending_txns {
-            // Only emit events if we have operations and an invoke index was reserved
             let Some(invoke_index) = pending.invoke_index else {
-                // If invoke_index is None, the transaction had no Elle operations - nothing to record
                 continue;
             };
             if !pending.ops.is_empty() {
-                // Invoke with nil results for reads
+                let invoke_time = pending.invoke_time.unwrap_or(0);
                 let invoke_ops: Vec<ElleOp> = pending
                     .ops
                     .iter()
@@ -764,11 +776,23 @@ impl Property for ElleHistoryRecorder {
                         other => other.clone(),
                     })
                     .collect();
-                self.add_event(invoke_index, ElleEventType::Invoke, fiber_id, invoke_ops);
+                self.add_event(
+                    invoke_index,
+                    ElleEventType::Invoke,
+                    fiber_id,
+                    invoke_ops,
+                    invoke_time,
+                );
 
-                // Info for incomplete transaction
                 let info_index = self.next_index();
-                self.add_event(info_index, ElleEventType::Info, fiber_id, pending.ops);
+                // Use invoke_time for info too — we don't have a better completion time
+                self.add_event(
+                    info_index,
+                    ElleEventType::Info,
+                    fiber_id,
+                    pending.ops,
+                    invoke_time,
+                );
             }
         }
 
@@ -780,9 +804,16 @@ impl Property for ElleHistoryRecorder {
                 ElleEventType::Invoke,
                 fiber_id,
                 vec![pending.op.clone()],
+                pending.invoke_time,
             );
             let info_index = self.next_index();
-            self.add_event(info_index, ElleEventType::Info, fiber_id, vec![pending.op]);
+            self.add_event(
+                info_index,
+                ElleEventType::Info,
+                fiber_id,
+                vec![pending.op],
+                pending.invoke_time,
+            );
         }
 
         self.export()?;
