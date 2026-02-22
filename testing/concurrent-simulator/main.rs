@@ -1,5 +1,6 @@
 /// Whopper CLI - The Turso deterministic simulator
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
 use rand::{Rng, RngCore};
@@ -11,7 +12,8 @@ use turso_whopper::{StepResult, Whopper, WhopperOpts, properties::*, workloads::
 enum ElleModel {
     /// List-append model: transactions append to and read from lists
     ListAppend,
-    // TODO: rw-register model
+    /// Rw-register model: transactions write and read single values
+    RwRegister,
 }
 
 #[derive(Parser)]
@@ -146,14 +148,36 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
     }
 
     // Build workloads and properties based on Elle mode
-    let (workloads, properties) = if let Some(elle_model) = args.elle {
+    let (workloads, properties, elle_tables) = if let Some(elle_model) = args.elle {
+        // Shared counter ensures globally unique values across all Elle workloads
+        let elle_counter = Arc::new(std::sync::atomic::AtomicI64::new(1));
+
         // Elle mode: only Elle workloads + transactions
+        let (table_name, create_sql) = match elle_model {
+            ElleModel::ListAppend => (
+                "elle_lists",
+                "CREATE TABLE IF NOT EXISTS elle_lists (key TEXT PRIMARY KEY, vals TEXT DEFAULT '')",
+            ),
+            ElleModel::RwRegister => (
+                "elle_rw",
+                "CREATE TABLE IF NOT EXISTS elle_rw (key TEXT PRIMARY KEY, val INTEGER)",
+            ),
+        };
+
         let w: Vec<(u32, Box<dyn Workload>)> = match elle_model {
             ElleModel::ListAppend => vec![
-                // Elle list-append workloads (single pre-created table)
-                (40, Box::new(ElleAppendWorkload::new())),
+                (40, Box::new(ElleAppendWorkload::with_counter(elle_counter))),
                 (30, Box::new(ElleReadWorkload)),
-                // Transaction control
+                (30, Box::new(BeginWorkload)),
+                (15, Box::new(CommitWorkload)),
+                (5, Box::new(RollbackWorkload)),
+            ],
+            ElleModel::RwRegister => vec![
+                (
+                    40,
+                    Box::new(ElleRwWriteWorkload::with_counter(elle_counter)),
+                ),
+                (30, Box::new(ElleRwReadWorkload)),
                 (30, Box::new(BeginWorkload)),
                 (15, Box::new(CommitWorkload)),
                 (5, Box::new(RollbackWorkload)),
@@ -163,7 +187,9 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         let output_path = PathBuf::from(&args.elle_output);
         let p: Vec<Box<dyn Property>> = vec![Box::new(ElleHistoryRecorder::new(output_path))];
 
-        (w, p)
+        let et = vec![(table_name.to_string(), create_sql.to_string())];
+
+        (w, p, et)
     } else {
         // Normal mode: all workloads
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
@@ -189,16 +215,19 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
             Box::new(SimpleKeysDoNotDisappear::new()),
         ];
 
-        (w, p)
+        (w, p, vec![])
     };
+
+    // Elle workloads require MVCC (BEGIN CONCURRENT)
+    let enable_mvcc = args.enable_mvcc || args.elle.is_some();
 
     let opts = base_opts
         .with_seed(seed)
         .with_max_connections(args.max_connections)
         .with_keep_files(args.keep)
-        .with_enable_mvcc(args.enable_mvcc)
+        .with_enable_mvcc(enable_mvcc)
         .with_enable_encryption(args.enable_encryption)
-        .with_elle_enabled(args.elle.is_some())
+        .with_elle_tables(elle_tables)
         .with_workloads(workloads)
         .with_properties(properties);
 

@@ -383,6 +383,32 @@ impl Property for ElleHistoryRecorder {
                     },
                 );
             }
+            Operation::ElleRwWrite { key, value, .. } if txn_id.is_none() => {
+                let invoke_index = self.next_index();
+                self.pending_auto_commits.insert(
+                    fiber_id,
+                    PendingAutoCommit {
+                        invoke_index,
+                        op: ElleOp::Write {
+                            key: key.clone(),
+                            value: *value,
+                        },
+                    },
+                );
+            }
+            Operation::ElleRwRead { key, .. } if txn_id.is_none() => {
+                let invoke_index = self.next_index();
+                self.pending_auto_commits.insert(
+                    fiber_id,
+                    PendingAutoCommit {
+                        invoke_index,
+                        op: ElleOp::RwRead {
+                            key: key.clone(),
+                            result: None,
+                        },
+                    },
+                );
+            }
             _ => {}
         }
         Ok(())
@@ -419,6 +445,10 @@ impl Property for ElleHistoryRecorder {
                             .iter()
                             .map(|o| match o {
                                 ElleOp::Read { key, .. } => ElleOp::Read {
+                                    key: key.clone(),
+                                    result: None,
+                                },
+                                ElleOp::RwRead { key, .. } => ElleOp::RwRead {
                                     key: key.clone(),
                                     result: None,
                                 },
@@ -461,6 +491,10 @@ impl Property for ElleHistoryRecorder {
                             .iter()
                             .map(|o| match o {
                                 ElleOp::Read { key, .. } => ElleOp::Read {
+                                    key: key.clone(),
+                                    result: None,
+                                },
+                                ElleOp::RwRead { key, .. } => ElleOp::RwRead {
                                     key: key.clone(),
                                     result: None,
                                 },
@@ -531,6 +565,111 @@ impl Property for ElleHistoryRecorder {
                                 vec![pending.op],
                             );
                         }
+                    }
+                }
+            }
+            Operation::ElleRwWrite { key, value, .. } => {
+                if txn_id.is_some() {
+                    let needs_index = self
+                        .pending_txns
+                        .get(&fiber_id)
+                        .is_some_and(|p| p.invoke_index.is_none());
+                    let new_index = if needs_index {
+                        Some(self.next_index())
+                    } else {
+                        None
+                    };
+                    if let Some(pending) = self.pending_txns.get_mut(&fiber_id) {
+                        if result.is_ok() {
+                            if let Some(idx) = new_index {
+                                pending.invoke_index = Some(idx);
+                            }
+                            pending.ops.push(ElleOp::Write {
+                                key: key.clone(),
+                                value: *value,
+                            });
+                        }
+                    }
+                } else if let Some(pending) = self.pending_auto_commits.remove(&fiber_id) {
+                    self.add_event(
+                        pending.invoke_index,
+                        ElleEventType::Invoke,
+                        fiber_id,
+                        vec![pending.op.clone()],
+                    );
+
+                    let completion_index = self.next_index();
+                    if result.is_ok() {
+                        self.add_event(
+                            completion_index,
+                            ElleEventType::Ok,
+                            fiber_id,
+                            vec![pending.op],
+                        );
+                    } else {
+                        self.add_event(
+                            completion_index,
+                            ElleEventType::Fail,
+                            fiber_id,
+                            vec![pending.op],
+                        );
+                    }
+                }
+            }
+            Operation::ElleRwRead { key, .. } => {
+                if txn_id.is_some() {
+                    let needs_index = self
+                        .pending_txns
+                        .get(&fiber_id)
+                        .is_some_and(|p| p.invoke_index.is_none());
+                    let new_index = if needs_index {
+                        Some(self.next_index())
+                    } else {
+                        None
+                    };
+                    if let Some(pending) = self.pending_txns.get_mut(&fiber_id) {
+                        if result.is_ok() {
+                            if let Some(idx) = new_index {
+                                pending.invoke_index = Some(idx);
+                            }
+                            let rw_result = parse_rw_read_result(result);
+                            pending.ops.push(ElleOp::RwRead {
+                                key: key.clone(),
+                                result: rw_result,
+                            });
+                        }
+                    }
+                } else if let Some(pending) = self.pending_auto_commits.remove(&fiber_id) {
+                    // Invoke has nil result
+                    self.add_event(
+                        pending.invoke_index,
+                        ElleEventType::Invoke,
+                        fiber_id,
+                        vec![pending.op],
+                    );
+
+                    let completion_index = self.next_index();
+                    if result.is_ok() {
+                        let rw_result = parse_rw_read_result(result);
+                        self.add_event(
+                            completion_index,
+                            ElleEventType::Ok,
+                            fiber_id,
+                            vec![ElleOp::RwRead {
+                                key: key.clone(),
+                                result: rw_result,
+                            }],
+                        );
+                    } else {
+                        self.add_event(
+                            completion_index,
+                            ElleEventType::Fail,
+                            fiber_id,
+                            vec![ElleOp::RwRead {
+                                key: key.clone(),
+                                result: None,
+                            }],
+                        );
                     }
                 }
             }
@@ -669,6 +808,27 @@ fn parse_read_result(result: &OpResult) -> Option<Vec<i64>> {
         } else {
             Some(vec![])
         }
+    } else {
+        None
+    }
+}
+
+/// Parse the rw-register read result from query rows.
+/// Returns Some(value) if a row was found, None if no rows.
+fn parse_rw_read_result(result: &OpResult) -> Option<i64> {
+    if let Ok(rows) = result {
+        if rows.is_empty() {
+            return None;
+        }
+        if let Some(row) = rows.first() {
+            if let Some(value) = row.first() {
+                match value {
+                    Value::Null => return None,
+                    v => return v.as_int(),
+                }
+            }
+        }
+        None
     } else {
         None
     }

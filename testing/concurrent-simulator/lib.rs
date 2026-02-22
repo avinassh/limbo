@@ -18,6 +18,7 @@ use turso_core::{
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
+pub mod chaotic_elle;
 pub mod elle;
 mod io;
 mod operations;
@@ -203,8 +204,8 @@ pub struct WhopperOpts {
     pub enable_mvcc: bool,
     /// Enable database encryption with random cipher.
     pub enable_encryption: bool,
-    /// Enable Elle consistency checking (creates Elle tables at init).
-    pub elle_enabled: bool,
+    /// Elle tables to create: vec of (table_name, create_sql).
+    pub elle_tables: Vec<(String, String)>,
     /// Workloads with weights: (weight, workload). Higher weight = more likely.
     pub workloads: Vec<(u32, Box<dyn Workload>)>,
     /// Properties to check
@@ -221,7 +222,7 @@ impl Default for WhopperOpts {
             keep_files: false,
             enable_mvcc: false,
             enable_encryption: false,
-            elle_enabled: false,
+            elle_tables: vec![],
             workloads: vec![],
             properties: vec![],
         }
@@ -289,8 +290,8 @@ impl WhopperOpts {
         self
     }
 
-    pub fn with_elle_enabled(mut self, enable: bool) -> Self {
-        self.elle_enabled = enable;
+    pub fn with_elle_tables(mut self, tables: Vec<(String, String)>) -> Self {
+        self.elle_tables = tables;
         self
     }
 
@@ -487,16 +488,12 @@ impl Whopper {
             bootstrap_conn.execute(&sql)?;
         }
 
-        // Create Elle table if Elle mode is enabled
-        let mut elle_tables = Vec::new();
-        if opts.elle_enabled {
-            let table_name = "elle_lists".to_string();
-            let sql = format!(
-                "CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, vals TEXT DEFAULT '')"
-            );
-            debug!("{}", sql);
-            bootstrap_conn.execute(&sql)?;
-            elle_tables.push(table_name);
+        // Create Elle tables if configured
+        let mut elle_table_names = Vec::new();
+        for (table_name, create_sql) in &opts.elle_tables {
+            debug!("{}", create_sql);
+            bootstrap_conn.execute(create_sql)?;
+            elle_table_names.push(table_name.clone());
         }
 
         bootstrap_conn.close()?;
@@ -507,7 +504,7 @@ impl Whopper {
             .collect();
 
         let mut state = SimulatorState::new(tables, indexes_vec);
-        for table_name in elle_tables {
+        for table_name in elle_table_names {
             state.elle_tables.insert(table_name, ());
         }
 

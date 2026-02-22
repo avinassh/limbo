@@ -291,13 +291,20 @@ impl Workload for CreateElleTableWorkload {
 /// Append to a random key in an Elle table.
 pub struct ElleAppendWorkload {
     /// Counter for generating unique append values
-    pub value_counter: std::sync::atomic::AtomicI64,
+    pub value_counter: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl ElleAppendWorkload {
     pub fn new() -> Self {
         Self {
-            value_counter: std::sync::atomic::AtomicI64::new(1),
+            value_counter: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1)),
+        }
+    }
+
+    /// Create with a shared counter (for coordinating with chaotic Elle workloads).
+    pub fn with_counter(counter: std::sync::Arc<std::sync::atomic::AtomicI64>) -> Self {
+        Self {
+            value_counter: counter,
         }
     }
 }
@@ -339,5 +346,58 @@ impl Workload for ElleReadWorkload {
         let key = elle_key_name(rng.random_range(0..ELLE_KEY_COUNT));
 
         Some(Operation::ElleRead { table_name, key })
+    }
+}
+
+// ============================================================================
+// Elle Rw-Register Workloads for Consistency Checking
+// ============================================================================
+
+/// Write a single value to a random key in an Elle rw-register table.
+pub struct ElleRwWriteWorkload {
+    /// Counter for generating unique write values
+    pub value_counter: std::sync::Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl ElleRwWriteWorkload {
+    /// Create with a shared counter (for coordinating with chaotic Elle workloads).
+    pub fn with_counter(counter: std::sync::Arc<std::sync::atomic::AtomicI64>) -> Self {
+        Self {
+            value_counter: counter,
+        }
+    }
+}
+
+impl Workload for ElleRwWriteWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if ctx.sim_state.elle_tables.is_empty() {
+            return None;
+        }
+        let table_name = ctx.sim_state.elle_tables.pick(rng)?.0.clone();
+        let key = elle_key_name(rng.random_range(0..ELLE_KEY_COUNT));
+        let value = self
+            .value_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        Some(Operation::ElleRwWrite {
+            table_name,
+            key,
+            value,
+        })
+    }
+}
+
+/// Read a random key from an Elle rw-register table.
+pub struct ElleRwReadWorkload;
+
+impl Workload for ElleRwReadWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if ctx.sim_state.elle_tables.is_empty() {
+            return None;
+        }
+        let table_name = ctx.sim_state.elle_tables.pick(rng)?.0.clone();
+        let key = elle_key_name(rng.random_range(0..ELLE_KEY_COUNT));
+
+        Some(Operation::ElleRwRead { table_name, key })
     }
 }
