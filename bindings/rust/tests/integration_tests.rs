@@ -1470,6 +1470,34 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::Barrier;
 
+/// Verify that concurrent increments on a single counter never lose updates.
+///
+/// 16 workers per round each do: BEGIN CONCURRENT → UPDATE val=val+1 → COMMIT.
+/// At the end, counter value must equal the total number of successful commits.
+///
+/// Known intermittent failure (~1/1000 runs) caused by two interacting bugs:
+///
+/// 1. **Missing write-write conflict detection for B-tree-only rows during DELETE.**
+///    After a checkpoint GCs in-memory MVCC versions, a row may only exist in the
+///    B-tree. The DELETE phase of UPDATE calls `delete_from_table_or_index`, which
+///    finds no MVCC version and returns Ok(false). It then creates a tombstone with
+///    `begin=None, end=TxID(this_tx)`. Because `begin=None` makes the tombstone
+///    invisible to all transactions (`is_begin_visible(None)` → false), a second
+///    worker's DELETE on the same row skips the tombstone entirely — the
+///    `is_write_write_conflict` check is never reached. Both workers successfully
+///    create their own tombstones and btree_resident versions for the same row.
+///
+/// 2. **Commit validation treats Active transactions as non-conflicting.**
+///    In `check_version_conflicts`, versions with `begin=TxID(other)` where the
+///    other transaction is `Active` are skipped (no conflict). The reasoning is
+///    that the other transaction will see *us* as `Preparing` when it validates.
+///    But on multi-core CPUs, Release/Acquire ordering on the transaction state
+///    allows a small store-buffer window (~10-50ns on x86) where two transactions
+///    both read each other as `Active`, causing both to pass validation.
+///
+/// Combined: after a checkpoint makes a row B-tree-only, two concurrent workers
+/// can both read the same val=X, both write X+1, and both commit — yielding
+/// counter=X+1 but committed=X+2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_lost_updates() {
     let (db, _dir) = setup_mvcc_db(
