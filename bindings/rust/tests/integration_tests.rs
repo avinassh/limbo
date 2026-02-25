@@ -1472,6 +1472,10 @@ use tokio::sync::Barrier;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_lost_updates() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
     let (db, _dir) = setup_mvcc_db(
         "CREATE TABLE counter(id INTEGER PRIMARY KEY, val INTEGER);
          INSERT INTO counter VALUES(1, 0);",
