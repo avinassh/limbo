@@ -1449,10 +1449,6 @@ use tokio::sync::Barrier;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_lost_updates() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
-
     let (db, _dir) = setup_mvcc_db(
         "CREATE TABLE counter(id INTEGER PRIMARY KEY, val INTEGER);
          INSERT INTO counter VALUES(1, 0);",
@@ -1518,6 +1514,10 @@ async fn setup_mvcc_db_with_options(
     schema: &str,
     triggers: bool,
 ) -> (turso::Database, tempfile::TempDir) {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt::try_init();
+    });
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let mut builder = Builder::new_local(db_path.to_str().unwrap());
