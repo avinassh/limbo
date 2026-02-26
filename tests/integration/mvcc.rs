@@ -171,6 +171,67 @@ fn test_stmt_rollback_cleans_write_set_with_index(tmp_db: TempDatabase) -> anyho
     Ok(())
 }
 
+/// Verify that regular (non-materialized) views can be created, queried,
+/// dropped, and recreated in MVCC mode.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_create_and_query_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER, y TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")?;
+
+    // Create and query a view in MVCC mode
+    conn.execute("CREATE VIEW v AS SELECT x, y FROM t WHERE x > 1")?;
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM v ORDER BY x");
+    assert_eq!(rows, vec![(2, "b".to_string()), (3, "c".to_string())]);
+
+    // Drop and recreate with a different definition
+    conn.execute("DROP VIEW v")?;
+    conn.execute("CREATE VIEW v AS SELECT x FROM t")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT * FROM v ORDER BY x");
+    assert_eq!(rows, vec![(1,), (2,), (3,)]);
+
+    Ok(())
+}
+
+/// Verify a view created on one MVCC connection is visible from another.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_view_visible_across_connections(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn1 = tmp_db.connect_limbo();
+    conn1.execute("CREATE TABLE t(x INTEGER)")?;
+    conn1.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+    conn1.execute("CREATE VIEW v AS SELECT * FROM t WHERE x > 1")?;
+
+    // A second connection should see the view
+    let conn2 = tmp_db.connect_limbo();
+    let rows: Vec<(i64,)> = conn2.exec_rows("SELECT * FROM v ORDER BY x");
+    assert_eq!(rows, vec![(2,), (3,)]);
+
+    Ok(())
+}
+
+/// Verify that a view reflects DML changes made to its underlying table,
+/// even when both the view and the writes happen in MVCC mode.
+#[turso_macros::test(mvcc)]
+fn test_mvcc_view_reflects_table_changes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1), (2)")?;
+    conn.execute("CREATE VIEW v AS SELECT * FROM t")?;
+
+    // View should reflect the initial data
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT * FROM v ORDER BY x");
+    assert_eq!(rows, vec![(1,), (2,)]);
+
+    // Insert more data into the underlying table
+    conn.execute("INSERT INTO t VALUES (3)")?;
+
+    // View should now include the new row
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT * FROM v ORDER BY x");
+    assert_eq!(rows, vec![(1,), (2,), (3,)]);
+
+    Ok(())
+}
+
 /// Regression test: upgrading an existing MVCC transaction from read->write must not
 /// leak an extra blocking-checkpoint read lock.
 ///
