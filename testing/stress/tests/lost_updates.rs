@@ -2,9 +2,10 @@
 
 use shuttle::scheduler::RandomScheduler;
 use shuttle::sync::Barrier;
-use turso::Builder;
+use turso_core::{Database, MemoryIO};
 use turso_stress::sync::atomic::{AtomicI64, Ordering};
 use turso_stress::sync::Arc;
+use turso_stress::thread;
 
 fn shuttle_config() -> shuttle::Config {
     let mut config = shuttle::Config::default();
@@ -13,38 +14,28 @@ fn shuttle_config() -> shuttle::Config {
     config
 }
 
-async fn setup_mvcc_db(schema: &str) -> (turso::Database, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let db = Builder::new_local(db_path.to_str().unwrap())
-        .build()
-        .await
-        .unwrap();
+fn setup_mvcc_db(schema: &str) -> Arc<Database> {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:").unwrap();
     let conn = db.connect().unwrap();
-    let mut rows = conn
-        .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
-        .await
-        .unwrap();
-    while let Ok(Some(_)) = rows.next().await {}
-    drop(rows);
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     if !schema.is_empty() {
-        conn.execute_batch(schema).await.unwrap();
+        conn.execute(schema).unwrap();
     }
-    (db, dir)
+    db
 }
 
-async fn query_i64(conn: &turso::Connection, sql: &str) -> i64 {
-    let mut rows = conn.query(sql, ()).await.unwrap();
-    let row = rows.next().await.unwrap().unwrap();
-    row.get::<i64>(0).unwrap()
+fn query_i64(conn: &Arc<turso_core::Connection>, sql: &str) -> i64 {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    rows[0][0].as_int().unwrap()
 }
 
-async fn lost_updates_scenario(num_workers: usize, rounds: usize) {
-    let (db, _dir) = setup_mvcc_db(
+fn lost_updates_scenario(num_workers: usize, rounds: usize) {
+    let db = Arc::new(setup_mvcc_db(
         "CREATE TABLE counter(id INTEGER PRIMARY KEY, val INTEGER);
          INSERT INTO counter VALUES(1, 0);",
-    )
-    .await;
+    ));
 
     let total_committed = Arc::new(AtomicI64::new(0));
 
@@ -53,40 +44,40 @@ async fn lost_updates_scenario(num_workers: usize, rounds: usize) {
         let mut handles = Vec::new();
 
         for _ in 0..num_workers {
-            let conn = db.connect().unwrap();
-            let barrier = barrier.clone();
-            let total_committed = total_committed.clone();
-            handles.push(turso_stress::future::spawn(async move {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            let total_committed = Arc::clone(&total_committed);
+            handles.push(thread::spawn(move || {
+                let conn = db.connect().unwrap();
                 barrier.wait();
-                if conn.execute("BEGIN CONCURRENT", ()).await.is_err() {
+                if conn.execute("BEGIN CONCURRENT").is_err() {
                     return;
                 }
                 if conn
-                    .execute("UPDATE counter SET val = val + 1 WHERE id = 1", ())
-                    .await
+                    .execute("UPDATE counter SET val = val + 1 WHERE id = 1")
                     .is_err()
                 {
-                    let _ = conn.execute("ROLLBACK", ()).await;
+                    let _ = conn.execute("ROLLBACK");
                     return;
                 }
-                match conn.execute("COMMIT", ()).await {
+                match conn.execute("COMMIT") {
                     Ok(_) => {
                         total_committed.fetch_add(1, Ordering::SeqCst);
                     }
                     Err(_) => {
-                        let _ = conn.execute("ROLLBACK", ()).await;
+                        let _ = conn.execute("ROLLBACK");
                     }
                 }
             }));
         }
 
         for handle in handles {
-            handle.await.unwrap();
+            handle.join().unwrap();
         }
     }
 
     let conn = db.connect().unwrap();
-    let val = query_i64(&conn, "SELECT val FROM counter WHERE id = 1").await;
+    let val = query_i64(&conn, "SELECT val FROM counter WHERE id = 1");
     let committed = total_committed.load(Ordering::SeqCst);
     assert_eq!(
         val, committed,
@@ -98,12 +89,12 @@ async fn lost_updates_scenario(num_workers: usize, rounds: usize) {
 fn shuttle_test_lost_updates() {
     let scheduler = RandomScheduler::new(100);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(lost_updates_scenario(2, 3)));
+    runner.run(|| lost_updates_scenario(2, 3));
 }
 
 #[test]
 fn shuttle_test_lost_updates_slow() {
     let scheduler = RandomScheduler::new(10);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
-    runner.run(|| shuttle::future::block_on(lost_updates_scenario(4, 20)));
+    runner.run(|| lost_updates_scenario(4, 20));
 }

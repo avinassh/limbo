@@ -42,4 +42,5 @@ serde_json = { workspace = true }
 
 [target.'cfg(shuttle)'.dependencies]
 shuttle = { workspace = true }
+turso_core = { workspace = true }
 
