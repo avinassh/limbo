@@ -178,6 +178,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     staged_checkpoint_header: Option<DatabaseHeader>,
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
     header_staged_for_commit: bool,
+    #[allow(dead_code)]
     /// Precomputed simulator yield plan for this checkpoint state machine.
     simulator_yield: SimulatorYield<SimulatorCheckpointYieldPoint>,
 }

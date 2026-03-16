@@ -67,6 +67,7 @@ const NO_EXCLUSIVE_TX: u64 = 0;
 // to thread the helper method name through every invocation.
 macro_rules! yield_transition_in_simulator {
     ($state_machine:expr, $point:expr) => {
+        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         if let Some(result) = $state_machine.simulator_yield.maybe_transition($point) {
             return Ok(result);
         }
@@ -77,6 +78,7 @@ pub(crate) use yield_transition_in_simulator;
 
 macro_rules! yield_io_in_simulator {
     ($state_machine:expr, $point:expr) => {
+        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         if let Some(result) = $state_machine.simulator_yield.maybe_io($point) {
             return Ok(result);
         }
@@ -145,11 +147,13 @@ impl SimulatorOpts {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SimulatorYield<YieldPoint> {
     remaining_points: SimulatorYieldPlan<YieldPoint>,
 }
 
+#[allow(dead_code)]
 impl<YieldPoint: Copy + PartialEq + Debug> SimulatorYield<YieldPoint> {
     pub(crate) fn disabled() -> Self {
         Self {
@@ -1100,6 +1104,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     pending_log_append_bytes: Option<u64>,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
+    #[allow(dead_code)]
     simulator_yield: SimulatorYield<SimulatorCommitYieldPoint>,
     _phantom: PhantomData<Clock>,
 }
@@ -1120,6 +1125,7 @@ pub struct WriteRowStateMachine {
     record: Option<ImmutableRecord>,
     cursor: Arc<RwLock<BTreeCursor>>,
     requires_seek: bool,
+    #[allow(dead_code)]
     simulator_yield: SimulatorYield<SimulatorWriteRowYieldPoint>,
 }
 
@@ -1138,6 +1144,7 @@ pub struct DeleteRowStateMachine {
     is_finalized: bool,
     rowid: RowID,
     cursor: Arc<RwLock<BTreeCursor>>,
+    #[allow(dead_code)]
     simulator_yield: SimulatorYield<SimulatorDeleteRowYieldPoint>,
 }
 

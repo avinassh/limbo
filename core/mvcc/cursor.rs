@@ -307,6 +307,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek,
+    #[allow(dead_code)]
     simulator_yield: SimulatorYield<SimulatorCursorYieldPoint>,
 }
 
