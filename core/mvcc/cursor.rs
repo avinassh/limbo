@@ -103,7 +103,6 @@ enum MvccLazyCursorState {
     Seek(SeekState, IterationDirection),
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulatorCursorYieldPoint {
     NextInit,
@@ -118,7 +117,6 @@ enum SimulatorCursorYieldPoint {
     AdvanceBtreeBackwardStateChange,
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl SimulatorCursorYieldPoint {
     const ALL: [Self; 10] = [
         Self::NextInit,
@@ -309,7 +307,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek,
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
     simulator_yield: SimulatorYield<SimulatorCursorYieldPoint>,
 }
 
@@ -338,7 +335,6 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             "BTreeCursor expected for mvcc cursor"
         );
         let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
-        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         let simulator_yield = if db.simulator_opts.unsafe_testing {
             SimulatorYield::enabled(SimulatorCursorYieldPoint::plan(
                 db.simulator_opts.simulator_seed,
@@ -364,7 +360,6 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             count_state: None,
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
-            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
             simulator_yield,
         })
     }

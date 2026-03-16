@@ -70,9 +70,6 @@ pub fn open_mv_store(
     encryption_ctx: Option<crate::storage::encryption::EncryptionContext>,
     opts: &DatabaseOpts,
 ) -> Result<Arc<MvStore>> {
-    #[cfg(not(any(test, feature = "test_helper", feature = "simulator")))]
-    let _ = opts;
-
     let storage: Arc<dyn mvcc::persistent_storage::DurableStorage> =
         if let Some(storage) = durable_storage {
             storage
@@ -94,7 +91,6 @@ pub fn open_mv_store(
     let mv_store = MvStore::new(
         mvcc::MvccClock::new(),
         storage,
-        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         mvcc::database::SimulatorOpts::from_db_opts(opts),
     );
     let mv_store = Arc::new(mv_store);

@@ -22,7 +22,6 @@ use crate::{
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // Yield points in the checkpoint state machine that the simulator can inject
 // synthetic yields at.
@@ -43,7 +42,6 @@ enum SimulatorCheckpointYieldPoint {
     TruncateWal,
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl SimulatorCheckpointYieldPoint {
     const ALL: [Self; 14] = [
         Self::AcquireLock,
@@ -180,7 +178,6 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     staged_checkpoint_header: Option<DatabaseHeader>,
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
     header_staged_for_commit: bool,
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
     /// Precomputed simulator yield plan for this checkpoint state machine.
     simulator_yield: SimulatorYield<SimulatorCheckpointYieldPoint>,
 }
@@ -248,7 +245,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             !connection.db.path.starts_with(":memory:") && mvcc_meta_table.is_some();
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
-        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         // Auto-checkpoints chained off COMMIT still share the outer MVCC commit
         // state machine, so defer synthetic yields there until that handoff has
         // dedicated cleanup support.
@@ -289,7 +285,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             durable_mvcc_metadata,
             staged_checkpoint_header: None,
             header_staged_for_commit: false,
-            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
             simulator_yield,
         }
     }

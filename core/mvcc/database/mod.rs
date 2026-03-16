@@ -36,7 +36,6 @@ use crate::{
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
@@ -68,7 +67,6 @@ const NO_EXCLUSIVE_TX: u64 = 0;
 // to thread the helper method name through every invocation.
 macro_rules! yield_transition_in_simulator {
     ($state_machine:expr, $point:expr) => {
-        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         if let Some(result) = $state_machine.simulator_yield.maybe_transition($point) {
             return Ok(result);
         }
@@ -79,7 +77,6 @@ pub(crate) use yield_transition_in_simulator;
 
 macro_rules! yield_io_in_simulator {
     ($state_machine:expr, $point:expr) => {
-        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         if let Some(result) = $state_machine.simulator_yield.maybe_io($point) {
             return Ok(result);
         }
@@ -92,7 +89,6 @@ const MAX_SIMULATOR_YIELDS: usize = 4;
 
 pub(crate) type SimulatorYieldPlan<YieldPoint> = [Option<YieldPoint>; MAX_SIMULATOR_YIELDS];
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 fn simulator_yield_seed(seed: u64, key: u64) -> u64 {
     // Mix the global simulator seed with a local key so each state machine
     // gets a deterministic but distinct RNG stream.
@@ -103,7 +99,6 @@ fn simulator_yield_seed(seed: u64, key: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 pub(crate) fn simulator_yield_plan<YieldPoint: Copy>(
     seed: Option<u64>,
     key: u64,
@@ -135,14 +130,12 @@ pub(crate) fn simulator_yield_plan<YieldPoint: Copy>(
     plan
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SimulatorOpts {
     pub(crate) unsafe_testing: bool,
     pub(crate) simulator_seed: Option<u64>,
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl SimulatorOpts {
     pub(crate) fn from_db_opts(opts: &crate::DatabaseOpts) -> Self {
         Self {
@@ -1031,7 +1024,6 @@ impl CommitCoordinator {
     }
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulatorCommitYieldPoint {
     InitialValidation,
@@ -1041,7 +1033,6 @@ enum SimulatorCommitYieldPoint {
     LogicalLogSync,
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl SimulatorCommitYieldPoint {
     const ALL: [Self; 5] = [
         Self::InitialValidation,
@@ -1056,7 +1047,6 @@ impl SimulatorCommitYieldPoint {
     }
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulatorWriteRowYieldPoint {
     Initial,
@@ -1064,7 +1054,6 @@ enum SimulatorWriteRowYieldPoint {
     Insert,
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl SimulatorWriteRowYieldPoint {
     const ALL: [Self; 3] = [Self::Initial, Self::Seek, Self::Insert];
 
@@ -1077,7 +1066,6 @@ impl SimulatorWriteRowYieldPoint {
     }
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulatorDeleteRowYieldPoint {
     Initial,
@@ -1085,7 +1073,6 @@ enum SimulatorDeleteRowYieldPoint {
     Advance,
 }
 
-#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl SimulatorDeleteRowYieldPoint {
     const ALL: [Self; 3] = [Self::Initial, Self::Seek, Self::Advance];
 
@@ -1113,7 +1100,6 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     pending_log_append_bytes: Option<u64>,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
     simulator_yield: SimulatorYield<SimulatorCommitYieldPoint>,
     _phantom: PhantomData<Clock>,
 }
@@ -1134,7 +1120,6 @@ pub struct WriteRowStateMachine {
     record: Option<ImmutableRecord>,
     cursor: Arc<RwLock<BTreeCursor>>,
     requires_seek: bool,
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
     simulator_yield: SimulatorYield<SimulatorWriteRowYieldPoint>,
 }
 
@@ -1153,7 +1138,6 @@ pub struct DeleteRowStateMachine {
     is_finalized: bool,
     rowid: RowID,
     cursor: Arc<RwLock<BTreeCursor>>,
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
     simulator_yield: SimulatorYield<SimulatorDeleteRowYieldPoint>,
 }
 
@@ -1167,7 +1151,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         sync_mode: SyncMode,
     ) -> Self {
         let pager = connection.pager.load().clone();
-        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         let simulator_yield = if connection.db.opts.unsafe_testing {
             SimulatorYield::enabled(SimulatorCommitYieldPoint::plan(
                 connection.db.opts.simulator_seed,
@@ -1188,7 +1171,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             header,
             pending_log_append_bytes: None,
             sync_mode,
-            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
             simulator_yield,
             _phantom: PhantomData,
         }
@@ -1606,7 +1588,6 @@ impl WriteRowStateMachine {
         simulator_yield_enabled: bool,
         simulator_seed: Option<u64>,
     ) -> Self {
-        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         let simulator_yield = if simulator_yield_enabled {
             SimulatorYield::enabled(SimulatorWriteRowYieldPoint::plan(simulator_seed, &row.id))
         } else {
@@ -1619,7 +1600,6 @@ impl WriteRowStateMachine {
             record: None,
             cursor,
             requires_seek,
-            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
             simulator_yield,
         }
     }
@@ -2316,7 +2296,6 @@ impl DeleteRowStateMachine {
         simulator_yield_enabled: bool,
         simulator_seed: Option<u64>,
     ) -> Self {
-        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         let simulator_yield = if simulator_yield_enabled {
             SimulatorYield::enabled(SimulatorDeleteRowYieldPoint::plan(simulator_seed, &rowid))
         } else {
@@ -2327,7 +2306,6 @@ impl DeleteRowStateMachine {
             is_finalized: false,
             rowid,
             cursor,
-            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
             simulator_yield,
         }
     }
@@ -2418,7 +2396,6 @@ pub struct MvStore<Clock: LogicalClock> {
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
-    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
     pub(crate) simulator_opts: SimulatorOpts,
 }
 
@@ -2473,7 +2450,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub(crate) fn new(
         clock: Clock,
         storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
-        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         simulator_opts: SimulatorOpts,
     ) -> Self {
         Self {
@@ -2496,7 +2472,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
-            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
             simulator_opts,
         }
     }
@@ -4369,9 +4344,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 row.clone(),
                 cursor,
                 requires_seek,
-                #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
                 self.simulator_opts.unsafe_testing,
-                #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
                 self.simulator_opts.simulator_seed,
             ));
 
@@ -4387,9 +4360,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             StateMachine::<DeleteRowStateMachine>::new(DeleteRowStateMachine::new(
                 rowid,
                 cursor,
-                #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
                 self.simulator_opts.unsafe_testing,
-                #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
                 self.simulator_opts.simulator_seed,
             ));
 
