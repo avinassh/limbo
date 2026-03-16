@@ -91,6 +91,7 @@ const MAX_SIMULATOR_YIELDS: usize = 4;
 
 pub(crate) type SimulatorYieldPlan<YieldPoint> = [Option<YieldPoint>; MAX_SIMULATOR_YIELDS];
 
+#[allow(dead_code)]
 fn simulator_yield_seed(seed: u64, key: u64) -> u64 {
     // Mix the global simulator seed with a local key so each state machine
     // gets a deterministic but distinct RNG stream.
@@ -101,6 +102,7 @@ fn simulator_yield_seed(seed: u64, key: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+#[allow(dead_code)]
 pub(crate) fn simulator_yield_plan<YieldPoint: Copy>(
     seed: Option<u64>,
     key: u64,
@@ -1028,6 +1030,7 @@ impl CommitCoordinator {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulatorCommitYieldPoint {
     InitialValidation,
@@ -1037,6 +1040,7 @@ enum SimulatorCommitYieldPoint {
     LogicalLogSync,
 }
 
+#[allow(dead_code)]
 impl SimulatorCommitYieldPoint {
     const ALL: [Self; 5] = [
         Self::InitialValidation,
@@ -1051,6 +1055,7 @@ impl SimulatorCommitYieldPoint {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulatorWriteRowYieldPoint {
     Initial,
@@ -1058,6 +1063,7 @@ enum SimulatorWriteRowYieldPoint {
     Insert,
 }
 
+#[allow(dead_code)]
 impl SimulatorWriteRowYieldPoint {
     const ALL: [Self; 3] = [Self::Initial, Self::Seek, Self::Insert];
 
@@ -1070,6 +1076,7 @@ impl SimulatorWriteRowYieldPoint {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulatorDeleteRowYieldPoint {
     Initial,
@@ -1077,6 +1084,7 @@ enum SimulatorDeleteRowYieldPoint {
     Advance,
 }
 
+#[allow(dead_code)]
 impl SimulatorDeleteRowYieldPoint {
     const ALL: [Self; 3] = [Self::Initial, Self::Seek, Self::Advance];
 
@@ -1158,13 +1166,22 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         sync_mode: SyncMode,
     ) -> Self {
         let pager = connection.pager.load().clone();
-        let simulator_yield = if connection.db.opts.unsafe_testing {
-            SimulatorYield::enabled(SimulatorCommitYieldPoint::plan(
-                connection.db.opts.simulator_seed,
-                tx_id,
-            ))
-        } else {
-            SimulatorYield::disabled()
+        let simulator_yield = {
+            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            {
+                if connection.db.opts.unsafe_testing {
+                    SimulatorYield::enabled(SimulatorCommitYieldPoint::plan(
+                        connection.db.opts.simulator_seed,
+                        tx_id,
+                    ))
+                } else {
+                    SimulatorYield::disabled()
+                }
+            }
+            #[cfg(not(any(test, feature = "test_helper", feature = "simulator")))]
+            {
+                SimulatorYield::disabled()
+            }
         };
         Self {
             state,
@@ -1595,10 +1612,23 @@ impl WriteRowStateMachine {
         simulator_yield_enabled: bool,
         simulator_seed: Option<u64>,
     ) -> Self {
-        let simulator_yield = if simulator_yield_enabled {
-            SimulatorYield::enabled(SimulatorWriteRowYieldPoint::plan(simulator_seed, &row.id))
-        } else {
-            SimulatorYield::disabled()
+        let simulator_yield = {
+            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            {
+                if simulator_yield_enabled {
+                    SimulatorYield::enabled(SimulatorWriteRowYieldPoint::plan(
+                        simulator_seed,
+                        &row.id,
+                    ))
+                } else {
+                    SimulatorYield::disabled()
+                }
+            }
+            #[cfg(not(any(test, feature = "test_helper", feature = "simulator")))]
+            {
+                let _ = (simulator_yield_enabled, simulator_seed);
+                SimulatorYield::disabled()
+            }
         };
         Self {
             state: WriteRowState::Initial,
@@ -2303,10 +2333,23 @@ impl DeleteRowStateMachine {
         simulator_yield_enabled: bool,
         simulator_seed: Option<u64>,
     ) -> Self {
-        let simulator_yield = if simulator_yield_enabled {
-            SimulatorYield::enabled(SimulatorDeleteRowYieldPoint::plan(simulator_seed, &rowid))
-        } else {
-            SimulatorYield::disabled()
+        let simulator_yield = {
+            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            {
+                if simulator_yield_enabled {
+                    SimulatorYield::enabled(SimulatorDeleteRowYieldPoint::plan(
+                        simulator_seed,
+                        &rowid,
+                    ))
+                } else {
+                    SimulatorYield::disabled()
+                }
+            }
+            #[cfg(not(any(test, feature = "test_helper", feature = "simulator")))]
+            {
+                let _ = (simulator_yield_enabled, simulator_seed);
+                SimulatorYield::disabled()
+            }
         };
         Self {
             state: DeleteRowState::Initial,

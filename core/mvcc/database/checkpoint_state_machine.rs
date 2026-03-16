@@ -22,6 +22,7 @@ use crate::{
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // Yield points in the checkpoint state machine that the simulator can inject
 // synthetic yields at.
@@ -42,6 +43,7 @@ enum SimulatorCheckpointYieldPoint {
     TruncateWal,
 }
 
+#[allow(dead_code)]
 impl SimulatorCheckpointYieldPoint {
     const ALL: [Self; 14] = [
         Self::AcquireLock,
@@ -249,13 +251,22 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         // Auto-checkpoints chained off COMMIT still share the outer MVCC commit
         // state machine, so defer synthetic yields there until that handoff has
         // dedicated cleanup support.
-        let simulator_yield = if mvstore.simulator_opts.unsafe_testing && update_transaction_state {
-            SimulatorYield::enabled(SimulatorCheckpointYieldPoint::plan(
-                mvstore.simulator_opts.simulator_seed,
-                &mvstore,
-            ))
-        } else {
-            SimulatorYield::disabled()
+        let simulator_yield = {
+            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            {
+                if mvstore.simulator_opts.unsafe_testing && update_transaction_state {
+                    SimulatorYield::enabled(SimulatorCheckpointYieldPoint::plan(
+                        mvstore.simulator_opts.simulator_seed,
+                        &mvstore,
+                    ))
+                } else {
+                    SimulatorYield::disabled()
+                }
+            }
+            #[cfg(not(any(test, feature = "test_helper", feature = "simulator")))]
+            {
+                SimulatorYield::disabled()
+            }
         };
         Self {
             state: CheckpointState::AcquireLock,
