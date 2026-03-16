@@ -1,7 +1,7 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     yield_transition_if_testing, DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey,
-    RowVersion, TxTimestampOrID, UnsafeTestingYield, WriteRowStateMachine,
+    RowVersion, TxTimestampOrID, UnsafeTestingYield, UnsafeTestingYieldPlan, WriteRowStateMachine,
     MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::schema::Index;
@@ -22,7 +22,7 @@ use crate::{
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
 
-#[cfg(any(test, feature = "test_helper"))]
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnsafeTestingCheckpointYieldPoint {
     AcquireLock,
@@ -41,7 +41,7 @@ enum UnsafeTestingCheckpointYieldPoint {
     TruncateWal,
 }
 
-#[cfg(any(test, feature = "test_helper"))]
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl UnsafeTestingCheckpointYieldPoint {
     const ALL: [Self; 14] = [
         Self::AcquireLock,
@@ -60,9 +60,12 @@ impl UnsafeTestingCheckpointYieldPoint {
         Self::TruncateWal,
     ];
 
-    fn pick(mvstore: &MvStore<impl LogicalClock>) -> Self {
+    fn plan(
+        seed: Option<u64>,
+        mvstore: &MvStore<impl LogicalClock>,
+    ) -> UnsafeTestingYieldPlan<Self> {
         let key = mvstore.durable_txid_max.load(Ordering::Acquire);
-        Self::ALL[(key as usize) % Self::ALL.len()]
+        super::unsafe_testing_plan(seed, key, &Self::ALL)
     }
 }
 
@@ -178,7 +181,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     staged_checkpoint_header: Option<DatabaseHeader>,
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
     header_staged_for_commit: bool,
-    #[cfg(any(test, feature = "test_helper"))]
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
     unsafe_testing_yield: UnsafeTestingYield<UnsafeTestingCheckpointYieldPoint>,
 }
 
@@ -245,9 +248,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             !connection.db.path.starts_with(":memory:") && mvcc_meta_table.is_some();
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
-        #[cfg(any(test, feature = "test_helper"))]
+        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         let unsafe_testing_yield = if mvstore.is_unsafe_testing_enabled() {
-            UnsafeTestingYield::enabled(UnsafeTestingCheckpointYieldPoint::pick(&mvstore))
+            UnsafeTestingYield::enabled(UnsafeTestingCheckpointYieldPoint::plan(
+                mvstore.unsafe_testing_seed(),
+                &mvstore,
+            ))
         } else {
             UnsafeTestingYield::disabled()
         };
@@ -280,7 +286,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             durable_mvcc_metadata,
             staged_checkpoint_header: None,
             header_staged_for_commit: false,
-            #[cfg(any(test, feature = "test_helper"))]
+            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
             unsafe_testing_yield,
         }
     }

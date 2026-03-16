@@ -69,6 +69,7 @@ pub fn open_mv_store(
     durable_storage: Option<Arc<dyn mvcc::persistent_storage::DurableStorage>>,
     encryption_ctx: Option<crate::storage::encryption::EncryptionContext>,
     unsafe_testing: bool,
+    unsafe_testing_seed: Option<u64>,
 ) -> Result<Arc<MvStore>> {
     let storage: Arc<dyn mvcc::persistent_storage::DurableStorage> =
         if let Some(storage) = durable_storage {
@@ -90,6 +91,7 @@ pub fn open_mv_store(
 
     let mv_store = MvStore::new(mvcc::MvccClock::new(), storage);
     mv_store.set_unsafe_testing(unsafe_testing);
+    mv_store.set_unsafe_testing_seed(unsafe_testing_seed);
     let mv_store = Arc::new(mv_store);
     Ok(mv_store)
 }

@@ -6,7 +6,7 @@ use crossbeam_skiplist::SkipMap;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     create_seek_range, yield_io_if_testing, MVTableId, MvStore, Row, RowID, RowKey, RowVersion,
-    SortableIndexKey, UnsafeTestingYield,
+    SortableIndexKey, UnsafeTestingYield, UnsafeTestingYieldPlan,
 };
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
@@ -103,7 +103,7 @@ enum MvccLazyCursorState {
     Seek(SeekState, IterationDirection),
 }
 
-#[cfg(any(test, feature = "test_helper"))]
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnsafeTestingCursorYieldPoint {
     NextInit,
@@ -118,7 +118,7 @@ enum UnsafeTestingCursorYieldPoint {
     AdvanceBtreeBackwardStateChange,
 }
 
-#[cfg(any(test, feature = "test_helper"))]
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 impl UnsafeTestingCursorYieldPoint {
     const ALL: [Self; 10] = [
         Self::NextInit,
@@ -133,9 +133,9 @@ impl UnsafeTestingCursorYieldPoint {
         Self::AdvanceBtreeBackwardStateChange,
     ];
 
-    fn pick(_tx_id: u64, table_id: MVTableId) -> Self {
+    fn plan(seed: Option<u64>, tx_id: u64, table_id: MVTableId) -> UnsafeTestingYieldPlan<Self> {
         let key = i64::from(table_id).unsigned_abs().saturating_sub(2);
-        Self::ALL[(key as usize) % Self::ALL.len()]
+        super::database::unsafe_testing_plan(seed, key ^ tx_id, &Self::ALL)
     }
 }
 
@@ -309,7 +309,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek,
-    #[cfg(any(test, feature = "test_helper"))]
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
     unsafe_testing_yield: UnsafeTestingYield<UnsafeTestingCursorYieldPoint>,
 }
 
@@ -338,9 +338,13 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             "BTreeCursor expected for mvcc cursor"
         );
         let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
-        #[cfg(any(test, feature = "test_helper"))]
+        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
         let unsafe_testing_yield = if db.is_unsafe_testing_enabled() {
-            UnsafeTestingYield::enabled(UnsafeTestingCursorYieldPoint::pick(tx_id, table_id))
+            UnsafeTestingYield::enabled(UnsafeTestingCursorYieldPoint::plan(
+                db.unsafe_testing_seed(),
+                tx_id,
+                table_id,
+            ))
         } else {
             UnsafeTestingYield::disabled()
         };
@@ -360,7 +364,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             count_state: None,
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
-            #[cfg(any(test, feature = "test_helper"))]
+            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
             unsafe_testing_yield,
         })
     }

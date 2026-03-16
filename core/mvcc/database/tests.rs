@@ -2682,31 +2682,82 @@ fn test_mvcc_cursor_next_yields_with_unsafe_testing() {
         .as_int()
         .unwrap();
     let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
-    let tx_id = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
+    let mut saw_yield = false;
+    for _ in 0..64 {
+        let tx_id = db
+            .mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap();
+
+        let mut cursor = MvccLazyCursor::new(
+            db.mvcc_store.clone(),
+            tx_id,
+            i64::from(table_id),
+            MvccCursorType::Table,
+            Box::new(BTreeCursor::new(
+                db.conn.pager.load().clone(),
+                root_page.abs(),
+                1,
+            )),
+        )
         .unwrap();
 
-    let mut cursor = MvccLazyCursor::new(
-        db.mvcc_store.clone(),
-        tx_id,
-        i64::from(table_id),
-        MvccCursorType::Table,
-        Box::new(BTreeCursor::new(
-            db.conn.pager.load().clone(),
-            root_page.abs(),
-            1,
-        )),
-    )
-    .unwrap();
+        saw_yield = matches!(cursor.next().unwrap(), IOResult::IO(_));
+        db.mvcc_store
+            .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+
+        if saw_yield {
+            break;
+        }
+    }
 
     assert!(
-        matches!(cursor.next().unwrap(), IOResult::IO(_)),
-        "unsafe_testing MVCC cursor should yield on its first reachable next() transition",
+        saw_yield,
+        "unsafe_testing MVCC cursor should yield on a first next() transition for some deterministic tx id",
+    );
+}
+
+#[test]
+fn test_seeded_unsafe_testing_plan_uses_simulator_seed() {
+    let key = 42;
+    let unseeded = UnsafeTestingCommitYieldPoint::plan(None, key);
+    assert_eq!(
+        unseeded.iter().flatten().count(),
+        1,
+        "unseeded unsafe_testing should keep the existing single-yield fallback",
     );
 
-    db.mvcc_store
-        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+    let seeded_plans = (0..4096_u64)
+        .map(|seed| (seed, UnsafeTestingCommitYieldPoint::plan(Some(seed), key)))
+        .collect::<Vec<_>>();
+
+    let seeded = seeded_plans
+        .iter()
+        .find(|(_, plan)| *plan != unseeded)
+        .copied()
+        .expect("expected at least one simulator seed to change the yield plan");
+
+    assert_eq!(
+        seeded.1,
+        UnsafeTestingCommitYieldPoint::plan(Some(seeded.0), key),
+        "seeded unsafe_testing plan should be deterministic",
+    );
+    assert!(
+        seeded.1.iter().flatten().count() <= 4,
+        "seeded unsafe_testing should select at most four yield points",
+    );
+    assert!(
+        seeded_plans
+            .iter()
+            .any(|(_, plan)| plan.iter().flatten().count() == 0),
+        "seeded unsafe_testing should be able to inject zero yields",
+    );
+    assert!(
+        seeded_plans
+            .iter()
+            .any(|(_, plan)| plan.iter().flatten().count() > 1),
+        "seeded unsafe_testing should be able to inject multiple yields",
+    );
 }
 
 pub(crate) fn commit_tx(
@@ -6901,7 +6952,7 @@ fn begin_tx_with_commit_yield_point(
         let tx_id = conn
             .get_mv_tx_id()
             .expect("transaction should have an MVCC tx id after write");
-        if UnsafeTestingCommitYieldPoint::pick(tx_id) == target {
+        if UnsafeTestingCommitYieldPoint::plan(None, tx_id).contains(&Some(target)) {
             return tx_id;
         }
         conn.execute("ROLLBACK").unwrap();
