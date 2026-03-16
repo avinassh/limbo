@@ -36,6 +36,8 @@ use crate::{
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::BTreeSet;
@@ -91,21 +93,18 @@ const MAX_SIMULATOR_YIELDS: usize = 4;
 pub(crate) type SimulatorYieldPlan<YieldPoint> = [Option<YieldPoint>; MAX_SIMULATOR_YIELDS];
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-fn simulator_yield_mix(seed: u64, key: u64, salt: u64) -> u64 {
-    // Stateless avalanche hash over the simulator seed and local key so plans
-    // stay deterministic without threading RNG state through core state
-    // machines.
-    let mut z = key
-        .wrapping_add(seed)
-        .wrapping_add(salt)
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+fn simulator_yield_seed(seed: u64, key: u64) -> u64 {
+    // Mix the global simulator seed with a local key so each state machine
+    // gets a deterministic but distinct RNG stream.
+    // 0x9E37_79B9_7F4A_7C15 is the 64-bit golden-ratio increment.
+    let mut z = key.wrapping_add(seed).wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-pub(crate) fn simulator_yield_plan<YieldPoint: Copy + PartialEq>(
+pub(crate) fn simulator_yield_plan<YieldPoint: Copy>(
     seed: Option<u64>,
     key: u64,
     all: &[YieldPoint],
@@ -118,17 +117,12 @@ pub(crate) fn simulator_yield_plan<YieldPoint: Copy + PartialEq>(
     match seed {
         Some(seed) => {
             let max_points = all.len().min(MAX_SIMULATOR_YIELDS);
-            let count = (simulator_yield_mix(seed, key, 0) as usize) % (max_points + 1);
-            let mut filled = 0;
-            let mut salt = 1;
-            while filled < count {
-                let idx = (simulator_yield_mix(seed, key, salt) as usize) % all.len();
-                let point = all[idx];
-                if !plan[..filled].contains(&Some(point)) {
-                    plan[filled] = Some(point);
-                    filled += 1;
-                }
-                salt = salt.wrapping_add(1);
+            let mut rng = StdRng::seed_from_u64(simulator_yield_seed(seed, key));
+            let count = rng.random_range(0..=max_points);
+            let mut choices = all.to_vec();
+            choices.shuffle(&mut rng);
+            for (dst, point) in plan.iter_mut().zip(choices.into_iter().take(count)) {
+                *dst = Some(point);
             }
         }
         None => {

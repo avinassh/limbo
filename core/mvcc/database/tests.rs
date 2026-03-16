@@ -2683,6 +2683,8 @@ fn test_mvcc_cursor_next_yields_with_unsafe_testing() {
         .unwrap();
     let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
     let mut saw_yield = false;
+    // The unseeded cursor plan is keyed by table_id ^ tx_id, so not every tx_id
+    // selects NextInit; probe a small deterministic range until one does.
     for _ in 0..64 {
         let tx_id = db
             .mvcc_store
