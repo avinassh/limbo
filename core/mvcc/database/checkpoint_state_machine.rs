@@ -249,7 +249,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-        let simulator_yield = if mvstore.simulator_opts.unsafe_testing {
+        // Auto-checkpoints chained off COMMIT still share the outer MVCC commit
+        // state machine, so defer synthetic yields there until that handoff has
+        // dedicated cleanup support.
+        let simulator_yield = if mvstore.simulator_opts.unsafe_testing && update_transaction_state {
             SimulatorYield::enabled(SimulatorCheckpointYieldPoint::plan(
                 mvstore.simulator_opts.simulator_seed,
                 &mvstore,
