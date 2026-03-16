@@ -60,41 +60,41 @@ pub mod tests;
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
 const NO_EXCLUSIVE_TX: u64 = 0;
 
-// Synthetic MVCC yields are injected from code that returns either
+// Synthetic simulator yields are injected from code that returns either
 // `TransitionResult<T>` state-machine steps or `IOResult<T>` cursor helpers.
 // Keep one macro per result shape so call sites stay explicit and do not have
 // to thread the helper method name through every invocation.
-macro_rules! yield_transition_if_testing {
+macro_rules! yield_transition_in_simulator {
     ($state_machine:expr, $point:expr) => {
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-        if let Some(result) = $state_machine.unsafe_testing_yield.maybe_transition($point) {
+        if let Some(result) = $state_machine.simulator_yield.maybe_transition($point) {
             return Ok(result);
         }
     };
 }
 
-pub(crate) use yield_transition_if_testing;
+pub(crate) use yield_transition_in_simulator;
 
-macro_rules! yield_io_if_testing {
+macro_rules! yield_io_in_simulator {
     ($state_machine:expr, $point:expr) => {
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-        if let Some(result) = $state_machine.unsafe_testing_yield.maybe_io($point) {
+        if let Some(result) = $state_machine.simulator_yield.maybe_io($point) {
             return Ok(result);
         }
     };
 }
 
-pub(crate) use yield_io_if_testing;
+pub(crate) use yield_io_in_simulator;
 
-const MAX_UNSAFE_TESTING_YIELDS: usize = 4;
+const MAX_SIMULATOR_YIELDS: usize = 4;
 
-pub(crate) type UnsafeTestingYieldPlan<YieldPoint> =
-    [Option<YieldPoint>; MAX_UNSAFE_TESTING_YIELDS];
+pub(crate) type SimulatorYieldPlan<YieldPoint> = [Option<YieldPoint>; MAX_SIMULATOR_YIELDS];
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-fn unsafe_testing_mix(seed: u64, key: u64, salt: u64) -> u64 {
-    // SplitMix64-style avalanche to reshuffle synthetic yield points from the
-    // simulator seed without pulling a full RNG into core.
+fn simulator_yield_mix(seed: u64, key: u64, salt: u64) -> u64 {
+    // Stateless avalanche hash over the simulator seed and local key so plans
+    // stay deterministic without threading RNG state through core state
+    // machines.
     let mut z = key
         .wrapping_add(seed)
         .wrapping_add(salt)
@@ -105,24 +105,24 @@ fn unsafe_testing_mix(seed: u64, key: u64, salt: u64) -> u64 {
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-pub(crate) fn unsafe_testing_plan<YieldPoint: Copy + PartialEq>(
+pub(crate) fn simulator_yield_plan<YieldPoint: Copy + PartialEq>(
     seed: Option<u64>,
     key: u64,
     all: &[YieldPoint],
-) -> UnsafeTestingYieldPlan<YieldPoint> {
-    let mut plan = [None; MAX_UNSAFE_TESTING_YIELDS];
+) -> SimulatorYieldPlan<YieldPoint> {
+    let mut plan = [None; MAX_SIMULATOR_YIELDS];
     if all.is_empty() {
         return plan;
     }
 
     match seed {
         Some(seed) => {
-            let max_points = all.len().min(MAX_UNSAFE_TESTING_YIELDS);
-            let count = (unsafe_testing_mix(seed, key, 0) as usize) % (max_points + 1);
+            let max_points = all.len().min(MAX_SIMULATOR_YIELDS);
+            let count = (simulator_yield_mix(seed, key, 0) as usize) % (max_points + 1);
             let mut filled = 0;
             let mut salt = 1;
             while filled < count {
-                let idx = (unsafe_testing_mix(seed, key, salt) as usize) % all.len();
+                let idx = (simulator_yield_mix(seed, key, salt) as usize) % all.len();
                 let point = all[idx];
                 if !plan[..filled].contains(&Some(point)) {
                     plan[filled] = Some(point);
@@ -142,18 +142,18 @@ pub(crate) fn unsafe_testing_plan<YieldPoint: Copy + PartialEq>(
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct UnsafeTestingYield<YieldPoint> {
-    remaining_points: UnsafeTestingYieldPlan<YieldPoint>,
+pub(crate) struct SimulatorYield<YieldPoint> {
+    remaining_points: SimulatorYieldPlan<YieldPoint>,
 }
 
-impl<YieldPoint: Copy + PartialEq + Debug> UnsafeTestingYield<YieldPoint> {
+impl<YieldPoint: Copy + PartialEq + Debug> SimulatorYield<YieldPoint> {
     pub(crate) fn disabled() -> Self {
         Self {
-            remaining_points: [None; MAX_UNSAFE_TESTING_YIELDS],
+            remaining_points: [None; MAX_SIMULATOR_YIELDS],
         }
     }
 
-    pub(crate) fn enabled(points: UnsafeTestingYieldPlan<YieldPoint>) -> Self {
+    pub(crate) fn enabled(points: SimulatorYieldPlan<YieldPoint>) -> Self {
         Self {
             remaining_points: points,
         }
@@ -1022,70 +1022,68 @@ impl CommitCoordinator {
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnsafeTestingCommitYieldPoint {
+enum SimulatorCommitYieldPoint {
     InitialValidation,
     WriteValidation,
     BuildLogRecord,
     LogicalLogWrite,
     LogicalLogSync,
-    CommitEndBoundary,
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-impl UnsafeTestingCommitYieldPoint {
-    const ALL: [Self; 6] = [
+impl SimulatorCommitYieldPoint {
+    const ALL: [Self; 5] = [
         Self::InitialValidation,
         Self::WriteValidation,
         Self::BuildLogRecord,
         Self::LogicalLogWrite,
         Self::LogicalLogSync,
-        Self::CommitEndBoundary,
     ];
 
-    fn plan(seed: Option<u64>, tx_id: TxID) -> UnsafeTestingYieldPlan<Self> {
-        unsafe_testing_plan(seed, tx_id, &Self::ALL)
+    fn plan(seed: Option<u64>, tx_id: TxID) -> SimulatorYieldPlan<Self> {
+        simulator_yield_plan(seed, tx_id, &Self::ALL)
     }
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnsafeTestingWriteRowYieldPoint {
+enum SimulatorWriteRowYieldPoint {
     Initial,
     Seek,
     Insert,
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-impl UnsafeTestingWriteRowYieldPoint {
+impl SimulatorWriteRowYieldPoint {
     const ALL: [Self; 3] = [Self::Initial, Self::Seek, Self::Insert];
 
-    fn plan(seed: Option<u64>, rowid: &RowID) -> UnsafeTestingYieldPlan<Self> {
+    fn plan(seed: Option<u64>, rowid: &RowID) -> SimulatorYieldPlan<Self> {
         let key = match &rowid.row_id {
             RowKey::Int(rowid) => rowid.unsigned_abs(),
             RowKey::Record(_) => i64::from(rowid.table_id).unsigned_abs(),
         };
-        unsafe_testing_plan(seed, key, &Self::ALL)
+        simulator_yield_plan(seed, key, &Self::ALL)
     }
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnsafeTestingDeleteRowYieldPoint {
+enum SimulatorDeleteRowYieldPoint {
     Initial,
     Seek,
     Advance,
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-impl UnsafeTestingDeleteRowYieldPoint {
+impl SimulatorDeleteRowYieldPoint {
     const ALL: [Self; 3] = [Self::Initial, Self::Seek, Self::Advance];
 
-    fn plan(seed: Option<u64>, rowid: &RowID) -> UnsafeTestingYieldPlan<Self> {
+    fn plan(seed: Option<u64>, rowid: &RowID) -> SimulatorYieldPlan<Self> {
         let key = match &rowid.row_id {
             RowKey::Int(rowid) => rowid.unsigned_abs(),
             RowKey::Record(_) => i64::from(rowid.table_id).unsigned_abs(),
         };
-        unsafe_testing_plan(seed, key, &Self::ALL)
+        simulator_yield_plan(seed, key, &Self::ALL)
     }
 }
 
@@ -1105,7 +1103,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
     #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-    unsafe_testing_yield: UnsafeTestingYield<UnsafeTestingCommitYieldPoint>,
+    simulator_yield: SimulatorYield<SimulatorCommitYieldPoint>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -1126,7 +1124,7 @@ pub struct WriteRowStateMachine {
     cursor: Arc<RwLock<BTreeCursor>>,
     requires_seek: bool,
     #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-    unsafe_testing_yield: UnsafeTestingYield<UnsafeTestingWriteRowYieldPoint>,
+    simulator_yield: SimulatorYield<SimulatorWriteRowYieldPoint>,
 }
 
 #[derive(Debug)]
@@ -1145,7 +1143,7 @@ pub struct DeleteRowStateMachine {
     rowid: RowID,
     cursor: Arc<RwLock<BTreeCursor>>,
     #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-    unsafe_testing_yield: UnsafeTestingYield<UnsafeTestingDeleteRowYieldPoint>,
+    simulator_yield: SimulatorYield<SimulatorDeleteRowYieldPoint>,
 }
 
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
@@ -1159,13 +1157,13 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     ) -> Self {
         let pager = connection.pager.load().clone();
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-        let unsafe_testing_yield = if connection.db.opts.unsafe_testing {
-            UnsafeTestingYield::enabled(UnsafeTestingCommitYieldPoint::plan(
+        let simulator_yield = if connection.db.opts.unsafe_testing {
+            SimulatorYield::enabled(SimulatorCommitYieldPoint::plan(
                 connection.db.opts.simulator_seed,
                 tx_id,
             ))
         } else {
-            UnsafeTestingYield::disabled()
+            SimulatorYield::disabled()
         };
         Self {
             state,
@@ -1180,7 +1178,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             pending_log_append_bytes: None,
             sync_mode,
             #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-            unsafe_testing_yield,
+            simulator_yield,
             _phantom: PhantomData,
         }
     }
@@ -1594,17 +1592,14 @@ impl WriteRowStateMachine {
         row: Row,
         cursor: Arc<RwLock<BTreeCursor>>,
         requires_seek: bool,
-        unsafe_testing: bool,
-        unsafe_testing_seed: Option<u64>,
+        simulator_yield_enabled: bool,
+        simulator_seed: Option<u64>,
     ) -> Self {
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-        let unsafe_testing_yield = if unsafe_testing {
-            UnsafeTestingYield::enabled(UnsafeTestingWriteRowYieldPoint::plan(
-                unsafe_testing_seed,
-                &row.id,
-            ))
+        let simulator_yield = if simulator_yield_enabled {
+            SimulatorYield::enabled(SimulatorWriteRowYieldPoint::plan(simulator_seed, &row.id))
         } else {
-            UnsafeTestingYield::disabled()
+            SimulatorYield::disabled()
         };
         Self {
             state: WriteRowState::Initial,
@@ -1614,7 +1609,7 @@ impl WriteRowStateMachine {
             cursor,
             requires_seek,
             #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-            unsafe_testing_yield,
+            simulator_yield,
         }
     }
 }
@@ -1798,10 +1793,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
                 self.state = CommitState::Commit { end_ts };
-                yield_transition_if_testing!(
-                    self,
-                    UnsafeTestingCommitYieldPoint::InitialValidation
-                );
+                yield_transition_in_simulator!(self, SimulatorCommitYieldPoint::InitialValidation);
                 Ok(TransitionResult::Continue)
             }
             CommitState::Commit { end_ts } => {
@@ -1831,7 +1823,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // TxID references until CommitEnd so an abandoned commit can
                 // still be rolled back by matching on TxID(self.tx_id).
                 self.state = CommitState::WaitForDependencies { end_ts: *end_ts };
-                yield_transition_if_testing!(self, UnsafeTestingCommitYieldPoint::WriteValidation);
+                yield_transition_in_simulator!(self, SimulatorCommitYieldPoint::WriteValidation);
                 return Ok(TransitionResult::Continue);
             }
             CommitState::WaitForDependencies { end_ts } => {
@@ -1901,7 +1893,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 } else {
                     self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
                 }
-                yield_transition_if_testing!(self, UnsafeTestingCommitYieldPoint::BuildLogRecord);
+                yield_transition_in_simulator!(self, SimulatorCommitYieldPoint::BuildLogRecord);
                 return Ok(TransitionResult::Continue);
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
@@ -1926,9 +1918,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    yield_transition_if_testing!(
+                    yield_transition_in_simulator!(
                         self,
-                        UnsafeTestingCommitYieldPoint::LogicalLogWrite
+                        SimulatorCommitYieldPoint::LogicalLogWrite
                     );
                     Ok(TransitionResult::Continue)
                 } else {
@@ -1942,32 +1934,34 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if self.sync_mode != SyncMode::Full {
                     tracing::debug!("Skipping fsync of logical log (synchronous!=full)");
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
-                    yield_transition_if_testing!(
-                        self,
-                        UnsafeTestingCommitYieldPoint::LogicalLogSync
-                    );
+                    yield_transition_in_simulator!(self, SimulatorCommitYieldPoint::LogicalLogSync);
                     return Ok(TransitionResult::Continue);
                 }
                 let c = mvcc_store.storage.sync(self.pager.get_sync_type())?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    yield_transition_if_testing!(
-                        self,
-                        UnsafeTestingCommitYieldPoint::LogicalLogSync
-                    );
+                    yield_transition_in_simulator!(self, SimulatorCommitYieldPoint::LogicalLogSync);
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
                 }
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
+                let connection = self.connection.clone();
+                let schema_did_change = self.did_commit_schema_change;
+                if schema_did_change {
+                    let schema = connection.schema.read().clone();
+                    connection.db.update_schema_if_newer(schema);
+                }
+                let tx = mvcc_store
+                    .txs
+                    .get(&self.tx_id)
+                    .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
+                let tx_unlocked = tx.value();
+                self.header.write().replace(*tx_unlocked.header.read());
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
-                yield_transition_if_testing!(
-                    self,
-                    UnsafeTestingCommitYieldPoint::CommitEndBoundary
-                );
                 return Ok(TransitionResult::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
@@ -2028,7 +2022,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
 
-                self.header.write().replace(*tx_unlocked.header.read());
+                mvcc_store
+                    .global_header
+                    .write()
+                    .replace(*tx_unlocked.header.read());
 
                 mvcc_store
                     .last_committed_tx_ts
@@ -2037,8 +2034,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     mvcc_store
                         .last_committed_schema_change_ts
                         .store(*end_ts, Ordering::Release);
-                    let schema = self.connection.schema.read().clone();
-                    self.connection.db.update_schema_if_newer(schema);
                 }
 
                 // We have now updated all the versions with a reference to the
@@ -2122,7 +2117,7 @@ impl StateTransition for WriteRowStateMachine {
                 } else {
                     self.state = WriteRowState::Insert;
                 }
-                yield_transition_if_testing!(self, UnsafeTestingWriteRowYieldPoint::Initial);
+                yield_transition_in_simulator!(self, SimulatorWriteRowYieldPoint::Initial);
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Seek => {
@@ -2144,7 +2139,7 @@ impl StateTransition for WriteRowStateMachine {
                 }
                 turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
                 self.state = WriteRowState::Insert;
-                yield_transition_if_testing!(self, UnsafeTestingWriteRowYieldPoint::Seek);
+                yield_transition_in_simulator!(self, SimulatorWriteRowYieldPoint::Seek);
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Insert => {
@@ -2166,7 +2161,7 @@ impl StateTransition for WriteRowStateMachine {
                     }
                 }
                 self.state = WriteRowState::Next;
-                yield_transition_if_testing!(self, UnsafeTestingWriteRowYieldPoint::Insert);
+                yield_transition_in_simulator!(self, SimulatorWriteRowYieldPoint::Insert);
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Next => {
@@ -2208,7 +2203,7 @@ impl StateTransition for DeleteRowStateMachine {
         match self.state {
             DeleteRowState::Initial => {
                 self.state = DeleteRowState::Seek;
-                yield_transition_if_testing!(self, UnsafeTestingDeleteRowYieldPoint::Initial);
+                yield_transition_in_simulator!(self, SimulatorDeleteRowYieldPoint::Initial);
                 Ok(TransitionResult::Continue)
             }
             DeleteRowState::Seek => {
@@ -2241,7 +2236,7 @@ impl StateTransition for DeleteRowStateMachine {
                                 );
                             }
                         }
-                        yield_transition_if_testing!(self, UnsafeTestingDeleteRowYieldPoint::Seek);
+                        yield_transition_in_simulator!(self, SimulatorDeleteRowYieldPoint::Seek);
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => {
@@ -2260,10 +2255,7 @@ impl StateTransition for DeleteRowStateMachine {
                             );
                         }
                         self.state = DeleteRowState::Delete;
-                        yield_transition_if_testing!(
-                            self,
-                            UnsafeTestingDeleteRowYieldPoint::Advance
-                        );
+                        yield_transition_in_simulator!(self, SimulatorDeleteRowYieldPoint::Advance);
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => {
@@ -2310,17 +2302,14 @@ impl DeleteRowStateMachine {
     fn new(
         rowid: RowID,
         cursor: Arc<RwLock<BTreeCursor>>,
-        unsafe_testing: bool,
-        unsafe_testing_seed: Option<u64>,
+        simulator_yield_enabled: bool,
+        simulator_seed: Option<u64>,
     ) -> Self {
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-        let unsafe_testing_yield = if unsafe_testing {
-            UnsafeTestingYield::enabled(UnsafeTestingDeleteRowYieldPoint::plan(
-                unsafe_testing_seed,
-                &rowid,
-            ))
+        let simulator_yield = if simulator_yield_enabled {
+            SimulatorYield::enabled(SimulatorDeleteRowYieldPoint::plan(simulator_seed, &rowid))
         } else {
-            UnsafeTestingYield::disabled()
+            SimulatorYield::disabled()
         };
         Self {
             state: DeleteRowState::Initial,
@@ -2328,7 +2317,7 @@ impl DeleteRowStateMachine {
             rowid,
             cursor,
             #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-            unsafe_testing_yield,
+            simulator_yield,
         }
     }
 }
@@ -2419,7 +2408,7 @@ pub struct MvStore<Clock: LogicalClock> {
     last_committed_tx_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
     unsafe_testing: AtomicBool,
-    unsafe_testing_seed: RwLock<Option<u64>>,
+    simulator_seed: RwLock<Option<u64>>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -2495,7 +2484,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_tx_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
             unsafe_testing: AtomicBool::new(false),
-            unsafe_testing_seed: RwLock::new(None),
+            simulator_seed: RwLock::new(None),
         }
     }
 
@@ -2507,12 +2496,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.unsafe_testing.load(Ordering::Relaxed)
     }
 
-    pub fn set_unsafe_testing_seed(&self, seed: Option<u64>) {
-        *self.unsafe_testing_seed.write() = seed;
+    pub fn set_simulator_seed(&self, seed: Option<u64>) {
+        *self.simulator_seed.write() = seed;
     }
 
-    pub fn unsafe_testing_seed(&self) -> Option<u64> {
-        *self.unsafe_testing_seed.read()
+    pub fn simulator_seed(&self) -> Option<u64> {
+        *self.simulator_seed.read()
     }
 
     /// Get the table ID from the root page.
@@ -4384,7 +4373,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 cursor,
                 requires_seek,
                 self.is_unsafe_testing_enabled(),
-                self.unsafe_testing_seed(),
+                self.simulator_seed(),
             ));
 
         Ok(state_machine)
@@ -4400,7 +4389,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 rowid,
                 cursor,
                 self.is_unsafe_testing_enabled(),
-                self.unsafe_testing_seed(),
+                self.simulator_seed(),
             ));
 
         Ok(state_machine)

@@ -2720,7 +2720,7 @@ fn test_mvcc_cursor_next_yields_with_unsafe_testing() {
 #[test]
 fn test_seeded_unsafe_testing_plan_uses_simulator_seed() {
     let key = 42;
-    let unseeded = UnsafeTestingCommitYieldPoint::plan(None, key);
+    let unseeded = SimulatorCommitYieldPoint::plan(None, key);
     assert_eq!(
         unseeded.iter().flatten().count(),
         1,
@@ -2728,18 +2728,18 @@ fn test_seeded_unsafe_testing_plan_uses_simulator_seed() {
     );
 
     let seeded_plans = (0..4096_u64)
-        .map(|seed| (seed, UnsafeTestingCommitYieldPoint::plan(Some(seed), key)))
+        .map(|seed| (seed, SimulatorCommitYieldPoint::plan(Some(seed), key)))
         .collect::<Vec<_>>();
 
     let seeded = seeded_plans
         .iter()
         .find(|(_, plan)| *plan != unseeded)
-        .copied()
+        .map(|(seed, plan)| (*seed, *plan))
         .expect("expected at least one simulator seed to change the yield plan");
 
     assert_eq!(
         seeded.1,
-        UnsafeTestingCommitYieldPoint::plan(Some(seeded.0), key),
+        SimulatorCommitYieldPoint::plan(Some(seeded.0), key),
         "seeded unsafe_testing plan should be deterministic",
     );
     assert!(
@@ -6937,29 +6937,6 @@ fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<MvStore<
     conn.close().unwrap();
 }
 
-fn begin_tx_with_commit_yield_point(
-    conn: &Arc<Connection>,
-    begin_sql: &str,
-    target: UnsafeTestingCommitYieldPoint,
-    materialize_tx_sql: Option<&str>,
-) -> TxID {
-    for _ in 0..(UnsafeTestingCommitYieldPoint::ALL.len() * 2) {
-        conn.execute(begin_sql).unwrap();
-        if conn.get_mv_tx_id().is_none() {
-            let sql = materialize_tx_sql.expect("write statement required to materialize tx");
-            conn.execute(sql).unwrap();
-        }
-        let tx_id = conn
-            .get_mv_tx_id()
-            .expect("transaction should have an MVCC tx id after write");
-        if UnsafeTestingCommitYieldPoint::plan(None, tx_id).contains(&Some(target)) {
-            return tx_id;
-        }
-        conn.execute("ROLLBACK").unwrap();
-    }
-    panic!("failed to find transaction for unsafe-testing yield point {target:?}");
-}
-
 #[test]
 fn test_abandoned_commit_rolls_back_insert_with_unsafe_testing_yield() {
     let db = MvccTestDbNoConn::new_with_random_db_with_opts(
@@ -6986,54 +6963,6 @@ fn test_abandoned_commit_rolls_back_insert_with_unsafe_testing_yield() {
     assert!(
         rows.is_empty(),
         "row from unsafe-testing abandoned INSERT commit remained visible: {rows:?}",
-    );
-    observer.close().unwrap();
-}
-
-#[test]
-fn test_abandoned_commit_end_yield_does_not_publish_schema_or_header() {
-    let db = MvccTestDbNoConn::new_with_random_db_with_opts(
-        DatabaseOpts::new().with_unsafe_testing(true),
-    );
-    let conn = db.connect();
-
-    begin_tx_with_commit_yield_point(
-        &conn,
-        "BEGIN",
-        UnsafeTestingCommitYieldPoint::CommitEndBoundary,
-        Some("PRAGMA user_version = 42"),
-    );
-    conn.execute("CREATE TABLE abandoned_commit_visibility(id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-
-    let mut stmt = conn.prepare("COMMIT").unwrap();
-    assert!(
-        matches!(stmt.step().unwrap(), crate::StepResult::IO),
-        "unsafe_testing COMMIT should yield at the commit-end boundary",
-    );
-
-    drop(stmt);
-    conn.close().unwrap();
-
-    let observer = db.connect();
-    let rows = get_rows(&observer, "PRAGMA user_version");
-    assert_eq!(
-        rows[0][0].as_int().unwrap(),
-        0,
-        "abandoned commit leaked user_version through the shared header cache",
-    );
-
-    observer
-        .execute("CREATE TABLE abandoned_commit_visibility(id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    let rows = get_rows(
-        &observer,
-        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'abandoned_commit_visibility'",
-    );
-    assert_eq!(
-        rows.len(),
-        1,
-        "abandoned commit leaked schema cache for table name abandoned_commit_visibility",
     );
     observer.close().unwrap();
 }

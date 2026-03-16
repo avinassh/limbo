@@ -1,7 +1,7 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    yield_transition_if_testing, DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey,
-    RowVersion, TxTimestampOrID, UnsafeTestingYield, UnsafeTestingYieldPlan, WriteRowStateMachine,
+    yield_transition_in_simulator, DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey,
+    RowVersion, SimulatorYield, SimulatorYieldPlan, TxTimestampOrID, WriteRowStateMachine,
     MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::schema::Index;
@@ -24,7 +24,9 @@ use std::num::NonZeroU64;
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnsafeTestingCheckpointYieldPoint {
+// Yield points in the checkpoint state machine that the simulator can inject
+// synthetic yields at.
+enum SimulatorCheckpointYieldPoint {
     AcquireLock,
     BeginPagerTxn,
     ChooseTableRowOp,
@@ -42,7 +44,7 @@ enum UnsafeTestingCheckpointYieldPoint {
 }
 
 #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-impl UnsafeTestingCheckpointYieldPoint {
+impl SimulatorCheckpointYieldPoint {
     const ALL: [Self; 14] = [
         Self::AcquireLock,
         Self::BeginPagerTxn,
@@ -60,12 +62,9 @@ impl UnsafeTestingCheckpointYieldPoint {
         Self::TruncateWal,
     ];
 
-    fn plan(
-        seed: Option<u64>,
-        mvstore: &MvStore<impl LogicalClock>,
-    ) -> UnsafeTestingYieldPlan<Self> {
+    fn plan(seed: Option<u64>, mvstore: &MvStore<impl LogicalClock>) -> SimulatorYieldPlan<Self> {
         let key = mvstore.durable_txid_max.load(Ordering::Acquire);
-        super::unsafe_testing_plan(seed, key, &Self::ALL)
+        super::simulator_yield_plan(seed, key, &Self::ALL)
     }
 }
 
@@ -182,7 +181,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
     header_staged_for_commit: bool,
     #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-    unsafe_testing_yield: UnsafeTestingYield<UnsafeTestingCheckpointYieldPoint>,
+    /// Precomputed simulator yield plan for this checkpoint state machine.
+    simulator_yield: SimulatorYield<SimulatorCheckpointYieldPoint>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -249,13 +249,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-        let unsafe_testing_yield = if mvstore.is_unsafe_testing_enabled() {
-            UnsafeTestingYield::enabled(UnsafeTestingCheckpointYieldPoint::plan(
-                mvstore.unsafe_testing_seed(),
+        let simulator_yield = if mvstore.is_unsafe_testing_enabled() {
+            SimulatorYield::enabled(SimulatorCheckpointYieldPoint::plan(
+                mvstore.simulator_seed(),
                 &mvstore,
             ))
         } else {
-            UnsafeTestingYield::disabled()
+            SimulatorYield::disabled()
         };
         Self {
             state: CheckpointState::AcquireLock,
@@ -287,7 +287,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             staged_checkpoint_header: None,
             header_staged_for_commit: false,
             #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-            unsafe_testing_yield,
+            simulator_yield,
         }
     }
 
@@ -796,7 +796,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 } else {
                     self.state = CheckpointState::BeginPagerTxn;
                 }
-                yield_transition_if_testing!(self, UnsafeTestingCheckpointYieldPoint::AcquireLock);
+                yield_transition_in_simulator!(self, SimulatorCheckpointYieldPoint::AcquireLock);
                 Ok(TransitionResult::Continue)
             }
             CheckpointState::BeginPagerTxn => {
@@ -823,10 +823,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     write_set_index: 0,
                     requires_seek: true,
                 };
-                yield_transition_if_testing!(
-                    self,
-                    UnsafeTestingCheckpointYieldPoint::BeginPagerTxn
-                );
+                yield_transition_in_simulator!(self, SimulatorCheckpointYieldPoint::BeginPagerTxn);
                 Ok(TransitionResult::Continue)
             }
 
@@ -1127,9 +1124,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     self.write_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::WriteRowStateMachine { write_set_index };
                 }
-                yield_transition_if_testing!(
+                yield_transition_in_simulator!(
                     self,
-                    UnsafeTestingCheckpointYieldPoint::ChooseTableRowOp
+                    SimulatorCheckpointYieldPoint::ChooseTableRowOp
                 );
                 Ok(TransitionResult::Continue)
             }
@@ -1150,9 +1147,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             write_set_index: write_set_index + 1,
                             requires_seek: true,
                         };
-                        yield_transition_if_testing!(
+                        yield_transition_in_simulator!(
                             self,
-                            UnsafeTestingCheckpointYieldPoint::WriteRow
+                            SimulatorCheckpointYieldPoint::WriteRow
                         );
                         Ok(TransitionResult::Continue)
                     }
@@ -1175,9 +1172,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             write_set_index: write_set_index + 1,
                             requires_seek: true,
                         };
-                        yield_transition_if_testing!(
+                        yield_transition_in_simulator!(
                             self,
-                            UnsafeTestingCheckpointYieldPoint::DeleteRow
+                            SimulatorCheckpointYieldPoint::DeleteRow
                         );
                         Ok(TransitionResult::Continue)
                     }
@@ -1273,9 +1270,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         index_write_set_index,
                     };
                 }
-                yield_transition_if_testing!(
+                yield_transition_in_simulator!(
                     self,
-                    UnsafeTestingCheckpointYieldPoint::ChooseIndexRowOp
+                    SimulatorCheckpointYieldPoint::ChooseIndexRowOp
                 );
                 Ok(TransitionResult::Continue)
             }
@@ -1298,9 +1295,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             index_write_set_index: index_write_set_index + 1,
                             requires_seek: true,
                         };
-                        yield_transition_if_testing!(
+                        yield_transition_in_simulator!(
                             self,
-                            UnsafeTestingCheckpointYieldPoint::WriteIndexRow
+                            SimulatorCheckpointYieldPoint::WriteIndexRow
                         );
                         Ok(TransitionResult::Continue)
                     }
@@ -1325,9 +1322,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             index_write_set_index: index_write_set_index + 1,
                             requires_seek: true,
                         };
-                        yield_transition_if_testing!(
+                        yield_transition_in_simulator!(
                             self,
-                            UnsafeTestingCheckpointYieldPoint::DeleteIndexRow
+                            SimulatorCheckpointYieldPoint::DeleteIndexRow
                         );
                         Ok(TransitionResult::Continue)
                     }
@@ -1389,9 +1386,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             )
                         })?;
                         self.mvstore.global_header.write().replace(header);
-                        yield_transition_if_testing!(
+                        yield_transition_in_simulator!(
                             self,
-                            UnsafeTestingCheckpointYieldPoint::CommitPagerTxn
+                            SimulatorCheckpointYieldPoint::CommitPagerTxn
                         );
                         Ok(TransitionResult::Continue)
                     }
@@ -1405,9 +1402,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    yield_transition_if_testing!(
+                    yield_transition_in_simulator!(
                         self,
-                        UnsafeTestingCheckpointYieldPoint::TruncateLogicalLog
+                        SimulatorCheckpointYieldPoint::TruncateLogicalLog
                     );
                     Ok(TransitionResult::Continue)
                 } else {
@@ -1420,9 +1417,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
                     self.state = CheckpointState::TruncateWal;
-                    yield_transition_if_testing!(
+                    yield_transition_in_simulator!(
                         self,
-                        UnsafeTestingCheckpointYieldPoint::FsyncLogicalLog
+                        SimulatorCheckpointYieldPoint::FsyncLogicalLog
                     );
                     return Ok(TransitionResult::Continue);
                 }
@@ -1431,9 +1428,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.state = CheckpointState::TruncateWal;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    yield_transition_if_testing!(
+                    yield_transition_in_simulator!(
                         self,
-                        UnsafeTestingCheckpointYieldPoint::FsyncLogicalLog
+                        SimulatorCheckpointYieldPoint::FsyncLogicalLog
                     );
                     Ok(TransitionResult::Continue)
                 } else {
@@ -1447,9 +1444,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     IOResult::Done(result) => {
                         self.checkpoint_result = Some(result);
                         self.state = CheckpointState::SyncDbFile;
-                        yield_transition_if_testing!(
+                        yield_transition_in_simulator!(
                             self,
-                            UnsafeTestingCheckpointYieldPoint::CheckpointWal
+                            SimulatorCheckpointYieldPoint::CheckpointWal
                         );
                         Ok(TransitionResult::Continue)
                     }
@@ -1464,10 +1461,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of database file (synchronous=off)");
                     self.state = CheckpointState::TruncateLogicalLog;
-                    yield_transition_if_testing!(
-                        self,
-                        UnsafeTestingCheckpointYieldPoint::SyncDbFile
-                    );
+                    yield_transition_in_simulator!(self, SimulatorCheckpointYieldPoint::SyncDbFile);
                     return Ok(TransitionResult::Continue);
                 }
 
@@ -1479,20 +1473,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Only sync if we actually backfilled any frames
                 if checkpoint_result.wal_checkpoint_backfilled == 0 {
                     self.state = CheckpointState::TruncateLogicalLog;
-                    yield_transition_if_testing!(
-                        self,
-                        UnsafeTestingCheckpointYieldPoint::SyncDbFile
-                    );
+                    yield_transition_in_simulator!(self, SimulatorCheckpointYieldPoint::SyncDbFile);
                     return Ok(TransitionResult::Continue);
                 }
 
                 // Check if we already sent the sync
                 if checkpoint_result.db_sync_sent {
                     self.state = CheckpointState::TruncateLogicalLog;
-                    yield_transition_if_testing!(
-                        self,
-                        UnsafeTestingCheckpointYieldPoint::SyncDbFile
-                    );
+                    yield_transition_in_simulator!(self, SimulatorCheckpointYieldPoint::SyncDbFile);
                     return Ok(TransitionResult::Continue);
                 }
 
@@ -1519,9 +1507,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 match wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())? {
                     IOResult::Done(()) => {
                         self.state = CheckpointState::Finalize;
-                        yield_transition_if_testing!(
+                        yield_transition_in_simulator!(
                             self,
-                            UnsafeTestingCheckpointYieldPoint::TruncateWal
+                            SimulatorCheckpointYieldPoint::TruncateWal
                         );
                         Ok(TransitionResult::Continue)
                     }
