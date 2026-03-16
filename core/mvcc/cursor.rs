@@ -339,9 +339,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         );
         let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-        let simulator_yield = if db.is_unsafe_testing_enabled() {
+        let simulator_yield = if db.simulator_opts.unsafe_testing {
             SimulatorYield::enabled(SimulatorCursorYieldPoint::plan(
-                db.simulator_seed(),
+                db.simulator_opts.simulator_seed,
                 tx_id,
                 table_id,
             ))

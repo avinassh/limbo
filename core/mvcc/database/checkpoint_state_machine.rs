@@ -249,9 +249,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
         #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
-        let simulator_yield = if mvstore.is_unsafe_testing_enabled() {
+        let simulator_yield = if mvstore.simulator_opts.unsafe_testing {
             SimulatorYield::enabled(SimulatorCheckpointYieldPoint::plan(
-                mvstore.simulator_seed(),
+                mvstore.simulator_opts.simulator_seed,
                 &mvstore,
             ))
         } else {

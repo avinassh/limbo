@@ -135,6 +135,23 @@ pub(crate) fn simulator_yield_plan<YieldPoint: Copy>(
     plan
 }
 
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SimulatorOpts {
+    pub(crate) unsafe_testing: bool,
+    pub(crate) simulator_seed: Option<u64>,
+}
+
+#[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+impl SimulatorOpts {
+    pub(crate) fn from_db_opts(opts: &crate::DatabaseOpts) -> Self {
+        Self {
+            unsafe_testing: opts.unsafe_testing,
+            simulator_seed: opts.simulator_seed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SimulatorYield<YieldPoint> {
     remaining_points: SimulatorYieldPlan<YieldPoint>,
@@ -2401,8 +2418,8 @@ pub struct MvStore<Clock: LogicalClock> {
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
-    unsafe_testing: AtomicBool,
-    simulator_seed: RwLock<Option<u64>>,
+    #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+    pub(crate) simulator_opts: SimulatorOpts,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -2453,9 +2470,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Creates a new database.
-    pub fn new(
+    pub(crate) fn new(
         clock: Clock,
         storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
+        #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+        simulator_opts: SimulatorOpts,
     ) -> Self {
         Self {
             rows: SkipMap::new(),
@@ -2477,25 +2496,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
-            unsafe_testing: AtomicBool::new(false),
-            simulator_seed: RwLock::new(None),
+            #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+            simulator_opts,
         }
-    }
-
-    pub fn set_unsafe_testing(&self, enable: bool) {
-        self.unsafe_testing.store(enable, Ordering::Relaxed);
-    }
-
-    pub fn is_unsafe_testing_enabled(&self) -> bool {
-        self.unsafe_testing.load(Ordering::Relaxed)
-    }
-
-    pub fn set_simulator_seed(&self, seed: Option<u64>) {
-        *self.simulator_seed.write() = seed;
-    }
-
-    pub fn simulator_seed(&self) -> Option<u64> {
-        *self.simulator_seed.read()
     }
 
     /// Get the table ID from the root page.
@@ -4366,8 +4369,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 row.clone(),
                 cursor,
                 requires_seek,
-                self.is_unsafe_testing_enabled(),
-                self.simulator_seed(),
+                #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+                self.simulator_opts.unsafe_testing,
+                #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+                self.simulator_opts.simulator_seed,
             ));
 
         Ok(state_machine)
@@ -4382,8 +4387,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             StateMachine::<DeleteRowStateMachine>::new(DeleteRowStateMachine::new(
                 rowid,
                 cursor,
-                self.is_unsafe_testing_enabled(),
-                self.simulator_seed(),
+                #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+                self.simulator_opts.unsafe_testing,
+                #[cfg(any(test, feature = "test_helper", feature = "simulator"))]
+                self.simulator_opts.simulator_seed,
             ));
 
         Ok(state_machine)

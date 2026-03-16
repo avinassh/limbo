@@ -1569,8 +1569,7 @@ impl Connection {
                 db.open_flags,
                 db.durable_storage.clone(),
                 None,
-                db.opts.unsafe_testing,
-                db.opts.simulator_seed,
+                &db.opts,
             )?;
             db.mv_store.store(Some(mv_store.clone()));
             let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;

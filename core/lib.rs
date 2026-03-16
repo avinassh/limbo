@@ -1268,8 +1268,7 @@ impl Database {
                 self.open_flags,
                 self.durable_storage.clone(),
                 None,
-                self.opts.unsafe_testing,
-                self.opts.simulator_seed,
+                &self.opts,
             )?;
             self.mv_store.store(Some(mv_store));
         }
