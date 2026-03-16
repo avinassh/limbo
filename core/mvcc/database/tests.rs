@@ -33,8 +33,13 @@ pub(crate) struct MvccTestDb {
 
 impl MvccTestDb {
     pub fn new() -> Self {
+        Self::new_with_opts(DatabaseOpts::new())
+    }
+
+    pub fn new_with_opts(opts: DatabaseOpts) -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:").unwrap();
+        let db = Database::open_file_with_flags(io, ":memory:", OpenFlags::default(), opts, None)
+            .unwrap();
         let conn = db.connect().unwrap();
         // Enable MVCC via PRAGMA
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
@@ -2586,6 +2591,122 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
         .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     (db, tx_id, table_id, btree_root_page)
+}
+
+#[test]
+fn test_write_row_state_machine_yields_with_unsafe_testing() {
+    let db = MvccTestDb::new_with_opts(DatabaseOpts::new().with_unsafe_testing(true));
+    db.conn
+        .execute("CREATE TABLE write_row_yield_test(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'write_row_yield_test'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+    let row = generate_simple_string_row(table_id, 0, "row0");
+    let cursor = Arc::new(RwLock::new(BTreeCursor::new_table(
+        db.conn.pager.load().clone(),
+        root_page.abs(),
+        1,
+    )));
+
+    let mut state_machine = db
+        .mvcc_store
+        .write_row_to_pager(&row, cursor, true)
+        .unwrap();
+    assert!(
+        matches!(state_machine.step(&()).unwrap(), IOResult::IO(_)),
+        "unsafe_testing write-row state machine should yield on its first reachable transition",
+    );
+}
+
+#[test]
+fn test_delete_row_state_machine_yields_with_unsafe_testing() {
+    let db = MvccTestDb::new_with_opts(DatabaseOpts::new().with_unsafe_testing(true));
+    db.conn
+        .execute("CREATE TABLE delete_row_yield_test(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'delete_row_yield_test'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+    let cursor = Arc::new(RwLock::new(BTreeCursor::new_table(
+        db.conn.pager.load().clone(),
+        root_page.abs(),
+        1,
+    )));
+
+    let mut state_machine = db
+        .mvcc_store
+        .delete_row_from_pager(RowID::new(table_id, RowKey::Int(0)), cursor)
+        .unwrap();
+    assert!(
+        matches!(state_machine.step(&()).unwrap(), IOResult::IO(_)),
+        "unsafe_testing delete-row state machine should yield on its first reachable transition",
+    );
+}
+
+#[test]
+fn test_checkpoint_state_machine_yields_with_unsafe_testing() {
+    let db = MvccTestDb::new_with_opts(DatabaseOpts::new().with_unsafe_testing(true));
+    let mut checkpoint_sm = CheckpointStateMachine::new(
+        db.conn.pager.load().clone(),
+        db.mvcc_store.clone(),
+        db.conn.clone(),
+        true,
+        db.conn.get_sync_mode(),
+    );
+
+    assert!(
+        matches!(checkpoint_sm.step(&()).unwrap(), TransitionResult::Io(_)),
+        "unsafe_testing checkpoint state machine should yield on its first reachable transition",
+    );
+}
+
+#[test]
+fn test_mvcc_cursor_next_yields_with_unsafe_testing() {
+    let db = MvccTestDb::new_with_opts(DatabaseOpts::new().with_unsafe_testing(true));
+    db.conn
+        .execute("CREATE TABLE cursor_yield_test(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'cursor_yield_test'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+
+    let mut cursor = MvccLazyCursor::new(
+        db.mvcc_store.clone(),
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(
+            db.conn.pager.load().clone(),
+            root_page.abs(),
+            1,
+        )),
+    )
+    .unwrap();
+
+    assert!(
+        matches!(cursor.next().unwrap(), IOResult::IO(_)),
+        "unsafe_testing MVCC cursor should yield on its first reachable next() transition",
+    );
+
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
 }
 
 pub(crate) fn commit_tx(
@@ -6763,6 +6884,107 @@ fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<MvStore<
     drop(stmt);
     lock.unlock();
     conn.close().unwrap();
+}
+
+fn begin_tx_with_commit_yield_point(
+    conn: &Arc<Connection>,
+    begin_sql: &str,
+    target: UnsafeTestingCommitYieldPoint,
+    materialize_tx_sql: Option<&str>,
+) -> TxID {
+    for _ in 0..(UnsafeTestingCommitYieldPoint::ALL.len() * 2) {
+        conn.execute(begin_sql).unwrap();
+        if conn.get_mv_tx_id().is_none() {
+            let sql = materialize_tx_sql.expect("write statement required to materialize tx");
+            conn.execute(sql).unwrap();
+        }
+        let tx_id = conn
+            .get_mv_tx_id()
+            .expect("transaction should have an MVCC tx id after write");
+        if UnsafeTestingCommitYieldPoint::pick(tx_id) == target {
+            return tx_id;
+        }
+        conn.execute("ROLLBACK").unwrap();
+    }
+    panic!("failed to find transaction for unsafe-testing yield point {target:?}");
+}
+
+#[test]
+fn test_abandoned_commit_rolls_back_insert_with_unsafe_testing_yield() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(
+        DatabaseOpts::new().with_unsafe_testing(true),
+    );
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        "unsafe_testing MVCC commit should yield before completion",
+    );
+
+    drop(stmt);
+    conn.close().unwrap();
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id FROM t WHERE id = 1");
+    assert!(
+        rows.is_empty(),
+        "row from unsafe-testing abandoned INSERT commit remained visible: {rows:?}",
+    );
+    observer.close().unwrap();
+}
+
+#[test]
+fn test_abandoned_commit_end_yield_does_not_publish_schema_or_header() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(
+        DatabaseOpts::new().with_unsafe_testing(true),
+    );
+    let conn = db.connect();
+
+    begin_tx_with_commit_yield_point(
+        &conn,
+        "BEGIN",
+        UnsafeTestingCommitYieldPoint::CommitEndBoundary,
+        Some("PRAGMA user_version = 42"),
+    );
+    conn.execute("CREATE TABLE abandoned_commit_visibility(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        "unsafe_testing COMMIT should yield at the commit-end boundary",
+    );
+
+    drop(stmt);
+    conn.close().unwrap();
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "PRAGMA user_version");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        0,
+        "abandoned commit leaked user_version through the shared header cache",
+    );
+
+    observer
+        .execute("CREATE TABLE abandoned_commit_visibility(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let rows = get_rows(
+        &observer,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'abandoned_commit_visibility'",
+    );
+    assert_eq!(
+        rows.len(),
+        1,
+        "abandoned commit leaked schema cache for table name abandoned_commit_visibility",
+    );
+    observer.close().unwrap();
 }
 
 /// if a txn made some inserts, then aborted (or abandoned due to some IO issue), then those

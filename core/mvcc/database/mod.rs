@@ -60,6 +60,74 @@ pub mod tests;
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
 const NO_EXCLUSIVE_TX: u64 = 0;
 
+// Synthetic MVCC yields are injected from code that returns either
+// `TransitionResult<T>` state-machine steps or `IOResult<T>` cursor helpers.
+// Keep one macro per result shape so call sites stay explicit and do not have
+// to thread the helper method name through every invocation.
+macro_rules! yield_transition_if_testing {
+    ($state_machine:expr, $point:expr) => {
+        #[cfg(any(test, feature = "test_helper"))]
+        if let Some(result) = $state_machine.unsafe_testing_yield.maybe_transition($point) {
+            return Ok(result);
+        }
+    };
+}
+
+pub(crate) use yield_transition_if_testing;
+
+macro_rules! yield_io_if_testing {
+    ($state_machine:expr, $point:expr) => {
+        #[cfg(any(test, feature = "test_helper"))]
+        if let Some(result) = $state_machine.unsafe_testing_yield.maybe_io($point) {
+            return Ok(result);
+        }
+    };
+}
+
+pub(crate) use yield_io_if_testing;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UnsafeTestingYield<YieldPoint> {
+    point: Option<YieldPoint>,
+    yielded: bool,
+}
+
+impl<YieldPoint: Copy + PartialEq + Debug> UnsafeTestingYield<YieldPoint> {
+    pub(crate) fn disabled() -> Self {
+        Self {
+            point: None,
+            yielded: false,
+        }
+    }
+
+    pub(crate) fn enabled(point: YieldPoint) -> Self {
+        Self {
+            point: Some(point),
+            yielded: false,
+        }
+    }
+
+    pub(crate) fn maybe_transition<T>(&mut self, point: YieldPoint) -> Option<TransitionResult<T>> {
+        if self.yielded || self.point != Some(point) {
+            return None;
+        }
+        self.yielded = true;
+        tracing::debug!(?point, "injecting MVCC yield");
+        Some(TransitionResult::Io(IOCompletions::Single(
+            Completion::new_yield(),
+        )))
+    }
+
+    pub(crate) fn maybe_io<T>(&mut self, point: YieldPoint) -> Option<IOResult<T>> {
+        if self.yielded || self.point != Some(point) {
+            return None;
+        }
+        self.yielded = true;
+        tracing::debug!(?point, "injecting MVCC yield");
+        Some(IOResult::IO(IOCompletions::Single(Completion::new_yield())))
+    }
+}
+
 /// A table ID for MVCC.
 /// MVCC table IDs are always negative. Their corresponding rootpage entry in sqlite_schema
 /// is the same negative value if the table has not been checkpointed yet. Otherwise, the root page
@@ -892,6 +960,75 @@ impl CommitCoordinator {
     }
 }
 
+#[cfg(any(test, feature = "test_helper"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsafeTestingCommitYieldPoint {
+    InitialValidation,
+    WriteValidation,
+    BuildLogRecord,
+    LogicalLogWrite,
+    LogicalLogSync,
+    CommitEndBoundary,
+}
+
+#[cfg(any(test, feature = "test_helper"))]
+impl UnsafeTestingCommitYieldPoint {
+    const ALL: [Self; 6] = [
+        Self::InitialValidation,
+        Self::WriteValidation,
+        Self::BuildLogRecord,
+        Self::LogicalLogWrite,
+        Self::LogicalLogSync,
+        Self::CommitEndBoundary,
+    ];
+
+    fn pick(tx_id: TxID) -> Self {
+        Self::ALL[(tx_id as usize) % Self::ALL.len()]
+    }
+}
+
+#[cfg(any(test, feature = "test_helper"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsafeTestingWriteRowYieldPoint {
+    Initial,
+    Seek,
+    Insert,
+}
+
+#[cfg(any(test, feature = "test_helper"))]
+impl UnsafeTestingWriteRowYieldPoint {
+    const ALL: [Self; 3] = [Self::Initial, Self::Seek, Self::Insert];
+
+    fn pick(rowid: &RowID) -> Self {
+        let key = match &rowid.row_id {
+            RowKey::Int(rowid) => rowid.unsigned_abs(),
+            RowKey::Record(_) => i64::from(rowid.table_id).unsigned_abs(),
+        };
+        Self::ALL[(key as usize) % Self::ALL.len()]
+    }
+}
+
+#[cfg(any(test, feature = "test_helper"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsafeTestingDeleteRowYieldPoint {
+    Initial,
+    Seek,
+    Advance,
+}
+
+#[cfg(any(test, feature = "test_helper"))]
+impl UnsafeTestingDeleteRowYieldPoint {
+    const ALL: [Self; 3] = [Self::Initial, Self::Seek, Self::Advance];
+
+    fn pick(rowid: &RowID) -> Self {
+        let key = match &rowid.row_id {
+            RowKey::Int(rowid) => rowid.unsigned_abs(),
+            RowKey::Record(_) => i64::from(rowid.table_id).unsigned_abs(),
+        };
+        Self::ALL[(key as usize) % Self::ALL.len()]
+    }
+}
+
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState<Clock>,
     is_finalized: bool,
@@ -907,6 +1044,8 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     pending_log_append_bytes: Option<u64>,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
+    #[cfg(any(test, feature = "test_helper"))]
+    unsafe_testing_yield: UnsafeTestingYield<UnsafeTestingCommitYieldPoint>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -926,6 +1065,8 @@ pub struct WriteRowStateMachine {
     record: Option<ImmutableRecord>,
     cursor: Arc<RwLock<BTreeCursor>>,
     requires_seek: bool,
+    #[cfg(any(test, feature = "test_helper"))]
+    unsafe_testing_yield: UnsafeTestingYield<UnsafeTestingWriteRowYieldPoint>,
 }
 
 #[derive(Debug)]
@@ -943,6 +1084,8 @@ pub struct DeleteRowStateMachine {
     is_finalized: bool,
     rowid: RowID,
     cursor: Arc<RwLock<BTreeCursor>>,
+    #[cfg(any(test, feature = "test_helper"))]
+    unsafe_testing_yield: UnsafeTestingYield<UnsafeTestingDeleteRowYieldPoint>,
 }
 
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
@@ -955,6 +1098,12 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         sync_mode: SyncMode,
     ) -> Self {
         let pager = connection.pager.load().clone();
+        #[cfg(any(test, feature = "test_helper"))]
+        let unsafe_testing_yield = if connection.db.opts.unsafe_testing {
+            UnsafeTestingYield::enabled(UnsafeTestingCommitYieldPoint::pick(tx_id))
+        } else {
+            UnsafeTestingYield::disabled()
+        };
         Self {
             state,
             is_finalized: false,
@@ -967,6 +1116,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             header,
             pending_log_append_bytes: None,
             sync_mode,
+            #[cfg(any(test, feature = "test_helper"))]
+            unsafe_testing_yield,
             _phantom: PhantomData,
         }
     }
@@ -1376,7 +1527,18 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
 }
 
 impl WriteRowStateMachine {
-    fn new(row: Row, cursor: Arc<RwLock<BTreeCursor>>, requires_seek: bool) -> Self {
+    fn new(
+        row: Row,
+        cursor: Arc<RwLock<BTreeCursor>>,
+        requires_seek: bool,
+        unsafe_testing: bool,
+    ) -> Self {
+        #[cfg(any(test, feature = "test_helper"))]
+        let unsafe_testing_yield = if unsafe_testing {
+            UnsafeTestingYield::enabled(UnsafeTestingWriteRowYieldPoint::pick(&row.id))
+        } else {
+            UnsafeTestingYield::disabled()
+        };
         Self {
             state: WriteRowState::Initial,
             is_finalized: false,
@@ -1384,6 +1546,8 @@ impl WriteRowStateMachine {
             record: None,
             cursor,
             requires_seek,
+            #[cfg(any(test, feature = "test_helper"))]
+            unsafe_testing_yield,
         }
     }
 }
@@ -1567,6 +1731,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Ok(TransitionResult::Done(()));
                 }
                 self.state = CommitState::Commit { end_ts };
+                yield_transition_if_testing!(
+                    self,
+                    UnsafeTestingCommitYieldPoint::InitialValidation
+                );
                 Ok(TransitionResult::Continue)
             }
             CommitState::Commit { end_ts } => {
@@ -1596,6 +1764,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // TxID references until CommitEnd so an abandoned commit can
                 // still be rolled back by matching on TxID(self.tx_id).
                 self.state = CommitState::WaitForDependencies { end_ts: *end_ts };
+                yield_transition_if_testing!(self, UnsafeTestingCommitYieldPoint::WriteValidation);
                 return Ok(TransitionResult::Continue);
             }
             CommitState::WaitForDependencies { end_ts } => {
@@ -1665,6 +1834,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 } else {
                     self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
                 }
+                yield_transition_if_testing!(self, UnsafeTestingCommitYieldPoint::BuildLogRecord);
                 return Ok(TransitionResult::Continue);
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
@@ -1689,6 +1859,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
+                    yield_transition_if_testing!(
+                        self,
+                        UnsafeTestingCommitYieldPoint::LogicalLogWrite
+                    );
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
@@ -1701,32 +1875,32 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if self.sync_mode != SyncMode::Full {
                     tracing::debug!("Skipping fsync of logical log (synchronous!=full)");
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
+                    yield_transition_if_testing!(
+                        self,
+                        UnsafeTestingCommitYieldPoint::LogicalLogSync
+                    );
                     return Ok(TransitionResult::Continue);
                 }
                 let c = mvcc_store.storage.sync(self.pager.get_sync_type())?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
+                    yield_transition_if_testing!(
+                        self,
+                        UnsafeTestingCommitYieldPoint::LogicalLogSync
+                    );
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
                 }
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
-                let connection = self.connection.clone();
-                let schema_did_change = self.did_commit_schema_change;
-                if schema_did_change {
-                    let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema);
-                }
-                let tx = mvcc_store
-                    .txs
-                    .get(&self.tx_id)
-                    .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
-                let tx_unlocked = tx.value();
-                self.header.write().replace(*tx_unlocked.header.read());
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
+                yield_transition_if_testing!(
+                    self,
+                    UnsafeTestingCommitYieldPoint::CommitEndBoundary
+                );
                 return Ok(TransitionResult::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
@@ -1736,7 +1910,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // 3. Rewrite live row versions from TxID to Timestamp
                 // 4. Notify dependents
                 // 5. Release commit lock (allows next committer)
-                // 6. Update cached global header
+                // 6. Update cached global header and shared schema cache
                 //
                 // (1) must precede (5): the commit lock serializes log writes, and
                 // log_tx() writes at the current offset. If we released the lock before
@@ -1787,10 +1961,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
 
-                mvcc_store
-                    .global_header
-                    .write()
-                    .replace(*tx_unlocked.header.read());
+                self.header.write().replace(*tx_unlocked.header.read());
 
                 mvcc_store
                     .last_committed_tx_ts
@@ -1799,6 +1970,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     mvcc_store
                         .last_committed_schema_change_ts
                         .store(*end_ts, Ordering::Release);
+                    let schema = self.connection.schema.read().clone();
+                    self.connection.db.update_schema_if_newer(schema);
                 }
 
                 // We have now updated all the versions with a reference to the
@@ -1882,6 +2055,7 @@ impl StateTransition for WriteRowStateMachine {
                 } else {
                     self.state = WriteRowState::Insert;
                 }
+                yield_transition_if_testing!(self, UnsafeTestingWriteRowYieldPoint::Initial);
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Seek => {
@@ -1903,6 +2077,7 @@ impl StateTransition for WriteRowStateMachine {
                 }
                 turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
                 self.state = WriteRowState::Insert;
+                yield_transition_if_testing!(self, UnsafeTestingWriteRowYieldPoint::Seek);
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Insert => {
@@ -1924,6 +2099,7 @@ impl StateTransition for WriteRowStateMachine {
                     }
                 }
                 self.state = WriteRowState::Next;
+                yield_transition_if_testing!(self, UnsafeTestingWriteRowYieldPoint::Insert);
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Next => {
@@ -1965,6 +2141,7 @@ impl StateTransition for DeleteRowStateMachine {
         match self.state {
             DeleteRowState::Initial => {
                 self.state = DeleteRowState::Seek;
+                yield_transition_if_testing!(self, UnsafeTestingDeleteRowYieldPoint::Initial);
                 Ok(TransitionResult::Continue)
             }
             DeleteRowState::Seek => {
@@ -1997,6 +2174,7 @@ impl StateTransition for DeleteRowStateMachine {
                                 );
                             }
                         }
+                        yield_transition_if_testing!(self, UnsafeTestingDeleteRowYieldPoint::Seek);
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => {
@@ -2015,6 +2193,10 @@ impl StateTransition for DeleteRowStateMachine {
                             );
                         }
                         self.state = DeleteRowState::Delete;
+                        yield_transition_if_testing!(
+                            self,
+                            UnsafeTestingDeleteRowYieldPoint::Advance
+                        );
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => {
@@ -2058,12 +2240,20 @@ impl StateTransition for DeleteRowStateMachine {
 }
 
 impl DeleteRowStateMachine {
-    fn new(rowid: RowID, cursor: Arc<RwLock<BTreeCursor>>) -> Self {
+    fn new(rowid: RowID, cursor: Arc<RwLock<BTreeCursor>>, unsafe_testing: bool) -> Self {
+        #[cfg(any(test, feature = "test_helper"))]
+        let unsafe_testing_yield = if unsafe_testing {
+            UnsafeTestingYield::enabled(UnsafeTestingDeleteRowYieldPoint::pick(&rowid))
+        } else {
+            UnsafeTestingYield::disabled()
+        };
         Self {
             state: DeleteRowState::Initial,
             is_finalized: false,
             rowid,
             cursor,
+            #[cfg(any(test, feature = "test_helper"))]
+            unsafe_testing_yield,
         }
     }
 }
@@ -2153,6 +2343,7 @@ pub struct MvStore<Clock: LogicalClock> {
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
+    unsafe_testing: AtomicBool,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -2227,7 +2418,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
+            unsafe_testing: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_unsafe_testing(&self, enable: bool) {
+        self.unsafe_testing.store(enable, Ordering::Relaxed);
+    }
+
+    pub fn is_unsafe_testing_enabled(&self) -> bool {
+        self.unsafe_testing.load(Ordering::Relaxed)
     }
 
     /// Get the table ID from the root page.
@@ -4098,6 +4298,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 row.clone(),
                 cursor,
                 requires_seek,
+                self.is_unsafe_testing_enabled(),
             ));
 
         Ok(state_machine)
@@ -4108,8 +4309,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         rowid: RowID,
         cursor: Arc<RwLock<BTreeCursor>>,
     ) -> Result<StateMachine<DeleteRowStateMachine>> {
-        let state_machine: StateMachine<DeleteRowStateMachine> =
-            StateMachine::<DeleteRowStateMachine>::new(DeleteRowStateMachine::new(rowid, cursor));
+        let state_machine: StateMachine<DeleteRowStateMachine> = StateMachine::<
+            DeleteRowStateMachine,
+        >::new(
+            DeleteRowStateMachine::new(rowid, cursor, self.is_unsafe_testing_enabled()),
+        );
 
         Ok(state_machine)
     }

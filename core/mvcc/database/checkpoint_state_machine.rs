@@ -1,8 +1,8 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, TxTimestampOrID,
-    WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
-    SQLITE_SCHEMA_MVCC_TABLE_ID,
+    yield_transition_if_testing, DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey,
+    RowVersion, TxTimestampOrID, UnsafeTestingYield, WriteRowStateMachine,
+    MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::schema::Index;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
@@ -21,6 +21,50 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
+
+#[cfg(any(test, feature = "test_helper"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsafeTestingCheckpointYieldPoint {
+    AcquireLock,
+    BeginPagerTxn,
+    ChooseTableRowOp,
+    WriteRow,
+    DeleteRow,
+    ChooseIndexRowOp,
+    WriteIndexRow,
+    DeleteIndexRow,
+    CommitPagerTxn,
+    CheckpointWal,
+    SyncDbFile,
+    TruncateLogicalLog,
+    FsyncLogicalLog,
+    TruncateWal,
+}
+
+#[cfg(any(test, feature = "test_helper"))]
+impl UnsafeTestingCheckpointYieldPoint {
+    const ALL: [Self; 14] = [
+        Self::AcquireLock,
+        Self::BeginPagerTxn,
+        Self::ChooseTableRowOp,
+        Self::WriteRow,
+        Self::DeleteRow,
+        Self::ChooseIndexRowOp,
+        Self::WriteIndexRow,
+        Self::DeleteIndexRow,
+        Self::CommitPagerTxn,
+        Self::CheckpointWal,
+        Self::SyncDbFile,
+        Self::TruncateLogicalLog,
+        Self::FsyncLogicalLog,
+        Self::TruncateWal,
+    ];
+
+    fn pick(mvstore: &MvStore<impl LogicalClock>) -> Self {
+        let key = mvstore.durable_txid_max.load(Ordering::Acquire);
+        Self::ALL[(key as usize) % Self::ALL.len()]
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
@@ -134,6 +178,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     staged_checkpoint_header: Option<DatabaseHeader>,
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
     header_staged_for_commit: bool,
+    #[cfg(any(test, feature = "test_helper"))]
+    unsafe_testing_yield: UnsafeTestingYield<UnsafeTestingCheckpointYieldPoint>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -199,6 +245,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             !connection.db.path.starts_with(":memory:") && mvcc_meta_table.is_some();
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
+        #[cfg(any(test, feature = "test_helper"))]
+        let unsafe_testing_yield = if mvstore.is_unsafe_testing_enabled() {
+            UnsafeTestingYield::enabled(UnsafeTestingCheckpointYieldPoint::pick(&mvstore))
+        } else {
+            UnsafeTestingYield::disabled()
+        };
         Self {
             state: CheckpointState::AcquireLock,
             lock_states: LockStates {
@@ -228,6 +280,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             durable_mvcc_metadata,
             staged_checkpoint_header: None,
             header_staged_for_commit: false,
+            #[cfg(any(test, feature = "test_helper"))]
+            unsafe_testing_yield,
         }
     }
 
@@ -736,6 +790,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 } else {
                     self.state = CheckpointState::BeginPagerTxn;
                 }
+                yield_transition_if_testing!(self, UnsafeTestingCheckpointYieldPoint::AcquireLock);
                 Ok(TransitionResult::Continue)
             }
             CheckpointState::BeginPagerTxn => {
@@ -762,6 +817,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     write_set_index: 0,
                     requires_seek: true,
                 };
+                yield_transition_if_testing!(
+                    self,
+                    UnsafeTestingCheckpointYieldPoint::BeginPagerTxn
+                );
                 Ok(TransitionResult::Continue)
             }
 
@@ -1062,7 +1121,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     self.write_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::WriteRowStateMachine { write_set_index };
                 }
-
+                yield_transition_if_testing!(
+                    self,
+                    UnsafeTestingCheckpointYieldPoint::ChooseTableRowOp
+                );
                 Ok(TransitionResult::Continue)
             }
 
@@ -1082,6 +1144,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             write_set_index: write_set_index + 1,
                             requires_seek: true,
                         };
+                        yield_transition_if_testing!(
+                            self,
+                            UnsafeTestingCheckpointYieldPoint::WriteRow
+                        );
                         Ok(TransitionResult::Continue)
                     }
                 }
@@ -1103,6 +1169,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             write_set_index: write_set_index + 1,
                             requires_seek: true,
                         };
+                        yield_transition_if_testing!(
+                            self,
+                            UnsafeTestingCheckpointYieldPoint::DeleteRow
+                        );
                         Ok(TransitionResult::Continue)
                     }
                 }
@@ -1197,7 +1267,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         index_write_set_index,
                     };
                 }
-
+                yield_transition_if_testing!(
+                    self,
+                    UnsafeTestingCheckpointYieldPoint::ChooseIndexRowOp
+                );
                 Ok(TransitionResult::Continue)
             }
 
@@ -1219,6 +1292,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             index_write_set_index: index_write_set_index + 1,
                             requires_seek: true,
                         };
+                        yield_transition_if_testing!(
+                            self,
+                            UnsafeTestingCheckpointYieldPoint::WriteIndexRow
+                        );
                         Ok(TransitionResult::Continue)
                     }
                 }
@@ -1242,6 +1319,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             index_write_set_index: index_write_set_index + 1,
                             requires_seek: true,
                         };
+                        yield_transition_if_testing!(
+                            self,
+                            UnsafeTestingCheckpointYieldPoint::DeleteIndexRow
+                        );
                         Ok(TransitionResult::Continue)
                     }
                 }
@@ -1302,6 +1383,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             )
                         })?;
                         self.mvstore.global_header.write().replace(header);
+                        yield_transition_if_testing!(
+                            self,
+                            UnsafeTestingCheckpointYieldPoint::CommitPagerTxn
+                        );
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
@@ -1314,6 +1399,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
+                    yield_transition_if_testing!(
+                        self,
+                        UnsafeTestingCheckpointYieldPoint::TruncateLogicalLog
+                    );
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
@@ -1325,6 +1414,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
                     self.state = CheckpointState::TruncateWal;
+                    yield_transition_if_testing!(
+                        self,
+                        UnsafeTestingCheckpointYieldPoint::FsyncLogicalLog
+                    );
                     return Ok(TransitionResult::Continue);
                 }
                 tracing::debug!("Fsyncing logical log file");
@@ -1332,6 +1425,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.state = CheckpointState::TruncateWal;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
+                    yield_transition_if_testing!(
+                        self,
+                        UnsafeTestingCheckpointYieldPoint::FsyncLogicalLog
+                    );
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
@@ -1344,6 +1441,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     IOResult::Done(result) => {
                         self.checkpoint_result = Some(result);
                         self.state = CheckpointState::SyncDbFile;
+                        yield_transition_if_testing!(
+                            self,
+                            UnsafeTestingCheckpointYieldPoint::CheckpointWal
+                        );
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
@@ -1357,6 +1458,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of database file (synchronous=off)");
                     self.state = CheckpointState::TruncateLogicalLog;
+                    yield_transition_if_testing!(
+                        self,
+                        UnsafeTestingCheckpointYieldPoint::SyncDbFile
+                    );
                     return Ok(TransitionResult::Continue);
                 }
 
@@ -1368,12 +1473,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Only sync if we actually backfilled any frames
                 if checkpoint_result.wal_checkpoint_backfilled == 0 {
                     self.state = CheckpointState::TruncateLogicalLog;
+                    yield_transition_if_testing!(
+                        self,
+                        UnsafeTestingCheckpointYieldPoint::SyncDbFile
+                    );
                     return Ok(TransitionResult::Continue);
                 }
 
                 // Check if we already sent the sync
                 if checkpoint_result.db_sync_sent {
                     self.state = CheckpointState::TruncateLogicalLog;
+                    yield_transition_if_testing!(
+                        self,
+                        UnsafeTestingCheckpointYieldPoint::SyncDbFile
+                    );
                     return Ok(TransitionResult::Continue);
                 }
 
@@ -1400,6 +1513,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 match wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())? {
                     IOResult::Done(()) => {
                         self.state = CheckpointState::Finalize;
+                        yield_transition_if_testing!(
+                            self,
+                            UnsafeTestingCheckpointYieldPoint::TruncateWal
+                        );
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
