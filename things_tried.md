@@ -76,7 +76,55 @@
 4. INSERT OR REPLACE on attached DB with UNIQUE constraint causes PANIC
 5. ROLLBACK TO SAVEPOINT does not undo writes on attached databases
 
+### Round 2 Tests (finding bugs 6-10)
+
+#### Working correctly:
+- FK CASCADE (ON DELETE CASCADE) on attached DB
+- Trigger firing on attached DB (AFTER INSERT trigger)
+- Schema name resolution with same table name in main and attached
+- ALTER TABLE RENAME on attached DB
+- INSERT INTO attached SELECT from main (cross-DB INSERT...SELECT)
+- CREATE TABLE IF NOT EXISTS on existing attached table
+- Multiple ATTACH (3 DBs) and PRAGMA database_list
+- sqlite_schema query on attached DB
+- ALTER TABLE RENAME COLUMN on attached DB
+- PRAGMA aux.table_info - works correctly
+- PRAGMA aux.table_xinfo - works correctly
+- PRAGMA aux.page_count / page_size / freelist_count - correct
+- UPDATE with subquery across databases
+- EXPLAIN QUERY PLAN on cross-DB join
+- WAL compatibility (turso writes, sqlite3 reads back)
+- CHECK constraint enforcement on attached DB
+- STRICT table type enforcement on attached DB
+- ATTACH with expression (concatenation) as filename
+- ATTACH :memory: (special string)
+- ATTACH '' (empty string, in-memory)
+- Re-attach same file after DETACH
+- ROLLBACK on multi-DB transaction (correctly rolls back both)
+- BEGIN IMMEDIATE with attached DB writes
+- PRAGMA aux.journal_mode - correct
+- CREATE TABLE on attached DB, verify persistence
+- Multiple DDL operations on attached DB in one session
+- DROP TABLE on attached DB
+- INSERT OR IGNORE with multiple unique constraints
+- UPSERT (INSERT ... ON CONFLICT DO UPDATE) on attached DB
+- JSON functions on attached DB
+- CREATE INDEX then query on attached DB
+- ATTACH non-existent file (creates new DB)
+- Schema-qualified name in expression context (subquery)
+
+#### Bugs Found (Round 2):
+6. PRAGMA aux.integrity_check checks main instead of attached
+7. PRAGMA aux.index_list / index_info / index_xinfo return empty on attached DBs
+8. PRAGMA aux.table_list shows main DB tables with hardcoded "main" schema name
+9. No limit on number of attached databases (sqlite3 enforces max 10)
+10. ALTER TABLE ADD COLUMN type validation on attached DB reads wrong pager (I/O error)
+
 ### Not Tested (features not yet supported)
 - VACUUM on attached DB ("not supported yet" error)
 - REINDEX ("not supported yet" error)
 - CREATE TABLE AS SELECT ("not supported" error)
+- TEMP tables (not supported yet)
+- WITHOUT ROWID INSERT (not supported yet)
+- Stored generated columns (not supported)
+- compile_options pragma (not a valid pragma name in turso)
