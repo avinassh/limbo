@@ -128,3 +128,81 @@
 - WITHOUT ROWID INSERT (not supported yet)
 - Stored generated columns (not supported)
 - compile_options pragma (not a valid pragma name in turso)
+- Recursive CTEs (not supported yet)
+- UPDATE ... FROM clause (not supported)
+
+### Round 3 Tests (finding bugs 11-15)
+
+#### Working correctly:
+- Triggers on attached DB fire correctly (AFTER INSERT, AFTER UPDATE, AFTER DELETE)
+- BEFORE trigger with RAISE(ABORT) on attached DB
+- Complex trigger (AFTER DELETE updates another table in same attached DB)
+- Cross-database JOIN with different table names
+- Cross-database JOIN with aliases (workaround for Bug 13)
+- Cross-database LEFT OUTER JOIN
+- Cross-database COALESCE + LEFT JOIN
+- Cross-database EXISTS / NOT EXISTS
+- Cross-database correlated subquery
+- Cross-database UNION / INTERSECT / EXCEPT
+- 3-way cross-database JOIN
+- GROUP BY / HAVING on attached DB
+- DISTINCT on attached DB
+- Window functions (ROW_NUMBER, SUM OVER) on attached DB
+- ORDER BY with schema-qualified columns
+- CTE (non-recursive) with attached DB
+- BETWEEN / IN operators on attached DB
+- JSON functions (json_extract, json_type) on attached DB
+- BLOB operations (hex, zeroblob) on attached DB
+- CAST on attached DB
+- RETURNING clause on attached DB operations
+- last_insert_rowid() on attached DB
+- changes() / total_changes() on attached DB
+- UPSERT (ON CONFLICT DO UPDATE) on attached DB
+- INSERT OR IGNORE on attached DB
+- INSERT OR ABORT on attached DB
+- Multi-row INSERT on attached DB
+- Multi-row INSERT with conflict (correct statement rollback)
+- Statement-level rollback on attached DB (NOT NULL violation)
+- DDL inside transaction + ROLLBACK on attached DB
+- ATTACH :memory: read/write
+- ATTACH with KEY parameter
+- ATTACH non-existent file creates new DB
+- ATTACH with file: URI and mode=ro (read-only enforcement)
+- DETACH then reattach same file (data persists)
+- Turso-created DB reattach
+- Multiple writes + COMMIT on attached DB (verified with sqlite3)
+- Autocommit on attached DB (verified with sqlite3)
+- ROLLBACK on multi-DB transaction (rolls back both)
+- Multiple DDL + DML interleaved on attached DB
+- DETACH/re-ATTACH with index reuse
+- PRAGMA user_version read/write on attached DB
+- PRAGMA schema_version on attached DB
+- PRAGMA page_size / journal_mode / page_count / freelist_count / cache_size / auto_vacuum / encoding on attached DB
+- PRAGMA wal_checkpoint on attached DB
+- ALTER TABLE RENAME on attached DB
+- ALTER TABLE RENAME COLUMN on attached DB (updates index SQL too)
+- ALTER TABLE DROP COLUMN on attached DB
+- DROP TABLE with indexes on attached DB (both cleaned up)
+- DROP INDEX on attached DB (schema-qualified)
+- DROP TRIGGER on attached DB (schema-qualified)
+- CREATE TABLE IF NOT EXISTS cross-DB
+- CREATE INDEX IF NOT EXISTS on attached DB
+- CREATE TABLE same name in 3 schemas (main + 2 attached)
+- FK enforcement within attached DB
+- ON DELETE CASCADE on attached DB
+- STRICT table type enforcement on attached DB
+- CHECK constraint enforcement on attached DB
+- EXPLAIN QUERY PLAN on cross-DB query
+- Large text values (overflow pages) on attached DB
+- Access after DETACH (correct error)
+- Error for wrong schema name (correct error)
+- CREATE VIEW on main referencing attached table (correctly rejected)
+- CREATE TABLE / CREATE VIEW / CREATE TRIGGER: schema prefix NOT stored in sqlite_master SQL (correct)
+  - Exception: CREATE INDEX DOES store schema prefix (Bug 1)
+
+#### Bugs Found (Round 3):
+11. Views on attached DBs cannot be queried (unqualified table in view SQL fails)
+12. Unqualified table names don't fall back to attached databases
+13. Schema.table.column references resolve to wrong table in cross-DB JOINs (same table name)
+14. Query optimizer doesn't use indexes on attached databases (full scan instead)
+15. DROP INDEX / DROP TRIGGER with unqualified name fails to search attached databases

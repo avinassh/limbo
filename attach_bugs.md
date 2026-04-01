@@ -252,3 +252,146 @@ Instead of a clean type-mismatch error, tursodb crashes with an I/O error becaus
 
 **Severity:** High - prevents valid DDL operations on attached databases and produces misleading error messages.
 
+## Bug 11: Querying pre-existing views on attached databases fails
+
+**Repro:**
+```sql
+-- Setup with sqlite3:
+-- CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+-- INSERT INTO t VALUES(1,'a'),(2,'b');
+-- CREATE VIEW v AS SELECT * FROM t;
+ATTACH '/tmp/claude/test_view2.db' AS vdb;
+SELECT * FROM vdb.v;
+```
+
+**Expected (sqlite3 behavior):**
+```
+1|a
+2|b
+```
+The view's SQL references `t` unqualified. When the view is in an attached schema, `t` should resolve within that schema.
+
+**Actual (tursodb):**
+```
+Parse error: no such table: t
+```
+
+When tursodb re-parses the view's stored SQL (`SELECT * FROM t`), it resolves `t` only in the main schema. Since `t` doesn't exist in main, the query fails. This means ALL views in attached databases with unqualified table references are completely broken. This is related to Bug 2 (CREATE VIEW fails) but distinct: here the view already exists in the attached file and still can't be queried.
+
+**Severity:** Critical - makes any attached database containing views unusable.
+
+## Bug 12: Unqualified table names do not fall back to attached databases
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.only_in_mem(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO only_in_mem VALUES(1, 'test');
+-- Also affects SELECT:
+SELECT * FROM only_in_mem;
+```
+
+**Expected (sqlite3 behavior):**
+SQLite searches main first, then attached databases in ATTACH order. Since `only_in_mem` exists only in `mem`, it should be found there.
+```
+1|test
+```
+
+**Actual (tursodb):**
+```
+Parse error: no such table: only_in_mem
+```
+
+Tursodb only searches the main schema for unqualified table names. It never falls back to attached databases. In SQLite, the resolution order is: main → temp → attached DBs (in attach order).
+
+**Severity:** High - forces users to always use schema-qualified names with attached databases, breaking SQLite compatibility and making many existing applications unusable.
+
+## Bug 13: Schema-qualified column references (schema.table.column) resolve to wrong table in cross-DB JOINs
+
+**Repro:**
+```sql
+CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO t VALUES(1,'MAIN');
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO mem.t VALUES(1,'MEM');
+SELECT main.t.val, mem.t.val FROM main.t, mem.t WHERE main.t.id = mem.t.id;
+```
+
+**Expected (sqlite3 behavior):**
+```
+MAIN|MEM
+```
+
+**Actual (tursodb):**
+```
+MAIN|MAIN
+```
+
+When using `schema.table.column` syntax (e.g., `mem.t.val`), the column reference incorrectly resolves to the main database's table instead of the attached database's table. `mem.t.val` returns `MAIN` instead of `MEM`. This only happens when both databases have a table with the same name. Using aliases (`FROM main.t a, mem.t b`) works correctly as a workaround.
+
+**Root cause:** The three-part column reference `mem.t.val` is likely being parsed as `table.column` with `mem` interpreted as a table alias, ignoring the schema qualifier. The resolver then matches the first `t` it finds (main's).
+
+**Severity:** High - produces silently wrong query results, which is the worst category of bug.
+
+## Bug 14: Query optimizer does not use indexes on attached databases
+
+**Repro:**
+```sql
+-- Setup: test_base.db has table items with CREATE INDEX idx_items_cat ON items(category)
+ATTACH '/tmp/claude/test_base.db' AS aux;
+EXPLAIN QUERY PLAN SELECT * FROM aux.items WHERE category = 'fruit';
+```
+
+**Expected (sqlite3 behavior):**
+```
+QUERY PLAN
+`--SEARCH aux.items USING INDEX idx_items_cat (category=?)
+```
+
+**Actual (tursodb):**
+```
+QUERY PLAN
+`--SCAN items
+```
+
+The optimizer performs a full table scan instead of using the available index on `category`. The same query on a main-database table with the same index correctly uses `SEARCH ... USING INDEX`. Verified via `EXPLAIN` bytecode: no `OpenRead` for the index page is emitted.
+
+The indexes are visible in `aux.sqlite_master` and `aux.sqlite_stat1` is readable, so the schema is loaded - but the optimizer's index selection logic doesn't consider indexes from attached databases.
+
+**Severity:** High - severe performance degradation for any query on indexed attached tables. Queries that should be O(log n) become O(n).
+
+## Bug 15: Unqualified DROP INDEX / DROP TRIGGER fails to search attached databases
+
+**Repro:**
+```sql
+-- DROP INDEX:
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY, val TEXT);
+CREATE INDEX mem.idx_t_val ON t(val);
+DROP INDEX idx_t_val;  -- ERROR: No such index: idx_t_val
+
+-- DROP TRIGGER:
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY, val TEXT);
+CREATE TABLE mem.log(id INTEGER PRIMARY KEY, msg TEXT);
+CREATE TRIGGER mem.trg AFTER INSERT ON t BEGIN INSERT INTO log(msg) VALUES('x'); END;
+DROP TRIGGER trg;  -- ERROR: no such trigger: trg
+```
+
+**Expected (sqlite3 behavior):**
+Both succeed. SQLite searches main, then temp, then attached databases when resolving unqualified index/trigger names.
+
+**Actual (tursodb):**
+```
+-- DROP INDEX:
+Invalid argument supplied: No such index: idx_t_val
+
+-- DROP TRIGGER:
+Parse error: no such trigger: trg
+```
+
+Tursodb only searches the main schema for unqualified DROP INDEX and DROP TRIGGER. This is the same class of bug as Bug 12 (unqualified table names) but affects DDL operations. Using schema-qualified names (`DROP INDEX mem.idx_t_val`) works as a workaround.
+
+**Severity:** Medium - broken for unqualified names, but schema-qualified workaround exists.
+
