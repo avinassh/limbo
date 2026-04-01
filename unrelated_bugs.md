@@ -131,3 +131,19 @@ SELECT 0.1 + 0.2;
 ```
 
 tursodb displays fewer significant digits and rounds `0.1 + 0.2` to `0.3` instead of showing the IEEE 754 exact result. This is a display formatting difference, not a computation error.
+
+## 7. ALTER TABLE ADD COLUMN rejects expression-based DEFAULT values
+
+**Repro:**
+```sql
+CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t VALUES(1, 'alice');
+ALTER TABLE t ADD COLUMN created TEXT DEFAULT (datetime('now'));
+-- Error: Cannot add a column with non-constant default
+```
+
+**Expected (sqlite3):**
+Successfully adds the column. sqlite3 supports expression defaults in ALTER TABLE ADD COLUMN since version 3.35.0.
+
+**Actual (tursodb):**
+Rejects with "Cannot add a column with non-constant default". This prevents using common patterns like `DEFAULT (datetime('now'))` or `DEFAULT (random())` when adding columns to existing tables. Not ATTACH-specific.

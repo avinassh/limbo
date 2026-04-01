@@ -473,3 +473,116 @@ ATTACH (SELECT ':memory:') AS dynamic_db;
 ```
 
 **Severity:** Low — uncommon usage, easy workaround.
+
+---
+
+## Bug 27: `.import` CLI command cannot import into attached DB tables
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.data(id INTEGER, name TEXT, score INTEGER);
+.import --csv /path/to/data.csv mem.data
+-- Error: "Error creating table: LexerError(...)"
+-- tursodb does not find the existing table and tries to auto-create one with literal name "mem.data"
+```
+
+**Expected (sqlite3):** sqlite3 also doesn't support schema-qualified names in `.import` (treats `mem.data` as a literal table name), but it at least succeeds by creating a table with that literal name. tursodb fails entirely.
+
+**Root cause:** The `.import` command doesn't support schema-qualified table names for lookup. When the table isn't found in main schema, it attempts auto-creation using the qualified name as a literal, which fails during parsing.
+
+**Severity:** Medium — prevents CSV import into attached database tables.
+
+---
+
+## Bug 28: INSERT OR REPLACE panic extends to composite PRIMARY KEY tables on attached DB
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(a INTEGER, b INTEGER, val TEXT, PRIMARY KEY(a, b));
+INSERT INTO mem.t VALUES(1, 1, 'first');
+INSERT INTO mem.t VALUES(1, 2, 'second');
+REPLACE INTO mem.t VALUES(1, 1, 'replaced');
+-- thread panicked at core/translate/insert.rs:3691: index to exist
+```
+
+**Expected:** Should replace the conflicting row without error.
+
+**Root cause:** Same as Bug 4 — `emit_replace_delete_conflicting_row` uses `resolver.schema()` (main) to look up the index backing the composite PK. Since the index exists only in the attached DB's schema, the lookup fails with a panic. Composite PKs create an internal unique index that is just as affected as explicit UNIQUE constraints.
+
+**Severity:** Critical — process crash. Affects ANY `REPLACE`/`INSERT OR REPLACE` on attached DB tables with composite primary keys.
+
+---
+
+## Bug 29: INSERT OR REPLACE panic extends to expression indexes on attached DB
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY, email TEXT);
+CREATE UNIQUE INDEX mem.idx_lower_email ON t(LOWER(email));
+INSERT INTO mem.t VALUES(1, 'Alice@test.com');
+INSERT OR REPLACE INTO mem.t VALUES(2, 'alice@test.com');
+-- thread panicked at core/translate/insert.rs:3691: index to exist
+```
+
+**Expected:** Should replace the row that conflicts on the expression index.
+
+**Root cause:** Same as Bugs 4 and 28 — `resolver.schema()` returns main schema which doesn't have the expression index.
+
+**Severity:** Critical — process crash on any REPLACE with expression-based UNIQUE indexes on attached DBs.
+
+---
+
+## Bug 30: DDL and SELECT on attached DB open unnecessary transactions on main database
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO mem.t VALUES(1, 'test');
+
+-- DDL on attached DB opens WRITE transaction on main:
+EXPLAIN CREATE TABLE mem.t2(id INTEGER PRIMARY KEY);
+-- Shows: Transaction iDb=0 tx_mode=Write AND Transaction iDb=2 tx_mode=Write
+-- sqlite3 only shows: Transaction iDb=2
+
+-- Even SELECT on attached DB opens READ transaction on main:
+EXPLAIN SELECT * FROM mem.t;
+-- Shows: Transaction iDb=0 tx_mode=Read AND Transaction iDb=2 tx_mode=Read
+-- sqlite3 only shows: Transaction iDb=2
+```
+
+**Expected (sqlite3):** Only open transactions on the databases actually involved in the operation.
+
+**Root cause:** Transaction emission always includes main database (iDb=0) regardless of which databases are actually accessed. This extends Bug 16 (which documented the issue for DML) to DDL and read-only operations as well.
+
+**Severity:** Medium — unnecessary lock contention on main DB for all attached DB operations, including read-only queries.
+
+---
+
+## Bug 31: SAVEPOINT ROLLBACK doesn't undo DDL (CREATE TABLE) on attached databases
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+BEGIN;
+SAVEPOINT sp1;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY);
+INSERT INTO mem.t VALUES(1);
+ROLLBACK TO sp1;
+-- Table still exists, data still present!
+SELECT * FROM mem.t;
+-- Returns: 1
+```
+
+**Expected (sqlite3):**
+```
+Error: no such table: mem.t
+```
+In sqlite3, `ROLLBACK TO sp1` undoes both the CREATE TABLE and the INSERT.
+
+**Root cause:** Extends Bug 5 (SAVEPOINT ROLLBACK doesn't undo writes on attached databases) to DDL operations. Neither schema changes (CREATE TABLE, CREATE INDEX) nor DML changes (INSERT, UPDATE, DELETE) are rolled back by SAVEPOINT on attached databases.
+
+**Severity:** Critical — silent data/schema corruption. Code expecting transactional DDL protection gets neither on attached databases.

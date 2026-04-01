@@ -758,3 +758,95 @@
 - Bugs 13+26 → Bug 10 (schema.table.column three-part references broken)
 - Bugs 17+39+40 → Bug 13 (parser can't handle non-identifier schema qualifiers)
 - Bugs 21+25 → Bug 17 (DROP TABLE cleanup misses indexes/sequence)
+
+### Round 9: Deep Edge Case Investigation (2026-04-02)
+
+#### Tests performed (working correctly):
+- json_each table-valued function on attached DB
+- Complex UPSERT with excluded references on attached DB
+- ALTER TABLE ADD COLUMN with FK on attached DB
+- DELETE with RETURNING + trigger on attached DB
+- UPSERT + triggers (AFTER INSERT/UPDATE) on attached DB
+- DELETE from attached DB table with index (correct index maintenance)
+- DELETE from attached DB table with same-name table in main (correct schema resolution)
+- UPDATE UNIQUE constraint violation on attached DB (correctly enforced)
+- Complex subquery in FROM clause from attached DB
+- Correlated subquery with attached DB in complex expression
+- Multiple CTEs from different attached DBs
+- COLLATE NOCASE + UNIQUE on attached DB
+- FK ON UPDATE CASCADE on attached DB
+- Chained triggers (INSERT→UPDATE→DELETE→INSERT) on attached DB
+- Multi-row INSERT statement rollback on attached DB (UNIQUE violation)
+- Cross-DB INSERT ON CONFLICT with triggers
+- AUTOINCREMENT persistence across DETACH/reattach cycles
+- Cross-DB JOIN + ORDER BY + LIMIT
+- Cross-DB UPDATE from two attached DBs
+- ALTER TABLE RENAME + sqlite_master updates on attached DB
+- Error recovery after constraint violation on attached DB
+- DETACH doesn't affect operations on remaining attached DBs
+- Cross-DB DELETE with IN subquery from different attached DB
+- Multiple ALTER TABLE operations in sequence on attached DB
+- DEFAULT expressions (datetime, random, concatenation) on attached DB
+- DDL rollback (BEGIN + CREATE TABLE + ROLLBACK) on attached DB
+- Complex DDL+DML rollback on attached DB
+- COMMIT + ROLLBACK sequence on attached DB
+- 3-way UNION from attached DBs
+- CASE WHEN cross-DB comparison
+- NATURAL JOIN cross-DB with type affinity mismatch
+- RAISE(ABORT) trigger statement rollback on attached DB
+- RAISE(FAIL) trigger on attached DB
+- Complex UPSERT with running stats on attached DB
+- Cross-DB UPDATE RETURNING
+- ATTACH/DETACH 10 cycles (resource management)
+- 3-DB aggregate INSERT SELECT
+- Drop + recreate table with different schema on attached DB
+- Large blob operations (100KB, 200KB zeroblob) on attached DB
+- Cross-DB INSERT SELECT with type coercion
+- VACUUM INTO with attached DBs present (correctly only copies main)
+- PRAGMA table_xinfo on complex attached DB table
+- DDL on read-only attached DB (correctly rejected)
+- Schema version tracking across DDL on attached DB
+- Multi-DB transaction error recovery
+- RETURNING + trigger interaction on attached DB
+- Group functions (GROUP_CONCAT) on attached DB
+- Multiple indexes UPDATE on attached DB (all maintained correctly)
+- ANALYZE on specific attached DB indexes (correct sqlite_stat1)
+- CREATE INDEX IF NOT EXISTS on attached DB
+- HAVING with cross-DB EXISTS subquery
+- Bulk operations (50 rows + index + delete/update) on attached DB
+- sqlite_master queries (GROUP BY, LIKE) on attached DB
+- Large INSERT SELECT between attached DBs with complex WHERE
+- Zero-length strings and empty blobs on attached DB
+- Special characters in column names on attached DB
+- AUTOINCREMENT sequence management on attached DB
+- COALESCE with NULLs cross-DB
+- Cross-DB row move in single transaction
+- Various PRAGMAs (schema_version, user_version, application_id, etc.) on attached DB
+- Per-DB PRAGMA settings (user_version isolation)
+- REPLACE INTO on main when attached has same-name table (correct isolation)
+- INSERT SELECT from main view into attached DB
+- RELEASE SAVEPOINT on attached DB (correct)
+- Round-trip: tursodb create → reattach (complex schema with COLLATE, CHECK, UNIQUE)
+- File-based attached DB with triggers (round-trip to sqlite3 works)
+- External modification (sqlite3 modifies, tursodb reattaches and sees changes)
+
+#### Confirmed existing bugs:
+- Bug 1: CREATE INDEX schema prefix in stored SQL (confirmed in multiple new tests)
+- Bug 2: View resolution on attached DB (confirmed)
+- Bug 4: INSERT OR REPLACE panic (confirmed with composite PK, expression indexes)
+- Bug 5: SAVEPOINT ROLLBACK (confirmed for DDL too)
+- Bug 6: PRAGMAs ignore schema qualifier (confirmed for freelist_count, integrity_check)
+- Bug 11: Optimizer doesn't use indexes on attached DB (confirmed even after ANALYZE)
+- Bug 16: Unnecessary write transaction on main (confirmed for DDL and SELECT too)
+- Bug 23: count(*) on empty attached DB sqlite_master (confirmed)
+
+#### New bugs found (Round 9):
+27. `.import` CLI command cannot import into attached DB tables
+28. INSERT OR REPLACE panic extends to composite PRIMARY KEY on attached DB
+29. INSERT OR REPLACE panic extends to expression indexes on attached DB
+30. DDL and SELECT on attached DB open unnecessary transactions on main
+31. SAVEPOINT ROLLBACK doesn't undo DDL (CREATE TABLE) on attached databases
+
+#### Unrelated bugs found:
+- ALTER TABLE ADD COLUMN with expression-based DEFAULT (e.g., datetime('now')) rejected by tursodb but allowed by sqlite3 (not ATTACH-specific)
+- UPDATE t SET a = b, b = a appears to hang (infinite loop) on both main and attached - actually was piped input issue, not a real bug
