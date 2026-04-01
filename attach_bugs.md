@@ -527,3 +527,163 @@ Tursodb emits a WRITE transaction on the main database even when only the attach
 
 **Severity:** Medium - causes unnecessary lock contention on the main database. Operations on attached databases that should be independent of main will hold a write lock on main, preventing concurrent readers/writers on main. Could cause `SQLITE_BUSY` errors in multi-connection scenarios that wouldn't occur in sqlite3.
 
+## Bug 21: DROP TABLE on attached DB leaks index B-tree pages
+
+**Repro:**
+```sql
+-- Setup with sqlite3:
+-- CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+-- CREATE INDEX idx_a ON t(a);
+-- CREATE INDEX idx_b ON t(b);
+-- INSERT INTO t VALUES(1,'x',10),(2,'y',20),(3,'z',30);
+-- Before: page_count=4, freelist_count=0
+ATTACH '/tmp/test_drop_idx.db' AS aux;
+DROP TABLE aux.t;
+-- After: check with sqlite3
+```
+
+**Expected (sqlite3 behavior):**
+```
+page_count: 4
+freelist_count: 3
+integrity_check: ok
+```
+All 3 data pages (1 table + 2 indexes) are freed and added to the freelist.
+
+**Actual (tursodb):**
+```
+page_count: 4
+freelist_count: 1
+*** in database main ***
+Page 3: never used
+Page 4: never used
+```
+Only 1 page is freed (the table's B-tree root). The 2 index B-tree pages are leaked — they're marked as "never used" by integrity_check but are not on the freelist. Verified via `EXPLAIN DROP TABLE`: tursodb emits only ONE `Destroy` instruction (for the table), while sqlite3 emits TWO `Destroy` instructions (one for the table, one for the index).
+
+**Root cause:** In `core/translate/schema.rs:1607`, `resolver.schema().get_indices(tbl_name)` returns the main DB's schema indices. For an attached DB table, this returns an empty list, so no index B-trees are destroyed.
+
+**Severity:** High - causes silent storage leak. Each DROP TABLE on an attached DB with indexes permanently leaks pages. Over time, the database file grows without bound. These pages can never be reclaimed without VACUUM (which isn't supported for attached DBs).
+
+## Bug 22: PRAGMA cache_size ignores schema qualifier (operates on main DB)
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+PRAGMA main.cache_size = 1000;
+PRAGMA mem.cache_size = 2000;
+PRAGMA main.cache_size;
+PRAGMA mem.cache_size;
+```
+
+**Expected (sqlite3 behavior):**
+```
+1000
+2000
+```
+Each database has its own independent cache_size setting.
+
+**Actual (tursodb):**
+```
+2000
+2000
+```
+Setting `mem.cache_size = 2000` overwrites `main.cache_size` from 1000 to 2000. The schema qualifier is completely ignored — both read and write operations on `PRAGMA mem.cache_size` actually operate on the main database's cache_size.
+
+**Root cause:** The PRAGMA implementation for `cache_size` does not resolve the schema qualifier to the correct database. It always reads/writes the main database's cache configuration.
+
+**Severity:** Medium - prevents per-database cache tuning. Applications that set different cache sizes for main vs attached databases will silently misconfigure the cache.
+
+## Bug 23: PRAGMA freelist_count ignores schema qualifier (returns main's value)
+
+**Repro:**
+```sql
+-- Setup: test.db has 1 free page (created table, inserted data, dropped table)
+-- Main DB has 0 free pages
+ATTACH '/tmp/test_fl.db' AS aux;
+PRAGMA main.freelist_count;
+PRAGMA aux.freelist_count;
+```
+
+**Expected (sqlite3 behavior):**
+```
+0
+1
+```
+Each database reports its own freelist count independently.
+
+**Actual (tursodb):**
+```
+0
+0
+```
+`PRAGMA aux.freelist_count` returns 0 (main's value) instead of 1 (aux's actual freelist count). The schema qualifier is ignored.
+
+**Root cause:** Same pattern as Bug 22 — the PRAGMA implementation reads from the main database's pager regardless of the schema qualifier.
+
+**Severity:** Medium - prevents accurate space accounting for attached databases. Applications monitoring database size/fragmentation will get wrong information for attached DBs.
+
+## Bug 24: EXPLAIN QUERY PLAN does not show schema name prefix for attached DB tables
+
+**Repro:**
+```sql
+ATTACH '/tmp/test.db' AS aux;
+EXPLAIN QUERY PLAN SELECT * FROM aux.t;
+-- In a cross-DB join:
+EXPLAIN QUERY PLAN SELECT * FROM m JOIN aux.t ON m.id = aux.t.id;
+```
+
+**Expected (sqlite3 behavior):**
+```
+QUERY PLAN
+`--SCAN aux.t
+
+QUERY PLAN
+|--SCAN m
+`--SEARCH aux.t USING INTEGER PRIMARY KEY (rowid=?)
+```
+sqlite3 prefixes attached table names with the schema name in EQP output.
+
+**Actual (tursodb):**
+```
+QUERY PLAN
+`--SCAN t
+
+QUERY PLAN
+|--SCAN m
+`--SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+```
+The schema name prefix is missing. Table names are shown without qualification.
+
+**Severity:** Low - diagnostic/informational issue. Makes it impossible to determine which database a table scan refers to when same-name tables exist in multiple schemas. Breaks compatibility with tools that parse EQP output.
+
+## Bug 25: DROP TABLE on attached DB does not clean up sqlite_sequence entry (AUTOINCREMENT)
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);
+INSERT INTO mem.t(val) VALUES('a');
+SELECT * FROM mem.sqlite_sequence;
+-- Shows: t|1
+DROP TABLE mem.t;
+SELECT * FROM mem.sqlite_sequence;
+```
+
+**Expected (sqlite3 behavior):**
+```
+-- After DROP TABLE:
+(empty - no rows)
+```
+sqlite3 removes the corresponding entry from `sqlite_sequence` when dropping an AUTOINCREMENT table.
+
+**Actual (tursodb):**
+```
+-- After DROP TABLE:
+t|1
+```
+The `t|1` entry persists in `sqlite_sequence` after the table is dropped. On the main database, tursodb correctly removes the entry — this bug is specific to attached databases.
+
+**Root cause:** Related to Bug 21's root cause — `core/translate/schema.rs` uses `resolver.schema()` (main DB schema) to look up the sqlite_sequence table. Since the sequence table is in the attached DB's schema, it isn't found, and the cleanup code is skipped.
+
+**Severity:** Medium - stale entries in `sqlite_sequence` accumulate over repeated CREATE/DROP TABLE cycles on attached databases. While this doesn't cause incorrect behavior for new tables (AUTOINCREMENT checks MAX(rowid) as well), it wastes space and could cause confusion when inspecting `sqlite_sequence`.
+

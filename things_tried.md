@@ -314,3 +314,119 @@
 18. ATTACH of 0-byte (empty) file causes hang/infinite loop
 19. BEGIN IMMEDIATE/EXCLUSIVE doesn't emit Transaction for attached databases
 20. DML on attached DB unnecessarily opens WRITE transaction on main database
+
+### Round 5 Tests (finding bugs 21-25)
+
+#### Working correctly:
+- Cross-DB trigger within same attached schema (trigger references same-schema table)
+- INSERT OR ROLLBACK on attached DB (correctly rolls back transaction)
+- Cross-DB IN subquery (SELECT from main WHERE col IN (SELECT from aux))
+- Cross-DB COALESCE with subquery
+- Complex UPSERT (ON CONFLICT DO UPDATE) on attached DB
+- CREATE INDEX IF NOT EXISTS on attached DB
+- UPDATE with correlated subquery from main to attached
+- DROP TABLE IF EXISTS on non-existent attached table
+- DETACH then re-ATTACH (data persists correctly)
+- COMMIT with only attached DB changes
+- CASE WHEN expression on attached DB
+- RETURNING clause on INSERT/UPDATE/DELETE on attached DB
+- FK ON UPDATE CASCADE on attached DB
+- FK ON DELETE CASCADE (multi-level) on attached DB
+- Empty table operations (SELECT/COUNT/INSERT/DELETE) on attached DB
+- COLLATE NOCASE on attached DB (WHERE, DISTINCT, ORDER BY)
+- Expression index on attached DB (SELECT works, index not used - related to Bug 14)
+- LIKE with ESCAPE on attached DB
+- Multiple DDL in single transaction on attached DB
+- GROUP BY HAVING on attached DB
+- NOT NULL constraint violation in transaction on attached DB
+- Cross-DB DELETE with NOT IN subquery
+- Window function PARTITION BY on attached DB
+- INSERT OR REPLACE with PK-only (no UNIQUE index) on attached DB
+- INSERT OR REPLACE with RETURNING on attached DB
+- COUNT(DISTINCT) on attached DB
+- Cross-DB DELETE with IN subquery
+- BEFORE trigger RAISE(IGNORE) on attached DB
+- BEFORE trigger RAISE(FAIL) on attached DB
+- ATTACH WAL-mode database (read/write)
+- UNION ALL across same-name tables in different schemas
+- json_group_array on attached DB
+- ALTER TABLE RENAME on attached DB (updates trigger/index SQL)
+- INSERT with self-referencing subquery on attached DB
+- PRAGMA user_version SET on attached DB (correctly modifies aux file)
+- PRAGMA application_id SET on attached DB (correctly modifies aux file)
+- PRAGMA max_page_count per-DB independence (works correctly)
+- PRAGMA page_count per-DB (works correctly)
+- PRAGMA auto_vacuum per-DB (works correctly)
+- AUTOINCREMENT sequence management on attached DB
+- INSERT SELECT from indexed attached DB to main
+- Complex constraints (NOT NULL + UNIQUE + CHECK) on attached DB
+- ATTACH with KEY parameter (ignored, like sqlite3)
+- DROP + recreate table in transaction on attached DB
+- Large BLOB values (10KB, 50KB) on attached DB with overflow pages
+- STRICT table type enforcement on attached DB
+- Multi-DB ROLLBACK (correctly undoes changes to both DBs)
+- Cross-DB BETWEEN query
+- DEFAULT CURRENT_TIMESTAMP on attached DB
+- Complex nested cross-DB subqueries (multi-level)
+- INSERT OR IGNORE + AUTOINCREMENT on attached DB
+- CTE with attached DB
+- ATTACH during savepoint
+- Cross-DB comparison in WHERE clause
+- Complex correlated DELETE on attached DB
+- ROWID access on attached DB
+- DDL isolation between attached DBs
+- Schema-qualified columns in GROUP BY/HAVING/ORDER BY
+- Table alias conflicting with schema name (correctly resolved)
+- Cross-DB move operation (INSERT SELECT + DELETE in transaction)
+- INSERT OR FAIL on attached DB (transaction continues after error)
+- GROUP_CONCAT on attached DB
+- ALTER TABLE RENAME COLUMN on attached DB (updates index SQL)
+- last_insert_rowid() across databases
+- ATTACH with unicode schema name
+- Multi-session ATTACH with WAL persistence
+- EXPLAIN cross-DB JOIN (correct iDb values in bytecode)
+- INSERT with cross-DB subquery in VALUES clause
+- DDL persistence on attached DB file (verified across sessions)
+- Schema version correctly bumps after DDL on attached DB
+- INSERT OR IGNORE with PK conflict on attached DB
+- changes()/total_changes() across databases
+- Encoding consistency (UTF-8) on attached DB
+- UPDATE PK on attached DB
+- DETACH + re-ATTACH cursor state cleanup
+- Trigger with comment in body on attached DB
+- ATTACH fresh (non-existent) file creates new DB correctly
+- Operations after failed ATTACH (non-existent path, corrupt file)
+- Database ID assignment after DETACH/re-ATTACH cycle
+- ANALYZE on attached DB writes to correct sqlite_stat1
+- Cross-DB view creation correctly rejected (sqlite3 compatibility)
+- Schema-qualified trigger body correctly rejected (sqlite3 compatibility)
+- PRAGMA wal_checkpoint per-DB (different return values due to WAL mode differences)
+- sqlite_master UNION across schemas
+
+#### Not tested (features not supported):
+- REINDEX ("not supported yet")
+- PRAGMA journal_size_limit ("Not a valid pragma name")
+- PRAGMA data_version ("Not a valid pragma name")
+- PRAGMA checksum_verification ("Not a valid pragma name")
+- PRAGMA optimize ("Not a valid pragma name")
+- sqlite_offset() ("no such function")
+- CREATE TABLE AS SELECT ("not supported")
+- Recursive CTEs ("not supported")
+
+#### Code analysis findings (confirmed via source review):
+- core/translate/schema.rs:1607 - DROP TABLE gets indices from main schema (Bug 21)
+- core/translate/schema.rs:1409,1427 - CREATE VIRTUAL TABLE writes to main DB
+- core/translate/schema.rs:1435 - ParseSchema uses cursor_id as DB ID (virtual tables)
+- core/translate/index.rs:1163 - IndexMethodOptimize hardcoded to main DB
+- core/translate/main_loop/open.rs:517 - IndexMethodQuery hardcoded to main DB
+- core/translate/transaction.rs:30-47 - BEGIN IMMEDIATE/CONCURRENT only emits for main (Bug 19)
+- core/vdbe/execute.rs:3321 - n_active_writes not counted for attached DBs
+- core/vdbe/execute.rs:2745 - MVCC FK rollback hardcoded to MAIN_DB_ID
+- Multiple TODO comments: database: None in select.rs:457, expr.rs:5695,5811, planner.rs:2007
+
+#### Bugs Found (Round 5):
+21. DROP TABLE on attached DB leaks index B-tree pages (freelist_count=1 vs 3)
+22. PRAGMA cache_size ignores schema qualifier (operates on main DB)
+23. PRAGMA freelist_count ignores schema qualifier (returns main's value)
+24. EXPLAIN QUERY PLAN doesn't show schema name prefix for attached DB tables
+25. DROP TABLE on attached DB doesn't clean up sqlite_sequence entry (AUTOINCREMENT)
