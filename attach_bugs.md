@@ -687,3 +687,171 @@ The `t|1` entry persists in `sqlite_sequence` after the table is dropped. On the
 
 **Severity:** Medium - stale entries in `sqlite_sequence` accumulate over repeated CREATE/DROP TABLE cycles on attached databases. While this doesn't cause incorrect behavior for new tables (AUTOINCREMENT checks MAX(rowid) as well), it wastes space and could cause confusion when inspecting `sqlite_sequence`.
 
+## Bug 26: Schema-qualified column references in WHERE clause with cartesian product give "ambiguous column name" error
+
+**Repro:**
+```sql
+CREATE TABLE m(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO m VALUES(1, 'MAIN');
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.m(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO mem.m VALUES(1, 'MEM');
+SELECT * FROM main.m, mem.m WHERE main.m.id = mem.m.id;
+```
+
+**Expected (sqlite3 behavior):**
+```
+1|MAIN|1|MEM
+```
+sqlite3 correctly uses the schema qualifier (`main.m.id`, `mem.m.id`) to disambiguate same-named tables in a cartesian product.
+
+**Actual (tursodb):**
+```
+Parse error: ambiguous column name: m.id
+```
+
+The parser/resolver treats `main.m.id` and `mem.m.id` as just `m.id`, ignoring the schema qualifier in the WHERE clause. This only happens with comma-join (cartesian product) syntax. Using explicit `JOIN ... ON` doesn't give the ambiguous error, but instead silently resolves to the wrong table (Bug 13). Using aliases (`FROM main.m a, mem.m b WHERE a.id = b.id`) works correctly.
+
+**Root cause:** The three-part name `schema.table.column` in WHERE clause is not properly parsed or resolved when used with comma-join syntax and same-named tables across databases.
+
+**Severity:** High - prevents valid cross-database queries that work correctly in sqlite3.
+
+## Bug 27: PRAGMA synchronous ignores schema qualifier (reads/writes main DB instead of specified DB)
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+PRAGMA main.synchronous;   -- Returns 2
+PRAGMA mem.synchronous;    -- Returns 2
+PRAGMA mem.synchronous = 0;
+PRAGMA mem.synchronous;    -- Returns 0 (correct)
+PRAGMA main.synchronous;   -- Returns 0 (WRONG - should still be 2)
+```
+
+**Expected (sqlite3 behavior):**
+```
+2
+2
+-- after set mem to 0:
+0
+2
+```
+In sqlite3, `PRAGMA mem.synchronous = 0` only affects the `mem` database. `main.synchronous` remains at 2.
+
+**Actual (tursodb):**
+```
+2
+2
+-- after set mem to 0:
+0
+0
+```
+Setting `mem.synchronous = 0` also changes `main.synchronous` to 0. The schema qualifier is completely ignored for both reading and writing.
+
+**Root cause:** In `core/translate/pragma.rs`, the synchronous PRAGMA uses `connection.set_sync_mode()` and `connection.get_sync_mode()`, which operate on a connection-wide setting rather than per-pager/per-database setting. SQLite stores synchronous mode per-database (in the pager), not per-connection.
+
+**Severity:** High - can cause data loss. If an application sets `PRAGMA mem.synchronous = OFF` for a temporary attached DB (for performance), this silently disables synchronous writes on the main database too, risking data corruption on crash.
+
+## Bug 28: INDEXED BY clause fails on attached DB with "no such index"
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY, val TEXT, num INTEGER);
+INSERT INTO mem.t VALUES(1,'a',10),(2,'b',20),(3,'c',30);
+CREATE INDEX mem.idx_val ON t(val);
+SELECT * FROM mem.t INDEXED BY idx_val WHERE val = 'b';
+```
+
+**Expected (sqlite3 behavior):**
+```
+2|b|20
+```
+sqlite3 correctly finds the index `idx_val` in the attached database and uses it.
+
+**Actual (tursodb):**
+```
+Parse error: no such index: idx_val
+```
+
+The `INDEXED BY` clause cannot find indexes that exist in attached databases. It only searches the main database's schema. The index clearly exists (visible in `mem.sqlite_master`), but the INDEXED BY name resolution doesn't search attached schemas.
+
+**Root cause:** The INDEXED BY resolution logic in the query planner only searches the main database schema for the named index. It does not consider the database context of the table being queried.
+
+**Severity:** Medium - prevents using `INDEXED BY` hints on attached database tables. Applications that rely on `INDEXED BY` for query plan stability will fail when using attached databases. Also affects `NOT INDEXED` (which works correctly, interestingly).
+
+## Bug 29: Unqualified ANALYZE only analyzes main database, not attached databases
+
+**Repro:**
+```sql
+CREATE TABLE main.mt(id INTEGER PRIMARY KEY, val TEXT);
+CREATE INDEX main.idx_mt ON mt(val);
+INSERT INTO main.mt VALUES(1,'a'),(2,'b'),(3,'a');
+
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY, val TEXT);
+CREATE INDEX mem.idx_t ON t(val);
+INSERT INTO mem.t VALUES(1,'x'),(2,'y'),(3,'x');
+
+ANALYZE;
+
+SELECT * FROM main.sqlite_stat1;   -- Returns data
+SELECT * FROM mem.sqlite_stat1;    -- ERROR: no such table
+```
+
+**Expected (sqlite3 behavior):**
+```
+-- main.sqlite_stat1:
+mt|idx_mt|3 2
+-- mem.sqlite_stat1:
+t|idx_t|3 2
+```
+In sqlite3, unqualified `ANALYZE` analyzes ALL databases (main + all attached databases).
+
+**Actual (tursodb):**
+```
+-- main.sqlite_stat1:
+mt||3
+mt|idx_mt|3 2
+-- mem.sqlite_stat1:
+Parse error: no such table: sqlite_stat1
+```
+
+The `sqlite_stat1` table is never created in the attached database. Only main is analyzed.
+
+Note: `ANALYZE mem;` (qualified) works correctly and creates `mem.sqlite_stat1`. The bug is specifically with the unqualified `ANALYZE` command.
+
+**Root cause:** The `translate_analyze` function in `core/translate/analyze.rs` likely only iterates over the main database's tables when no schema qualifier is provided, instead of iterating over all attached databases as well.
+
+**Severity:** Medium - applications that run `ANALYZE;` to update statistics will only update the main database. Attached database queries will have suboptimal query plans due to missing statistics. Combined with Bug 14 (optimizer doesn't use indexes on attached DBs), this means attached database performance is doubly penalized.
+
+## Bug 30: ALTER TABLE ADD COLUMN default type validation reads wrong pager on ALL attached DBs (not just file-based)
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.strict_t(id INTEGER PRIMARY KEY, name TEXT NOT NULL) STRICT;
+INSERT INTO mem.strict_t VALUES(1, 'alice');
+ALTER TABLE mem.strict_t ADD COLUMN num INTEGER NOT NULL DEFAULT 'not_int';
+```
+
+**Expected (sqlite3 behavior):**
+```
+Error: type mismatch on DEFAULT
+```
+Clean type-mismatch error because the DEFAULT value 'not_int' is incompatible with INTEGER on a STRICT table.
+
+**Actual (tursodb):**
+```
+ERROR turso_core::storage::sqlite3_ondisk: short read on page 2: expected 4096 bytes, got 0
+Error: I/O error: short read on page 2: expected 4096 bytes, got 0
+```
+
+Instead of a clean type-mismatch error, tursodb crashes with an I/O error. This was documented as Bug 10 for file-based attached databases, but this repro shows it also affects **in-memory** attached databases. The root cause is the same: `core/translate/alter.rs` line 306 hardcodes `db: crate::MAIN_DB_ID` in the OpenRead instruction for default type validation, so it reads from the main database's pager at the attached table's root page number.
+
+For in-memory attached DBs, the main DB often has fewer pages, so reading the attached table's root page number from main's pager returns 0 bytes, causing the "short read" error. For file-based attached DBs, it might read garbage data from a different page.
+
+**Root cause:** Same as Bug 10 — `core/translate/alter.rs:306` hardcodes `MAIN_DB_ID`. This confirms Bug 10 affects ALL attached databases, not just file-based ones.
+
+**Severity:** High - prevents ALTER TABLE ADD COLUMN with type-checked defaults on STRICT tables in any attached database. The I/O error is particularly confusing for in-memory databases where there are no actual I/O operations.
+

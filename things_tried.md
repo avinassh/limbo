@@ -430,3 +430,139 @@
 23. PRAGMA freelist_count ignores schema qualifier (returns main's value)
 24. EXPLAIN QUERY PLAN doesn't show schema name prefix for attached DB tables
 25. DROP TABLE on attached DB doesn't clean up sqlite_sequence entry (AUTOINCREMENT)
+
+### Round 6: Systematic Bug Hunting (2026-04-01)
+
+#### Tests performed:
+- UPSERT (INSERT ... ON CONFLICT DO UPDATE) on attached DB - works
+- INSERT OR IGNORE on attached DB - works
+- INSERT OR ABORT on attached DB - works
+- INSERT OR ROLLBACK on attached DB - works correctly (rolls back txn)
+- INSERT OR FAIL on attached DB - works correctly (keeps txn open)
+- CHECK constraints on pre-existing attached DB - works
+- FK enforcement (ON DELETE CASCADE, ON UPDATE CASCADE, ON DELETE SET NULL) - works
+- RETURNING clause on attached DB (INSERT/UPDATE/DELETE) - works
+- Trigger with WHEN clause on attached DB - works
+- BEFORE trigger with RAISE on attached DB - works
+- Cross-DB INSERT ... SELECT (both directions) - works
+- Cross-DB INSERT ... SELECT with JOIN - works
+- UPDATE OR REPLACE on attached DB - works
+- REPLACE INTO with PK-only on attached DB - works
+- REPLACE INTO with UNIQUE constraint - PANICS (Bug 4, already known)
+- ALTER TABLE RENAME on attached DB - works
+- ALTER TABLE RENAME COLUMN on attached DB - works
+- ALTER TABLE DROP COLUMN on attached DB (memory and file) - works
+- ALTER TABLE RENAME COLUMN with index - works (index SQL updated)
+- ALTER TABLE RENAME COLUMN with trigger - works (trigger SQL updated)
+- COMPOUND queries (UNION, INTERSECT, EXCEPT) across DBs - works
+- Window functions on attached DB - works
+- CTE with attached DB - works
+- Correlated subquery on attached DB - works
+- EXISTS subquery across DBs - works
+- NOT IN subquery across DBs - works
+- Cartesian product with schema.table.column in WHERE - BUG 26
+- PRAGMA database_list with multiple attached DBs - works
+- last_insert_rowid across attached DBs - works
+- changes() and total_changes() across attached DBs - works
+- ROLLBACK across multiple attached DBs - works
+- SAVEPOINT across multiple attached DBs - BROKEN (Bug 5, confirmed)
+- PRAGMA schema_version on attached DB - works (read correctly per-DB)
+- PRAGMA page_count on attached DB - works (correct per-DB values)
+- PRAGMA page_size on attached DB - works
+- PRAGMA user_version on attached DB - works
+- PRAGMA application_id on attached DB - works
+- PRAGMA encoding on attached DB - works
+- PRAGMA synchronous on attached DB - BUG 27 (ignores schema qualifier)
+- PRAGMA max_page_count on attached DB - works
+- PRAGMA auto_vacuum on attached DB - not enabled (experimental)
+- PRAGMA journal_mode on attached DB - consistent
+- PRAGMA cache_spill on attached DB - consistent (connection-wide in both)
+- PRAGMA query_only on attached DB - consistent (connection-wide in both)
+- PRAGMA temp_store on attached DB - consistent (connection-wide in both)
+- PRAGMA foreign_keys on attached DB - consistent (connection-wide in both)
+- PRAGMA full_column_names on attached DB - consistent (connection-wide in both)
+- PRAGMA ignore_check_constraints on attached DB - consistent (connection-wide)
+- PRAGMA require_where on attached DB - not in sqlite3 (tursodb-specific)
+- COLLATE NOCASE on attached DB - works
+- DEFAULT expressions on attached DB - works
+- File persistence (write, detach, reattach) - works
+- ATTACH same file twice with different aliases - works (both allow)
+- ATTACH inside a transaction - works (both allow)
+- ATTACH with expression as filename (concatenation) - works
+- ATTACH with empty string filename - works (creates temp DB)
+- ATTACH with reserved names (main, temp) - correctly rejected
+- ATTACH with duplicate alias - correctly rejected
+- ATTACH with non-existent directory - correctly errors
+- ATTACH with non-SQLite file - correctly errors
+- ATTACH with different page size - correctly rejected
+- DETACH non-existent database - correctly errors
+- DETACH twice (double detach) - correctly errors
+- DETACH during transaction - succeeds (Bug 3, known), rolls back correctly
+- ATTACH/DETACH/REATTACH ID reuse - works (reuses freed IDs)
+- DROP TABLE on attached DB with triggers - correctly removes triggers
+- DROP VIEW on attached DB - works
+- DROP VIEW IF EXISTS on attached DB - works
+- DROP TRIGGER on attached DB - works
+- DROP TABLE with FK constraints on attached DB - correctly prevented
+- CREATE TABLE IF NOT EXISTS on attached DB - works
+- CREATE INDEX IF NOT EXISTS on attached DB - works
+- CREATE VIEW IF NOT EXISTS on attached DB - BROKEN (not ATTACH-specific, logged as unrelated)
+- CREATE TRIGGER IF NOT EXISTS on attached DB - works
+- STRICT table operations on attached DB - works
+- Multi-row INSERT VALUES on attached DB - works
+- INSERT DEFAULT VALUES on attached DB - works
+- Multi-table schema on attached DB - works
+- Composite PRIMARY KEY on attached DB - works
+- Complex DELETE with subquery on attached DB - works
+- Cross-DB UPDATE with subquery - works
+- Nested triggers on attached DB - works
+- Recursive triggers - not implemented (not ATTACH-specific)
+- Trigger + SAVEPOINT on attached DB - BROKEN (Bug 5)
+- Large blobs (overflow pages) on attached DB - works
+- typeof/quote/hex on attached DB - works
+- LIKE/GLOB/BETWEEN on attached DB - works
+- IN subquery cross-DB - works
+- GROUP BY/HAVING on attached DB - works
+- ORDER BY/LIMIT/OFFSET on attached DB - works
+- CASE expressions on attached DB - works
+- IFNULL/COALESCE on attached DB - works
+- AGGREGATE functions (COUNT/SUM/AVG/MIN/MAX/GROUP_CONCAT/TOTAL) on attached DB - works
+- NATURAL JOIN across DBs - works
+- LEFT JOIN across DBs - works
+- JOIN USING across DBs - works
+- INDEXED BY on attached DB - BUG 28
+- NOT INDEXED on attached DB - works
+- Expression index with JSON on attached DB - creates correctly, not used by optimizer (Bug 14)
+- ANALYZE on attached DB (qualified) - works
+- ANALYZE (unqualified) - BUG 29 (only analyzes main)
+- Pre-existing indexes on attached DB (UNIQUE enforcement) - works
+- Pre-existing triggers on attached DB - works
+- Pre-existing CHECK constraints on attached DB - works
+- Cross-DB trigger reference - correctly rejected (same as sqlite3)
+- DDL + DML in transaction on attached DB - works
+- Multi-DB transaction commit and rollback - works
+- Error handling in transaction on attached DB - works
+- Auto-commit on attached DB - works
+- Schema cookie tracking on attached DB - works
+- sqlite_master operations (read, UNION across DBs) - works
+- sqlite_schema alias on attached DB - works
+- .tables with multiple attached DBs - works
+- .schema with attached DBs - works (with Bug 1 in index SQL)
+- .dump - only dumps main (same as sqlite3)
+- ROWID/_rowid_/oid aliases on attached DB - works
+- NULLS FIRST/NULLS LAST on attached DB - works
+- EXPLAIN on ATTACH statement - works
+- WAL checkpoint on attached DB - works
+- INSERT ... SELECT ... ON CONFLICT across DBs - works
+- INSERT ... RETURNING with cross-DB expression - works
+- STRICT table + ALTER TABLE ADD COLUMN on memory-attached DB - BUG 30
+
+#### Unrelated bugs found:
+- CREATE VIEW IF NOT EXISTS broken on BOTH main and attached DB (if_not_exists field ignored in translate_create_view)
+
+#### Bugs Found (Round 6):
+26. Schema.table.column in WHERE with cartesian product gives "ambiguous column name"
+27. PRAGMA synchronous ignores schema qualifier (writes/reads connection-wide)
+28. INDEXED BY fails on attached DB with "no such index"
+29. Unqualified ANALYZE only analyzes main DB, not attached databases
+30. ALTER TABLE ADD COLUMN default type validation reads wrong pager on ALL attached DBs (extends Bug 10)

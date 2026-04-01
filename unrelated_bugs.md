@@ -46,3 +46,24 @@ t|idx|5 1
 ```
 
 Tursodb produces an extra row `t||5` with empty index name containing just the table row count. While this is valid sqlite_stat1 format, sqlite3's ANALYZE does not produce this row, causing a compatibility difference. The extra row is accepted by sqlite3 when reading back and doesn't cause issues.
+
+## 3. CREATE VIEW IF NOT EXISTS errors when view already exists
+
+**Repro:**
+```sql
+CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+CREATE VIEW v AS SELECT * FROM t;
+CREATE VIEW IF NOT EXISTS v AS SELECT id FROM t;
+```
+
+**Expected (sqlite3 behavior):**
+No error - `IF NOT EXISTS` makes it a no-op when the view already exists.
+
+**Actual (tursodb):**
+```
+Parse error: view v already exists
+```
+
+The `if_not_exists` flag in the `CreateView` AST variant is ignored. In `core/translate/mod.rs` line 239-244, the `CreateView` is destructured with `..` which silently discards the `if_not_exists: bool` field. The `translate_create_view` function in `core/translate/view.rs` never checks this flag before checking if the view already exists (lines 295-306).
+
+This bug affects BOTH main and attached databases - it is not ATTACH-specific.
