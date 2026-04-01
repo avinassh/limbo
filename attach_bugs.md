@@ -1012,6 +1012,133 @@ The `file` column shows a file path, and actual files are created on disk:
 
 The `mode=memory` URI parameter is ignored. Instead of creating an in-memory database, tursodb creates a file-based database using the URI name ("mydb") as the filename in the current working directory.
 
+## Bug 36: CREATE TRIGGER in one schema ON another schema's table is silently accepted and targets the wrong table
+
+**Repro:**
+```sql
+CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+CREATE TABLE log(source TEXT, val TEXT);
+INSERT INTO t1 VALUES(1, 'main_data');
+ATTACH ':memory:' AS aux;
+CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO aux.t1 VALUES(1, 'aux_data');
+
+-- User intends to create trigger on aux.t1, but tursodb silently creates it on main.t1
+CREATE TRIGGER main.sneaky_trigger AFTER INSERT ON aux.t1
+BEGIN
+  INSERT INTO log VALUES('trigger fired', NEW.val);
+END;
+
+INSERT INTO t1 VALUES(2, 'inserted_to_main');
+SELECT * FROM log; -- Shows: trigger fired|inserted_to_main (WRONG!)
+
+INSERT INTO aux.t1 VALUES(2, 'inserted_to_aux');
+SELECT * FROM log; -- Still only 1 row - trigger did NOT fire for aux.t1
+```
+
+**Expected (sqlite3 behavior):**
+```
+Error: trigger sneaky_trigger cannot reference objects in database aux
+```
+sqlite3 rejects the CREATE TRIGGER at creation time because a trigger in one schema cannot reference a table in another schema.
+
+**Actual (tursodb):**
+The trigger is silently created, but it targets `main.t1` instead of `aux.t1`. The `aux.` qualifier on the table name is ignored. This is a correctness bug that can lead to unexpected trigger behavior - the trigger fires on the wrong table.
+
+## Bug 37: Views in attached schemas resolve unqualified table names from main instead of own schema
+
+**Repro:**
+```sql
+CREATE TABLE items(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO items VALUES(1, 'main_item');
+ATTACH ':memory:' AS aux;
+CREATE TABLE aux.items(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO aux.items VALUES(2, 'aux_item');
+
+CREATE VIEW aux.v_items AS SELECT * FROM items;
+SELECT * FROM aux.v_items;
+```
+
+**Expected (sqlite3 behavior):**
+```
+2|aux_item
+```
+The view `aux.v_items` should resolve unqualified `items` in its body against its own schema (`aux`), returning `aux.items` data.
+
+**Actual (tursodb):**
+```
+1|main_item
+```
+The view resolves `items` against the main schema instead of its own schema. This is a cross-schema data leakage bug - a view in `aux` shows data from `main` instead of `aux`.
+
+Note: This is the converse of Bug 2/11 (views on attached DBs can't resolve tables in their own schema). The root cause is the same: view body SQL is always resolved against main instead of the view's own schema.
+
+## Bug 38: ATTACH with subquery expression not supported
+
+**Repro:**
+```sql
+ATTACH (SELECT ':memory:') AS dynamic_db;
+CREATE TABLE dynamic_db.t1(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO dynamic_db.t1 VALUES(1, 'hello');
+SELECT * FROM dynamic_db.t1;
+```
+
+**Expected (sqlite3 behavior):**
+```
+1|hello
+```
+sqlite3 supports arbitrary expressions as the filename argument to ATTACH, including subqueries.
+
+**Actual (tursodb):**
+```
+Parse error: Subquery is not supported in this position
+```
+Tursodb rejects subquery expressions in the ATTACH filename position. Other expression types (string concatenation, function calls, CAST, CASE WHEN) work correctly.
+
+## Bug 39: Schema-qualified names with empty string schema fail to parse
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS "";
+CREATE TABLE "".t1(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO "".t1 VALUES(1, 'hello');
+SELECT * FROM "".t1;
+```
+
+**Expected (sqlite3 behavior):**
+```
+1|hello
+```
+sqlite3 allows empty strings as schema names and supports `"".table` syntax.
+
+**Actual (tursodb):**
+```
+Error: unexpected token '.' at offset 14
+```
+The ATTACH with empty string name succeeds, but using the empty string as a schema qualifier (`"".t1`) fails with a parse error. The parser can't handle an empty quoted identifier followed by `.`.
+
+## Bug 40: Schema-qualified names with numeric schema name fail to parse
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS "123";
+CREATE TABLE "123".t1(id INTEGER PRIMARY KEY);
+INSERT INTO "123".t1 VALUES(1);
+SELECT * FROM "123".t1;
+```
+
+**Expected (sqlite3 behavior):**
+```
+1
+```
+sqlite3 allows numeric strings as schema names and supports `"123".table` syntax.
+
+**Actual (tursodb):**
+```
+Error: unexpected token '123.' at offset 14
+```
+The ATTACH with numeric name succeeds, but using it as a schema qualifier (`"123".t1`) fails with a parse error. Related to Bug 17 (keyword schema names) and Bug 39 (empty string schema names) - the parser can't handle non-standard identifiers as schema qualifiers.
+
 **Root cause:** The URI parameter parsing in `core/connection.rs` likely doesn't handle the `mode=memory` query parameter for the `file:` URI scheme. The filename extraction strips the `file:` prefix and query parameters but doesn't check for `mode=memory` to redirect to in-memory storage.
 
 **Severity:** High - applications that use `file:` URIs with `mode=memory` for temporary in-memory databases will unexpectedly create files on disk, potentially causing:
