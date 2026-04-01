@@ -855,3 +855,168 @@ For in-memory attached DBs, the main DB often has fewer pages, so reading the at
 
 **Severity:** High - prevents ALTER TABLE ADD COLUMN with type-checked defaults on STRICT tables in any attached database. The I/O error is particularly confusing for in-memory databases where there are no actual I/O operations.
 
+## Bug 31: WAL not checkpointed on DETACH for attached databases
+
+**Repro:**
+```sql
+-- Setup: create an attached file-based DB, write data, then DETACH
+ATTACH '/tmp/test_wal.db' AS aux;
+CREATE TABLE aux.t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO aux.t VALUES(1,'a'),(2,'b');
+DETACH aux;
+-- Check files:
+-- ls -la /tmp/test_wal.db*
+```
+
+**Expected (sqlite3 behavior):**
+After DETACH, the WAL file is checkpointed and removed (or truncated to 0 bytes). Only the main .db file remains:
+```
+-rw-r--r--  8192  /tmp/test_wal.db
+```
+
+**Actual (tursodb):**
+```
+-rw-rw-r--  4096  /tmp/test_wal.db
+-rw-rw-r-- 20632  /tmp/test_wal.db-wal
+```
+The WAL file remains with significant content (20KB) after DETACH. The same issue occurs on process exit without explicit DETACH. In contrast, the main database's WAL IS properly checkpointed on exit (0 bytes).
+
+Even explicit `PRAGMA aux.wal_checkpoint(FULL)` before DETACH doesn't remove the WAL file - the checkpoint succeeds (pages are moved to the main file) but the WAL file is not truncated or deleted.
+
+**Root cause:** The `detach_database()` function in `core/connection.rs` does not perform a WAL checkpoint before closing the attached database's pager. sqlite3 performs a passive checkpoint on DETACH.
+
+**Severity:** Medium - While the WAL file can be replayed by the next connection, it wastes disk space and can confuse backup tools. In production, large WAL files from many attach/detach cycles could consume significant storage.
+
+## Bug 32: CREATE INDEX on attached DB produces database files unreadable by sqlite3
+
+**Repro:**
+```sql
+ATTACH '/tmp/test_corrupt.db' AS aux;
+CREATE TABLE aux.t(id INTEGER PRIMARY KEY, val TEXT);
+CREATE INDEX aux.idx ON t(val);
+INSERT INTO aux.t VALUES(1,'a'),(2,'b');
+DETACH aux;
+-- Then open with sqlite3:
+-- sqlite3 /tmp/test_corrupt.db "SELECT * FROM t;"
+```
+
+**Expected (sqlite3 behavior):**
+The database file should be readable by sqlite3 with no issues.
+
+**Actual (tursodb):**
+```
+Error: malformed database schema (idx) - corrupt database (11)
+```
+
+sqlite3 cannot open the database at all. The dump shows:
+```
+CORRUPTION ERROR
+malformed database schema (idx) - corrupt database
+ERROR: near "ORDER": syntax error
+```
+
+**Root cause:** This is a critical escalation of Bug 1. The CREATE INDEX stores `CREATE INDEX aux.idx ON t (val)` in sqlite_master's SQL column (with the schema prefix `aux.`). When sqlite3 reads this back as the main database, it tries to parse `CREATE INDEX aux.idx ON t(val)` which is invalid SQL in the main schema context (there is no `aux` schema). This causes sqlite3 to reject the entire database as corrupt.
+
+Tables, triggers, and views do NOT have this problem - only CREATE INDEX stores the schema prefix. This means any tursodb-created attached database that contains indexes is permanently unreadable by sqlite3 until the schema is manually repaired.
+
+**Severity:** Critical - produces corrupt/incompatible database files that cannot be read by sqlite3 or any standard SQLite tooling. This is a data compatibility issue that could affect all users of attached databases.
+
+## Bug 33: `.schema` command adds extra schema prefix to table name in CREATE INDEX for attached databases
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY, val TEXT);
+CREATE INDEX mem.idx ON t(val);
+-- Check stored SQL:
+SELECT sql FROM mem.sqlite_master WHERE type='index';
+-- Shows: CREATE INDEX mem.idx ON t (val)
+-- Check .schema display:
+.schema
+```
+
+**Expected (sqlite3 behavior):**
+```
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY, val TEXT);
+CREATE INDEX mem.idx ON t(val);
+```
+sqlite3's `.schema` prefixes the index name with the schema (`mem.idx`) for display but does NOT prefix the table name.
+
+**Actual (tursodb):**
+```
+CREATE TABLE mem.t (id INTEGER PRIMARY KEY, val TEXT);
+CREATE INDEX mem.idx ON mem.t (val);
+```
+The `.schema` output shows `ON mem.t` instead of `ON t`. This is a separate bug from Bug 1 (which is about the stored SQL in sqlite_master). The stored SQL has `CREATE INDEX mem.idx ON t (val)` (schema prefix only on index name), but `.schema` adds an additional `mem.` prefix to the table name in the ON clause.
+
+**Root cause:** The `.schema` rendering logic adds the schema prefix to the table name in the CREATE INDEX statement's ON clause, even though the stored SQL doesn't have it.
+
+**Severity:** Low - cosmetic issue in `.schema` output, but could confuse users who copy-paste the output to recreate indexes.
+
+## Bug 34: Reading sqlite_master from empty (freshly attached) database causes I/O error
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS mem;
+-- Don't create any tables, just query sqlite_master
+SELECT count(*) FROM mem.sqlite_master;
+```
+
+**Expected (sqlite3 behavior):**
+```
+0
+```
+sqlite3 correctly handles reading sqlite_master from an empty database and returns 0 rows.
+
+**Actual (tursodb):**
+```
+ERROR turso_core::storage::sqlite3_ondisk: short read on page 1: expected 4096 bytes, got 0
+Error: I/O error: short read on page 1: expected 4096 bytes, got 0
+```
+
+The error occurs because an empty database (whether in-memory or file-based) doesn't have page 1 allocated yet. The `count(*)` query requires reading the sqlite_master B-tree root page (page 1), which doesn't exist.
+
+Note: `SELECT * FROM mem.sqlite_master` and `SELECT name FROM mem.sqlite_master WHERE type='table'` return empty results without error, suggesting they use a different code path that handles the empty database case. Only `count(*)` triggers the I/O error because it uses the `Count` opcode which tries to directly access the page.
+
+**Root cause:** The `Count` opcode in the VDBE executor doesn't handle the case where the table's root page doesn't exist in an empty database.
+
+**Severity:** Medium - prevents basic schema introspection on freshly attached databases. Applications that check `count(*) FROM schema_table` before performing operations will crash.
+
+## Bug 35: `file:` URI `mode=memory` parameter ignored for ATTACH (creates file-based DB instead of in-memory)
+
+**Repro:**
+```sql
+ATTACH 'file:mydb?mode=memory' AS mdb;
+CREATE TABLE mdb.t(id INTEGER PRIMARY KEY);
+INSERT INTO mdb.t VALUES(1);
+PRAGMA database_list;
+```
+
+**Expected (sqlite3 behavior):**
+```
+0|main|
+2|mdb|
+```
+The `file` column is empty because `mode=memory` creates an in-memory database. No files are created on disk.
+
+**Actual (tursodb):**
+```
+0|main|
+2|mdb|/path/to/cwd/mydb
+```
+The `file` column shows a file path, and actual files are created on disk:
+```
+-rw-rw-r--  4096  mydb
+-rw-rw-r-- 12392  mydb-wal
+```
+
+The `mode=memory` URI parameter is ignored. Instead of creating an in-memory database, tursodb creates a file-based database using the URI name ("mydb") as the filename in the current working directory.
+
+**Root cause:** The URI parameter parsing in `core/connection.rs` likely doesn't handle the `mode=memory` query parameter for the `file:` URI scheme. The filename extraction strips the `file:` prefix and query parameters but doesn't check for `mode=memory` to redirect to in-memory storage.
+
+**Severity:** High - applications that use `file:` URIs with `mode=memory` for temporary in-memory databases will unexpectedly create files on disk, potentially causing:
+1. Unexpected disk writes in production environments
+2. Data persistence when temporary data was expected
+3. Disk space usage where none was intended
+4. Files left behind in the working directory
+
