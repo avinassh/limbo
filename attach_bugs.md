@@ -395,3 +395,135 @@ Tursodb only searches the main schema for unqualified DROP INDEX and DROP TRIGGE
 
 **Severity:** Medium - broken for unqualified names, but schema-qualified workaround exists.
 
+## Bug 16: ATTACH NULL fails instead of creating an in-memory database
+
+**Repro:**
+```sql
+ATTACH NULL AS aux;
+CREATE TABLE aux.t(id INTEGER PRIMARY KEY);
+INSERT INTO aux.t VALUES(1);
+SELECT * FROM aux.t;
+```
+
+**Expected (sqlite3 behavior):**
+```
+1
+```
+In SQLite, `ATTACH NULL AS aux` creates a temporary in-memory database (equivalent to `ATTACH '' AS aux`).
+
+**Actual (tursodb):**
+```
+Error: Invalid argument supplied: attach: filename argument must be text
+```
+
+Tursodb rejects the NULL argument because it checks for TEXT type explicitly. SQLite treats NULL, empty string, and ':memory:' all as in-memory database specifications.
+
+**Severity:** Medium - breaks compatibility with applications that use `ATTACH NULL`.
+
+## Bug 17: Schema-qualified names with SQL keywords as schema name fail to parse
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS "select";
+CREATE TABLE "select".t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO "select".t VALUES(1, 'test');
+SELECT * FROM "select".t;
+```
+
+**Expected (sqlite3 behavior):**
+```
+1|test
+```
+SQLite correctly handles double-quoted SQL keywords as schema names in schema-qualified references.
+
+**Actual (tursodb):**
+```
+Error: unexpected token 'select' at offset 14
+Parse error: no such table: t
+Parse error: no such table: t
+```
+
+The ATTACH itself succeeds (the schema name is registered), but subsequent use of the double-quoted keyword as a schema qualifier in `"select".t` fails. The parser doesn't correctly handle quoted SQL keywords in the `schema.table` position. Backtick and bracket quoting also fail for keyword schema names in this position.
+
+**Root cause:** The parser's schema-qualified name resolution treats quoted keywords specially in the schema position. It correctly handles `"select"` as a table name (`CREATE TABLE "select"(...)` works) but fails when used as a schema qualifier before the dot.
+
+**Severity:** Medium - prevents using reserved words as attached database names, which is a valid use case in SQLite.
+
+## Bug 18: ATTACH of a 0-byte (empty) file causes hang (infinite loop)
+
+**Repro:**
+```bash
+# Create an empty file
+> /tmp/empty.db
+# Try to attach it
+echo "ATTACH '/tmp/empty.db' AS aux;" | tursodb --experimental-attach -q
+# Process hangs indefinitely
+```
+
+**Expected (sqlite3 behavior):**
+SQLite correctly handles attaching a 0-byte file. It treats it as an empty database and allows creating tables and inserting data.
+
+**Actual (tursodb):**
+The process enters an infinite loop (or deadlock) and never returns. It must be killed externally.
+
+**Root cause:** When opening a 0-byte file, the database header read gets 0 bytes. The code likely enters a retry loop or fails to handle the case where the database file exists but has no content (unlike a non-existent file, which creates a new database).
+
+**Severity:** Critical - process hang/freeze that requires external kill. Any application that attaches a file that was truncated or incompletely written will hang.
+
+## Bug 19: BEGIN IMMEDIATE/EXCLUSIVE does not acquire locks on attached databases
+
+**Repro:**
+```sql
+CREATE TABLE m(id INTEGER PRIMARY KEY);
+ATTACH ':memory:' AS aux;
+CREATE TABLE aux.a(id INTEGER PRIMARY KEY);
+EXPLAIN BEGIN IMMEDIATE;
+```
+
+**Expected (sqlite3 behavior):**
+```
+Transaction    0     1     0    -- main, write lock
+Transaction    1     1     0    -- temp, write lock
+Transaction    2     1     0    -- aux, write lock
+AutoCommit     0     0     0
+```
+SQLite emits Transaction instructions for ALL databases (main, temp, all attached) during `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE`.
+
+**Actual (tursodb):**
+```
+Transaction    0     2     1    -- main only, write lock
+AutoCommit     0     0     0
+```
+Tursodb only emits a Transaction instruction for the main database. Attached databases are not locked.
+
+**Root cause:** In `core/translate/transaction.rs` lines 30-31 and 42-43, the `translate_begin` function only emits a Transaction instruction with `MAIN_DB_ID`. It does not iterate over attached databases to emit Transaction instructions for them.
+
+**Severity:** High - breaks the semantics of `BEGIN IMMEDIATE` which guarantees that after it succeeds, no other connection can write to any of the connection's databases. Without locking attached databases, concurrent writers could cause conflicts. Also affects `BEGIN EXCLUSIVE`.
+
+## Bug 20: DML on attached database unnecessarily opens WRITE transaction on main database
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS aux;
+CREATE TABLE aux.t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO aux.t VALUES(1,'a'),(2,'b');
+EXPLAIN DELETE FROM aux.t WHERE id = 1;
+```
+
+**Expected (sqlite3 behavior):**
+```
+Transaction    2     1     1    -- ONLY aux needs write transaction
+```
+SQLite only emits a Transaction instruction for the database being modified.
+
+**Actual (tursodb):**
+```
+Transaction    0     2     0    -- main gets WRITE transaction (unnecessary!)
+Transaction    2     2     1    -- aux gets write transaction (correct)
+```
+Tursodb emits a WRITE transaction on the main database even when only the attached database is being modified.
+
+**Root cause:** The write transaction emission logic always includes a write Transaction for `MAIN_DB_ID` regardless of which database is actually being modified.
+
+**Severity:** Medium - causes unnecessary lock contention on the main database. Operations on attached databases that should be independent of main will hold a write lock on main, preventing concurrent readers/writers on main. Could cause `SQLITE_BUSY` errors in multi-connection scenarios that wouldn't occur in sqlite3.
+

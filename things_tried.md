@@ -206,3 +206,111 @@
 13. Schema.table.column references resolve to wrong table in cross-DB JOINs (same table name)
 14. Query optimizer doesn't use indexes on attached databases (full scan instead)
 15. DROP INDEX / DROP TRIGGER with unqualified name fails to search attached databases
+
+### Round 4 Tests (finding bugs 16-20)
+
+#### Working correctly:
+- ANALYZE aux (reads and writes sqlite_stat1 to correct DB)
+- Cross-DB trigger fires correctly (trigger in attached DB)
+- ATTACH WAL-mode database read/write
+- Same table name in 3+ attached DBs with schema qualifiers
+- Cross-DB INSERT INTO ... SELECT
+- COLLATE NOCASE on attached DB (SELECT, DISTINCT, UNIQUE)
+- NATURAL JOIN cross-DB
+- JOIN USING cross-DB
+- Self-join on attached table
+- Complex cross-DB correlated subquery with COALESCE
+- Cross-DB UPDATE with subquery SET
+- Cross-DB DELETE with WHERE EXISTS
+- Cross-DB EXCEPT / INTERSECT
+- ATTACH during active transaction (works like sqlite3)
+- Multiple attached DBs write in single transaction (correctly committed)
+- Data integrity verification: turso-created attached DB passes sqlite3 integrity_check
+- Trigger on attached DB persists correctly, fires in sqlite3
+- FK SET NULL on attached DB
+- FK SET DEFAULT on attached DB
+- ON UPDATE CASCADE on attached DB
+- ON DELETE CASCADE on attached DB
+- BEFORE UPDATE trigger with RAISE(ABORT) on attached DB
+- Multiple triggers on same attached table
+- AUTOINCREMENT on attached DB (sqlite_sequence management)
+- Schema version correctly incremented after DDL on attached DB
+- REPLACE (without UNIQUE beyond PK) on attached DB
+- DETACH DATABASE syntax works
+- INSERT OR IGNORE with multiple UNIQUE constraints on attached DB
+- UPSERT (ON CONFLICT DO UPDATE) on attached DB
+- Group functions (GROUP_CONCAT, json_group_array) on attached DB
+- Complex CHECK constraints (LIKE, BETWEEN) on attached DB
+- STRICT table type enforcement on attached DB
+- DEFAULT expression (datetime('now')) on attached DB
+- large text values (overflow pages) on attached DB
+- Complex CASE WHEN with cross-DB subqueries
+- LIMIT/OFFSET on cross-DB UNION
+- Cross-DB JOIN with aggregation (COUNT, SUM)
+- 3-way cross-DB JOIN with different table names
+- Scalar functions (abs, min, max, printf, substr, instr, replace) on attached DB
+- Date/time functions on attached DB
+- IIF function on attached DB
+- TOTAL() vs SUM() on attached DB
+- ROWID access on attached DB
+- BETWEEN cross-DB comparison
+- last_insert_rowid() across databases (connection-wide)
+- Schema name case insensitivity (MyDb == mydb == MYDB)
+- Multi-column PK on attached DB
+- ALTER TABLE RENAME on attached DB (updates index/trigger SQL)
+- ALTER TABLE RENAME COLUMN on attached DB (updates index SQL)
+- ALTER TABLE ADD COLUMN with DEFAULT on attached DB
+- ALTER TABLE DROP COLUMN on attached DB
+- DDL+DML in transaction on attached DB
+- CREATE TABLE + ALTER TABLE in same transaction on attached DB
+- Schema migration pattern (CREATE+INSERT SELECT+DROP+RENAME) on attached DB
+- DETACH main correctly rejected
+- ATTACH with directory path correctly rejected
+- ATTACH same file twice (correct behavior, changes visible across aliases)
+- DROP TABLE IF EXISTS on non-existent attached table (correctly silent)
+- Ambiguous table/schema name (table named 'aux' in main) resolved correctly
+- Unicode table/column names on attached DB
+- ALTER TABLE RENAME to name existing in another schema (correctly allowed)
+- Cross-DB UPDATE with EXISTS
+- NOT NULL constraint violation error on attached DB
+- PK violation error on attached DB (correct error message)
+- Read-only attached DB (file: URI ?mode=ro) rejects writes
+- ATTACH different page size correctly rejected
+- ATTACH non-SQLite file gives I/O error
+- ATTACH empty string creates in-memory DB
+- Externally modified attached DB correctly read in new session
+- INSERT from CTE into attached DB (non-recursive)
+- ATTACH with quoted non-keyword identifier works ("mydb", [mydb], `mydb`)
+- PRAGMA aux.schema_version correctly reflects DDL changes
+- PRAGMA aux.table_info works correctly
+- PRAGMA aux.table_xinfo works correctly
+- PRAGMA aux.encoding correctly returns UTF-8
+- PRAGMA aux.auto_vacuum returns correct value
+- PRAGMA database_list shows correct IDs
+- SELECT on aux.sqlite_schema alias works
+- COUNT on aux.sqlite_master with GROUP BY works
+- GLOB operator on attached DB works
+- Table/index name collision detection on attached DB works
+- EXPLAIN bytecode shows correct iDb for attached DB operations
+
+#### Not tested (features not supported yet):
+- REINDEX ("not supported yet")
+- VACUUM aux ("not supported with schema name yet")
+- Recursive CTEs ("circular reference" error)
+- UPDATE ... FROM clause ("not supported")
+- RANK() window function ("no such function")
+- PRAGMA foreign_key_check ("Not a valid pragma name")
+- PRAGMA foreign_key_list ("Not a valid pragma name")
+- PRAGMA collation_list ("Not a valid pragma name")
+- PRAGMA data_version ("Not a valid pragma name")
+- PRAGMA locking_mode ("Not a valid pragma name")
+- Generated columns (STORED / VIRTUAL) on attached DB ("not supported")
+- CREATE TABLE AS SELECT ("not supported")
+- MVCC mode (--experimental-mvcc flag doesn't exist)
+
+#### Bugs Found (Round 4):
+16. ATTACH NULL fails (should create in-memory DB like sqlite3)
+17. Schema-qualified names with SQL keywords as schema name fail to parse ("select".t)
+18. ATTACH of 0-byte (empty) file causes hang/infinite loop
+19. BEGIN IMMEDIATE/EXCLUSIVE doesn't emit Transaction for attached databases
+20. DML on attached DB unnecessarily opens WRITE transaction on main database
