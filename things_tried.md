@@ -746,3 +746,15 @@
 38. ATTACH with subquery expression not supported (sqlite3 supports it)
 39. Schema-qualified names with empty string schema fail to parse
 40. Schema-qualified names with numeric schema name fail to parse
+
+### Post-investigation: Merged duplicates/related bugs
+
+40 bugs merged into 26 distinct issues in attach_bugs.md:
+- Bugs 1+32 → Bug 1 (schema prefix in CREATE INDEX + corrupt files)
+- Bugs 2+11+37 → Bug 2 (view name resolution in attached schemas)
+- Bugs 6+7+8+22+23+27 → Bug 6 (PRAGMAs ignore schema qualifier)
+- Bugs 10+30 → Bug 7 (ALTER ADD COLUMN type validation wrong pager)
+- Bugs 12+15 → Bug 9 (unqualified names don't fall back to attached DBs)
+- Bugs 13+26 → Bug 10 (schema.table.column three-part references broken)
+- Bugs 17+39+40 → Bug 13 (parser can't handle non-identifier schema qualifiers)
+- Bugs 21+25 → Bug 17 (DROP TABLE cleanup misses indexes/sequence)
