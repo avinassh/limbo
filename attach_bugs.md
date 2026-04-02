@@ -1,6 +1,6 @@
 # ATTACH Bugs Found
 
-*61 raw bugs found across 13 rounds, merged into 46 distinct issues below. Original bug numbers preserved in parentheses for traceability.*
+*66 raw bugs found across 14 rounds, merged into 51 distinct issues below. Original bug numbers preserved in parentheses for traceability.*
 
 ---
 
@@ -1134,3 +1134,151 @@ Both queries return the correct value (10), but the attached DB version does O(n
 **Root cause:** Same as Bug 11 — the optimizer's index consideration logic doesn't search attached database schemas. Specifically confirmed for the MIN/MAX aggregate optimization path which uses a covering index to find the minimum/maximum value in O(1) by reading the first/last index entry.
 
 **Severity:** High — MIN/MAX on indexed columns is a very common pattern. O(n) vs O(1) can be significant for large tables.
+
+---
+
+## Bug 47: ATTACH silently converts journal_mode of file-based databases from delete to WAL
+
+**Repro:**
+```bash
+# Create a delete-mode database with sqlite3
+sqlite3 /tmp/jmode_test.db "PRAGMA journal_mode=delete; CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT); INSERT INTO t VALUES(1,'a');"
+sqlite3 /tmp/jmode_test.db "PRAGMA journal_mode;"  -- Returns: delete
+```
+```sql
+-- Now just attach and read (no writes!)
+ATTACH '/tmp/jmode_test.db' AS jm;
+SELECT * FROM jm.t;
+DETACH jm;
+```
+```bash
+# Check the journal mode after tursodb touched it
+sqlite3 /tmp/jmode_test.db "PRAGMA journal_mode;"  -- Returns: wal (CHANGED!)
+```
+
+**Expected (sqlite3 behavior):** Attaching a database should preserve its journal mode. A read-only operation should never modify the database file's journal mode.
+
+**Actual:** tursodb unconditionally converts the database to WAL mode when attaching, even for read-only operations. The file is permanently modified — the original journal mode (delete, truncate, persist, etc.) is lost.
+
+**Root cause:** The ATTACH implementation always opens databases in WAL mode regardless of the file's existing journal mode. There's no check to preserve the original mode.
+
+**Severity:** Critical — silently and permanently modifies database files. Breaks interoperability with systems that require delete/truncate/persist journal modes (e.g., some embedded systems, NFS-mounted databases where WAL doesn't work). A read-only ATTACH should never modify the file.
+
+---
+
+## Bug 48: PRAGMA database_list doesn't renumber slots after DETACH (differs from sqlite3)
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS a;
+ATTACH ':memory:' AS b;
+ATTACH ':memory:' AS c;
+PRAGMA database_list;
+-- Returns: 0|main, 2|a, 3|b, 4|c (same as sqlite3)
+DETACH b;
+PRAGMA database_list;
+-- tursodb: 0|main, 2|a, 4|c (gap at position 3)
+-- sqlite3: 0|main, 2|a, 3|c (c renumbered from 4 to 3)
+ATTACH ':memory:' AS d;
+PRAGMA database_list;
+-- tursodb: 0|main, 2|a, 3|d, 4|c (d fills the gap)
+-- sqlite3: 0|main, 2|a, 3|c, 4|d (d appended)
+```
+
+**Expected (sqlite3 behavior):** After DETACH, remaining databases are renumbered to fill gaps. New attachments get the next sequential ID.
+
+**Actual:** tursodb preserves the original slot numbers after DETACH, creating gaps. New attachments fill gaps rather than appending. This means the ordering and IDs of databases in `PRAGMA database_list` can differ from sqlite3 after detach/reattach cycles.
+
+**Root cause:** The attached database list uses a sparse data structure that preserves slot positions. sqlite3 compacts the array when a database is detached.
+
+**Severity:** Medium — affects applications that rely on `PRAGMA database_list` ordering or database IDs being contiguous/sequential. The IDs are used internally for `iDb` in bytecode, so the difference propagates to EXPLAIN output and potentially to any code that uses database IDs.
+
+---
+
+## Bug 49: SAVEPOINT ROLLBACK doesn't undo DDL created via ATTACH after savepoint *(extends Bug 5)*
+
+**Repro:**
+```sql
+SAVEPOINT sp1;
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t1(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO m1.t1 VALUES(1,'should_be_gone');
+ROLLBACK TO sp1;
+-- tursodb: t1 still exists with data!
+SELECT * FROM m1.t1;
+-- Returns: 1|should_be_gone
+SELECT type, name FROM m1.sqlite_master;
+-- Returns: table|t1
+```
+
+**Expected (sqlite3 behavior):**
+```sql
+ROLLBACK TO sp1;
+SELECT * FROM m1.t1;
+-- Error: no such table: m1.t1
+SELECT type, name FROM m1.sqlite_master;
+-- Returns: (empty - DDL was rolled back)
+```
+
+sqlite3 correctly rolls back all DDL and DML on attached databases that occurred after the savepoint. The database `m1` remains attached but its schema is restored to the state at the savepoint (empty).
+
+**Root cause:** The savepoint mechanism doesn't create or restore save states for attached database schemas. When `ROLLBACK TO` is issued, only the main database's state is restored. Attached databases are completely unaffected. This is related to Bug 5 (SAVEPOINT ROLLBACK doesn't undo DML on attached DBs) and Bug 44 (savepoint bytecode lacks attached DB operations), but specifically tests the DDL case where CREATE TABLE and INSERT are both lost.
+
+**Severity:** Critical — complete loss of transactional guarantees for DDL on attached databases within savepoints. Applications using savepoints for error recovery will have inconsistent state across main and attached databases.
+
+---
+
+## Bug 50: SAVEPOINT ROLLBACK doesn't restore pre-existing data on attached databases *(extends Bug 5/43)*
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t1(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO m1.t1 VALUES(1,'committed');
+SAVEPOINT sp1;
+INSERT INTO m1.t1 VALUES(2,'in_savepoint');
+UPDATE m1.t1 SET val = 'modified' WHERE id = 1;
+SELECT * FROM m1.t1 ORDER BY id;
+-- Returns: 1|modified, 2|in_savepoint
+ROLLBACK TO sp1;
+SELECT * FROM m1.t1 ORDER BY id;
+-- tursodb: 1|modified, 2|in_savepoint (UNCHANGED!)
+-- sqlite3: 1|committed (restored to pre-savepoint state)
+RELEASE sp1;
+```
+
+**Expected (sqlite3 behavior):** After `ROLLBACK TO sp1`, the table is restored to its state at the time of `SAVEPOINT sp1`: only row `(1,'committed')` exists. The INSERT and UPDATE are both undone.
+
+**Actual:** The ROLLBACK TO has no effect on the attached database. Both the INSERT (row 2) and UPDATE (row 1's val change) persist. The data is identical before and after the rollback.
+
+**Root cause:** Same as Bug 5/43 — the savepoint implementation doesn't track or restore state for attached databases. This specifically confirms that even pre-existing data modified after the savepoint is not restored.
+
+**Severity:** Critical — applications relying on savepoint-based error recovery or optimistic execution will silently have corrupted state on attached databases. This is particularly dangerous because the pattern of "savepoint → try something → rollback if wrong" is very common.
+
+---
+
+## Bug 51: PRAGMA m1.index_list(table) returns empty on attached databases *(extends Bug 6)*
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t1(id INTEGER PRIMARY KEY, val TEXT, score INTEGER);
+CREATE INDEX m1.idx_val ON t1(val);
+CREATE UNIQUE INDEX m1.idx_score ON t1(score);
+PRAGMA m1.index_list(t1);
+-- tursodb: (empty - no output)
+-- sqlite3: 0|idx_score|1|c|0 \n 1|idx_val|0|c|0
+PRAGMA m1.index_info(idx_val);
+-- tursodb: (empty - no output)
+-- sqlite3: 0|1|val
+```
+
+**Expected (sqlite3):** Returns the index list/info for the specified table in the attached database.
+
+**Actual:** Returns empty results for both `index_list` and `index_info` on attached databases, even using the `PRAGMA schema.name(arg)` form with explicit schema qualifier.
+
+**Note:** Bug 6 documents that several PRAGMAs ignore the schema qualifier. Bug 32 (line 696 in attach_bugs.md) incorrectly states that `PRAGMA m1.index_list(t)` "works correctly" — this test disproves that claim. The statement-style pragma with schema qualifier also fails for index_list and index_info.
+
+**Root cause:** The pragma implementation resolves the table/index lookup using the main schema, not the attached schema indicated by the qualifier. The `schema.get_table()` and `schema.indexes` lookups in `pragma.rs` always reference the main database schema.
+
+**Severity:** High — prevents any form of programmatic index introspection on attached databases. Applications cannot discover what indexes exist on attached tables.
