@@ -1,6 +1,6 @@
 # ATTACH Bugs Found
 
-*51 raw bugs found across 11 rounds, merged into 36 distinct issues below. Original bug numbers preserved in parentheses for traceability.*
+*56 raw bugs found across 12 rounds, merged into 41 distinct issues below. Original bug numbers preserved in parentheses for traceability.*
 
 ---
 
@@ -818,3 +818,177 @@ The error prefix string is a compile-time constant "main" regardless of which da
 **Root cause:** In `core/translate/pragma.rs`, the integrity check error prefix is hardcoded as `"*** in database main ***"` instead of interpolating the actual schema name.
 
 **Severity:** Medium — misidentifies which database has integrity issues when checking attached databases.
+
+---
+
+## Bug 37: Same-name tables from different schemas in JOIN: optimizer degrades PK search to full SCAN
+
+**Repro:**
+```sql
+CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO t VALUES(1,'m1'),(2,'m2');
+ATTACH ':memory:' AS a1;
+CREATE TABLE a1.t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO a1.t VALUES(1,'a1'),(2,'a2');
+ATTACH ':memory:' AS a2;
+CREATE TABLE a2.t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO a2.t VALUES(1,'a2_1'),(2,'a2_2');
+-- 3-way join with same table name 't' in all schemas
+EXPLAIN QUERY PLAN SELECT main.t.val, a1.t.val, a2.t.val FROM main.t JOIN a1.t ON main.t.id = a1.t.id JOIN a2.t ON main.t.id = a2.t.id;
+-- tursodb: SCAN t / SCAN t / SCAN t
+-- sqlite3: SCAN main.t / SEARCH a1.t USING INTEGER PRIMARY KEY / SEARCH a2.t USING INTEGER PRIMARY KEY
+```
+
+Also fails for 2-way joins:
+```sql
+EXPLAIN QUERY PLAN SELECT main.t.val, a1.t.val FROM main.t JOIN a1.t ON main.t.id = a1.t.id;
+-- tursodb: SCAN t / SCAN t
+-- sqlite3: SCAN main.t / SEARCH a1.t USING INTEGER PRIMARY KEY (rowid=?)
+```
+
+**Workaround:** Use table aliases:
+```sql
+SELECT x.val, y.val FROM main.t x JOIN a1.t y ON x.id = y.id;
+-- tursodb: SCAN t AS x / SEARCH y USING INTEGER PRIMARY KEY (rowid=?)  ← CORRECT
+```
+
+**Root cause:** When tables share the same name across schemas, the optimizer's name resolution fails and it can't match the join condition to a rowid lookup. The optimizer effectively gives up and does full scans on all tables. With aliases or different table names, the optimizer correctly uses PK search.
+
+**Severity:** High — O(n²) or O(n³) performance instead of O(n) for joins involving same-name tables across schemas. Very common pattern since users often have identically-named tables across databases.
+
+---
+
+## Bug 38: Unqualified statement-style PRAGMAs don't search attached databases
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS aux;
+CREATE TABLE aux.t(id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+-- Qualified: works correctly
+PRAGMA aux.table_info(t);
+-- 0|id|INTEGER|0||1
+-- 1|name|TEXT|0||0
+-- 2|age|INTEGER|0||0
+
+-- Unqualified: returns empty (should search all schemas)
+PRAGMA table_info(t);
+-- (empty)
+```
+
+**Expected (sqlite3):**
+```sql
+PRAGMA table_info(t);
+-- Searches main → temp → attached DBs and returns:
+-- 0|id|INTEGER|0||1
+-- 1|name|TEXT|0||0
+-- 2|age|INTEGER|0||0
+```
+
+**Root cause:** The statement-style PRAGMA code path only searches the main schema when no schema qualifier is provided. sqlite3 follows the standard name resolution order (main → temp → attached DBs).
+
+**Severity:** Medium — forces always-qualified PRAGMA calls. Breaks patterns like `PRAGMA table_info(t)` when table only exists in attached DB.
+
+---
+
+## Bug 39: CREATE TYPE can't target attached databases (always stored in main)
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS aux;
+-- Schema-qualified CREATE TYPE fails to parse:
+CREATE TYPE aux.mytype BASE integer ENCODE value * 2 DECODE value / 2;
+-- Error: expected BASE keyword
+
+-- Unqualified CREATE TYPE always creates in main:
+CREATE TYPE mytype BASE integer ENCODE value * 2 DECODE value / 2;
+SELECT * FROM main.sqlite_master WHERE name LIKE '%turso%';
+-- Shows: __turso_internal_types in main
+SELECT * FROM aux.sqlite_master WHERE name LIKE '%turso%';
+-- (empty) -- no types table created in aux
+```
+
+**Root cause:** In `core/translate/schema.rs`, all type-related operations hardcode `db: 0` (MAIN_DB_ID). The `CreateBtree`, `OpenWrite`, `AddType`, `SetCookie`, and `DropType` instructions all target the main database. The parser also doesn't support schema-qualified `CREATE TYPE schema.name`.
+
+**Code references:**
+- `core/translate/schema.rs:2060` — `CreateBtree { db: 0, ... }`
+- `core/translate/schema.rs:2075` — `OpenWrite { db: 0 }`
+- `core/translate/schema.rs:2132` — `AddType { db: 0, sql }`
+- `core/translate/schema.rs:2135` — `SetCookie { db: 0, ... }`
+
+**Severity:** Medium — custom types cannot be stored in attached database files. Type definitions are lost when the attached DB is detached and reattached in a new session (unless the main DB also defines the same types).
+
+---
+
+## Bug 40: Same-name tables in cross-DB SELECT * with schema-qualified ON clause fails with "ambiguous column name"
+
+**Repro:**
+```sql
+CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO t VALUES(1, 'main');
+ATTACH ':memory:' AS aux;
+CREATE TABLE aux.t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO aux.t VALUES(2, 'aux');
+-- Fails even with schema-qualified table references
+SELECT * FROM main.t JOIN aux.t ON main.t.id != aux.t.id;
+-- Error: ambiguous column name: t.id
+```
+
+**Expected (sqlite3):**
+```sql
+SELECT * FROM main.t JOIN aux.t ON main.t.id != aux.t.id;
+-- Returns: 1|main|2|aux
+```
+
+**Workaround:** Use table aliases:
+```sql
+SELECT * FROM main.t x JOIN aux.t y ON x.id != y.id;
+-- Returns: 1|main|2|aux  ← works correctly
+```
+
+This is a specific manifestation of Bug 10 (three-part references broken) for SELECT * expansion. When `*` is expanded, the schema qualifier is lost, causing the column names to appear ambiguous.
+
+**Root cause:** The `SELECT *` expansion doesn't preserve the database context in the generated column expressions. The code at `core/translate/select.rs:457` sets `database: None` for expanded columns.
+
+**Severity:** High — prevents basic cross-DB queries involving same-name tables without workarounds.
+
+---
+
+## Bug 41: Non-PK indexes completely ignored by optimizer on attached databases (additional confirmation with covering, expression, partial, multi-column, MIN/MAX, BETWEEN, ORDER BY)
+
+**Extended repro from Bug 11, confirming ALL non-PK index types are affected:**
+
+```sql
+ATTACH ':memory:' AS aux;
+CREATE TABLE aux.t(id INTEGER PRIMARY KEY, val TEXT, score INTEGER, category TEXT);
+CREATE INDEX aux.idx_score ON t(score);
+CREATE INDEX aux.idx_cat ON t(category);
+CREATE INDEX aux.idx_multi ON t(score, val);
+CREATE INDEX aux.idx_expr ON t(lower(val));
+CREATE INDEX aux.idx_partial ON t(val) WHERE score > 0;
+INSERT INTO aux.t VALUES(1,'a',10,'A'),(2,'b',20,'B'),(3,'c',30,'A');
+
+-- ALL of these do SCAN on attached (should use index):
+EXPLAIN QUERY PLAN SELECT * FROM aux.t WHERE score = 20;         -- SCAN (should SEARCH idx_score)
+EXPLAIN QUERY PLAN SELECT * FROM aux.t WHERE score BETWEEN 10 AND 30;  -- SCAN
+EXPLAIN QUERY PLAN SELECT * FROM aux.t ORDER BY score;           -- SCAN + SORTER
+EXPLAIN QUERY PLAN SELECT MIN(score) FROM aux.t;                 -- SCAN (should use covering index)
+EXPLAIN QUERY PLAN SELECT val FROM aux.t WHERE score > 15;       -- SCAN (covering index not used)
+EXPLAIN QUERY PLAN SELECT * FROM aux.t WHERE lower(val) = 'a';   -- SCAN (expression index not used)
+EXPLAIN QUERY PLAN SELECT * FROM aux.t WHERE score = 20 AND category = 'B';  -- SCAN (multi-column not used)
+```
+
+All equivalent queries on main correctly use their respective indexes.
+
+**Bytecode evidence (equality search):**
+```
+-- Main: OpenRead using index root page, SeekGE + IdxGT
+-- Attached: OpenRead using table root page, Rewind + Next + Ne comparison
+```
+
+The optimizer DOES correctly handle:
+- PK (rowid) lookups on attached DBs in JOINs (when table names differ)
+- Single-table PK WHERE clause on attached DBs
+
+**Root cause:** The index selection logic in the optimizer doesn't search the attached database schema for available indexes. It only considers indexes from the main schema.
+
+**Severity:** Critical — every non-PK indexed query on attached databases does O(n) full table scan instead of O(log n) index lookup. This makes attached databases unsuitable for any performance-sensitive workload.

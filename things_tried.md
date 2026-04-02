@@ -1068,3 +1068,112 @@
 39. PRAGMA integrity_check error prefix always says "main" for attached DBs
 40. `.schema TABLE_NAME` doesn't search attached databases
 41. `.schema` shows wrong view column info (`x` instead of `id,val`) for attached DB views
+
+### Round 12: Deep Edge Case & Code Analysis Investigation (2026-04-02)
+
+#### Tests performed (working correctly):
+- Cross-DB trigger writing to main from attached (correctly rejected - same as sqlite3)
+- ALTER TABLE RENAME to name existing in main (allowed in both)
+- Cross-DB trigger cascade chain on attached DB (works correctly)
+- DETACH after query completion (works)
+- DEFAULT function + trigger on attached DB (works)
+- Complex CHECK constraint (LIKE + BETWEEN) on attached DB (works)
+- INSERT ... SELECT from sqlite_master across DBs (works)
+- ATTACH inside BEGIN IMMEDIATE transaction (works)
+- Window functions on cross-DB JOIN (matches sqlite3)
+- Schema.table.column references with different table names (works)
+- Correlated subquery in SELECT list from attached DB (works)
+- CROSS JOIN between main and attached (works)
+- Cross-DB BETWEEN with values from attached DB (works)
+- json_extract in cross-DB query (matches sqlite3)
+- Complex cross-DB HAVING between two attached DBs (works)
+- INSERT SELECT between two attached DBs (works)
+- DELETE with subquery from another attached DB (works)
+- UPDATE one attached DB from another attached DB (works)
+- Multi-row INSERT failure on attached DB (correct statement rollback)
+- CREATE VIEW in main referencing attached table (correctly rejected)
+- UPDATE RETURNING on attached DB (matches sqlite3)
+- DELETE RETURNING on attached DB (matches sqlite3)
+- RETURNING from UPSERT on attached DB (matches sqlite3)
+- Error messages for constraint violations (correct on attached)
+- AUTOINCREMENT after DELETE on attached DB (correct - continues from max)
+- CREATE TABLE IF NOT EXISTS cross-schema (correct isolation)
+- Pre-existing trigger on attached DB fires correctly
+- BEFORE trigger RAISE(ABORT) on pre-existing attached DB (works)
+- Trigger chain (cascading) on attached DB (works, matches sqlite3)
+- ALTER TABLE on one attached while another is open (correct isolation)
+- COLLATION in cross-DB JOIN (matches sqlite3)
+- Concurrent schema reads across attached DBs (works)
+- Multi-DB transaction ROLLBACK with file-based DB (correct)
+- DROP TABLE + recreate with different schema on attached DB (works)
+- tursodb-created attached DB passes sqlite3 integrity_check
+- ATTACH/DETACH cycles with resource management (correct)
+- Cross-DB data move (copy + delete) in transaction (works)
+- UPSERT with schema-qualified references on attached (works)
+- Partial index on attached DB (correct results, optimizer doesn't use it - Bug 11)
+- Complex CASE in UPDATE on attached DB (works)
+- ALTER TABLE DROP COLUMN on attached DB (works)
+- INSERT OR ABORT in transaction on attached (correct)
+- UPDATE OR IGNORE on attached DB (correct)
+- UPDATE OR REPLACE on attached DB (correct - no panic!)
+- PK ON CONFLICT REPLACE on attached DB (works)
+- AUTOINCREMENT after DELETE all on attached DB (correct)
+- ANALYZE on specific table in attached DB (works, has extra row - unrelated)
+- Integer overflow on attached DB (correct)
+- Deeply nested cross-DB correlated subqueries (correct)
+- Complex trigger with WHEN and ROUND computations on attached (correct)
+- SELECT * with aliases on same-name tables (works)
+- PRAGMA user_version persistence on attached DB (correct)
+- UPSERT + AUTOINCREMENT + DEFAULT on attached DB (correct)
+- Complex EXISTS cross-DB subquery (correct)
+- RETURNING with AUTOINCREMENT on attached DB (correct)
+- Cross-DB INSERT SELECT with GROUP BY HAVING (correct)
+- sqlite_master self-join on attached DB (correct)
+- DROP INDEX with same name in main and attached (correct)
+- EXPLAIN for ALTER TABLE on attached DB (correct iDb)
+- EXPLAIN for DROP TABLE on attached DB (correct iDb)
+- EXPLAIN for ANALYZE on attached DB (correct iDb)
+- EXPLAIN for cross-DB INSERT SELECT (correct iDb, but Bug 16)
+- EXPLAIN for DELETE on attached DB (correct iDb, but Bug 16)
+- EXPLAIN for UPSERT on attached DB (correct iDb, but Bug 16)
+- EXPLAIN for 3-table cross-DB query (correct cursor/iDb assignments)
+- Schema version tracking after many DDL ops on attached DB (matches sqlite3)
+- WAL checkpoint on attached DB (TRUNCATE works correctly)
+- Custom types on attached DB tables (data works, type in main - see Bug 39)
+- Encrypted attached DB (read/write works, cross-DB query works)
+- Multiple ALTER TABLE operations in sequence on attached DB (works)
+- ATTACH with file: URI mode=rwc (works)
+- ATTACH + large BLOBs (100K, 500K zeroblob) on attached DB (works)
+- query_only pragma per-DB behavior (connection-wide, same as sqlite3)
+- Expression index on attached DB (correct results, optimizer miss - Bug 11)
+
+#### Code analysis findings (from Explore agent):
+- core/translate/schema.rs:2060,2075,2103,2132,2135 - CREATE TYPE hardcoded to db: 0 (Bug 39)
+- core/translate/schema.rs:2188,2240,2245 - DROP TYPE hardcoded to db: 0 (Bug 39)
+- core/translate/schema.rs:1409,1427 - CREATE VIRTUAL TABLE hardcoded to MAIN_DB_ID
+- core/translate/main_loop/open.rs:517 - IndexMethodQuery hardcoded to MAIN_DB_ID
+- core/translate/index.rs:1163 - IndexMethodOptimize hardcoded to MAIN_DB_ID
+- core/translate/select.rs:457 - SELECT * expansion sets database: None (Bug 40)
+- core/translate/expr.rs:5695,5811 - Column binding sets database: None
+- core/translate/delete.rs:359 - DELETE RowId sets database: None
+- core/translate/planner.rs:2007 - database: None TODO
+
+#### Bugs confirmed from previous rounds:
+- Bug 1: Schema prefix in CREATE INDEX stored SQL (confirmed with UNIQUE INDEX too)
+- Bug 5: SAVEPOINT ROLLBACK doesn't work across multiple attached DBs
+- Bug 6: PRAGMA table_list shows only main tables, even qualified
+- Bug 9: Unqualified DROP INDEX fails for attached-only indexes
+- Bug 10: Same-name tables with schema-qualified ON clause fails
+- Bug 11: Non-PK indexes not used on attached DBs (equality, range, ORDER BY, covering, expression, partial, multi-column, MIN/MAX, BETWEEN, LIKE)
+- Bug 16: Unnecessary WRITE transaction on main for all attached operations
+- Bug 23: count(*) on empty attached DB sqlite_master I/O error
+
+#### Unrelated bugs found:
+- COLLATE clause in ORDER BY of compound SELECT (UNION ALL) not supported (not ATTACH-specific)
+
+#### Bugs Found (Round 12):
+42. Same-name tables in cross-DB JOIN: optimizer degrades PK search to full SCAN on ALL tables
+43. Unqualified statement-style PRAGMAs (table_info, etc.) don't search attached databases
+44. CREATE TYPE/DROP TYPE always targets main database (schema-qualified form fails to parse)
+45. SELECT * on same-name tables in cross-DB JOIN with schema-qualified ON clause fails with "ambiguous column name"
+46. Non-PK indexes completely ignored on attached DBs (extended confirmation: covering, expression, partial, multi-column, MIN/MAX, BETWEEN, ORDER BY)

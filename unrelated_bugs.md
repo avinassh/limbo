@@ -168,3 +168,29 @@ Parse error: no such table: v
 ```
 
 Views exist as schema objects but the INSERT/UPDATE/DELETE code paths don't recognize them. Instead of giving the proper "cannot modify view" error, tursodb doesn't find the view at all when used as a DML target. Affects both main and attached databases.
+
+## 9. COLLATE clause in ORDER BY of compound SELECT not supported
+
+**Repro:**
+```sql
+CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t1 VALUES(1,'Bob'),(2,'alice');
+CREATE TABLE t2(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t2 VALUES(3,'Charlie'),(4,'david');
+SELECT * FROM t1 UNION ALL SELECT * FROM t2 ORDER BY name COLLATE NOCASE;
+```
+
+**Expected (sqlite3):**
+```
+2|alice
+1|Bob
+3|Charlie
+4|david
+```
+
+**Actual (tursodb):**
+```
+Parse error: ORDER BY expression in compound SELECT must be a column number or name
+```
+
+sqlite3 allows COLLATE in ORDER BY of compound SELECT. tursodb rejects it. Not ATTACH-specific.
