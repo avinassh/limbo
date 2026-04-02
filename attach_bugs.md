@@ -1,6 +1,6 @@
 # ATTACH Bugs Found
 
-*45 bugs found, merged into 31 distinct issues below. Original bug numbers preserved in parentheses for traceability. Bugs 32-36 found in Round 10.*
+*46 raw bugs found across 10 rounds, merged into 31 distinct issues below. Original bug numbers preserved in parentheses for traceability.*
 
 ---
 
@@ -86,9 +86,11 @@ DETACH aux;
 
 ---
 
-## Bug 4: PANIC — INSERT OR REPLACE on attached DB with UNIQUE constraint crashes
+## Bug 4: PANIC — INSERT OR REPLACE on attached DB crashes for any UNIQUE/PK index type *(was Bugs 4, 28, 29)*
 
-**Repro:**
+Any `INSERT OR REPLACE` / `REPLACE INTO` on an attached DB table that has a UNIQUE constraint, composite PK, or expression-based UNIQUE index causes a panic:
+
+**Manifestation A — Explicit UNIQUE constraint:**
 ```sql
 ATTACH ':memory:' AS aux;
 CREATE TABLE aux.t(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
@@ -97,15 +99,36 @@ INSERT OR REPLACE INTO aux.t VALUES(2, 'alice');
 -- thread panicked at core/translate/insert.rs:3691: index to exist
 ```
 
-**Root cause:** Index lookup in `emit_replace_delete_conflicting_row` uses the wrong database ID (main instead of attached).
+**Manifestation B — Composite PRIMARY KEY:**
+```sql
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(a INTEGER, b INTEGER, val TEXT, PRIMARY KEY(a, b));
+INSERT INTO mem.t VALUES(1, 1, 'first');
+REPLACE INTO mem.t VALUES(1, 1, 'replaced');
+-- thread panicked at core/translate/insert.rs:3691: index to exist
+```
 
-**Severity:** Critical — process crash.
+**Manifestation C — Expression-based UNIQUE index:**
+```sql
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY, email TEXT);
+CREATE UNIQUE INDEX mem.idx_lower_email ON t(LOWER(email));
+INSERT INTO mem.t VALUES(1, 'Alice@test.com');
+INSERT OR REPLACE INTO mem.t VALUES(2, 'alice@test.com');
+-- thread panicked at core/translate/insert.rs:3691: index to exist
+```
+
+**Root cause:** `emit_replace_delete_conflicting_row` uses `resolver.schema()` (main) to look up the index backing the constraint. Since the index only exists in the attached DB's schema, the lookup fails with a panic.
+
+**Severity:** Critical — process crash. Affects ANY `REPLACE`/`INSERT OR REPLACE` on attached DB tables with UNIQUE constraints, composite primary keys, or expression indexes.
 
 ---
 
-## Bug 5: ROLLBACK TO SAVEPOINT does not undo writes on attached databases
+## Bug 5: SAVEPOINT ROLLBACK doesn't undo changes (DML or DDL) on attached databases *(was Bugs 5, 31)*
 
-**Repro:**
+Neither data changes nor schema changes are rolled back by SAVEPOINT on attached databases:
+
+**DML not rolled back:**
 ```sql
 ATTACH ':memory:' AS aux;
 CREATE TABLE aux.t(id INTEGER PRIMARY KEY, val TEXT);
@@ -119,7 +142,20 @@ SELECT * FROM aux.t;
 -- Returns BOTH rows (row 2 should have been rolled back)
 ```
 
-**Severity:** Critical — silent data corruption. Affects nested savepoints too.
+**DDL not rolled back:**
+```sql
+ATTACH ':memory:' AS mem;
+BEGIN;
+SAVEPOINT sp1;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY);
+INSERT INTO mem.t VALUES(1);
+ROLLBACK TO sp1;
+SELECT * FROM mem.t;
+-- Returns: 1 (both CREATE TABLE and INSERT should have been undone)
+-- sqlite3: Error: no such table: mem.t
+```
+
+**Severity:** Critical — silent data/schema corruption. Affects nested savepoints too. Code expecting transactional protection gets none on attached databases.
 
 ---
 
@@ -307,17 +343,32 @@ EXPLAIN BEGIN IMMEDIATE;
 
 ---
 
-## Bug 16: DML on attached DB unnecessarily opens WRITE transaction on main *(was Bug 20)*
+## Bug 16: Operations on attached DB unnecessarily open transactions on main database *(was Bugs 20, 30)*
+
+All operations targeting attached databases — DML, DDL, and even read-only queries — unnecessarily open a transaction on the main database:
 
 ```sql
 ATTACH ':memory:' AS aux;
 CREATE TABLE aux.t(id INTEGER PRIMARY KEY);
+
+-- DML opens WRITE on main:
 EXPLAIN INSERT INTO aux.t VALUES(1);
 -- Shows WRITE transaction on both main (iDb=0) AND aux (iDb=2)
--- Should only open write on aux
+
+-- DDL opens WRITE on main:
+EXPLAIN CREATE TABLE aux.t2(id INTEGER PRIMARY KEY);
+-- Shows: Transaction iDb=0 tx_mode=Write AND Transaction iDb=2 tx_mode=Write
+
+-- Even SELECT opens READ on main:
+EXPLAIN SELECT * FROM aux.t;
+-- Shows: Transaction iDb=0 tx_mode=Read AND Transaction iDb=2 tx_mode=Read
 ```
 
-**Severity:** Medium — unnecessary lock contention on main DB.
+**Expected (sqlite3):** Only open transactions on the databases actually involved in the operation.
+
+**Root cause:** Transaction emission always includes main database (iDb=0) regardless of which databases are actually accessed.
+
+**Severity:** Medium — unnecessary lock contention on main DB for all attached DB operations.
 
 ---
 
@@ -430,14 +481,29 @@ SELECT count(*) FROM mem.sqlite_master;
 
 ---
 
-## Bug 24: `file:` URI `mode=memory` parameter ignored for ATTACH *(was Bug 35)*
+## Bug 24: URI `mode=memory` and empty `file:` path not handled for ATTACH *(was Bugs 24-orig, 35)*
 
+Two related failures in URI-based in-memory database creation for ATTACH:
+
+**`mode=memory` parameter ignored (creates file on disk instead):**
 ```sql
 ATTACH 'file:mydb?mode=memory' AS mdb;
 -- Creates file-based DB on disk instead of in-memory DB
 ```
 
-**Severity:** Medium — breaks URI-based in-memory database usage.
+**Empty `file:` path fails (should create in-memory/temp DB):**
+```sql
+ATTACH 'file:' AS empty_uri;
+-- Error: I/O error (open): entity not found
+
+ATTACH 'file:?mode=memory' AS mem;
+-- Error: I/O error (open): entity not found
+-- sqlite3: both succeed and create in-memory DBs
+```
+
+**Root cause:** The URI parser in `from_uri_attached` doesn't handle: (a) the `mode=memory` parameter to override file creation, or (b) the empty-path case where `file:` should be treated as `:memory:`.
+
+**Severity:** Medium — breaks URI-based in-memory database patterns.
 
 ---
 
@@ -495,103 +561,9 @@ CREATE TABLE mem.data(id INTEGER, name TEXT, score INTEGER);
 
 ---
 
-## Bug 28: INSERT OR REPLACE panic extends to composite PRIMARY KEY tables on attached DB
+## Bug 28: Experimental feature flags not propagated to attached DB schema *(was Bug 32)*
 
-**Repro:**
-```sql
-ATTACH ':memory:' AS mem;
-CREATE TABLE mem.t(a INTEGER, b INTEGER, val TEXT, PRIMARY KEY(a, b));
-INSERT INTO mem.t VALUES(1, 1, 'first');
-INSERT INTO mem.t VALUES(1, 2, 'second');
-REPLACE INTO mem.t VALUES(1, 1, 'replaced');
--- thread panicked at core/translate/insert.rs:3691: index to exist
-```
-
-**Expected:** Should replace the conflicting row without error.
-
-**Root cause:** Same as Bug 4 — `emit_replace_delete_conflicting_row` uses `resolver.schema()` (main) to look up the index backing the composite PK. Since the index exists only in the attached DB's schema, the lookup fails with a panic. Composite PKs create an internal unique index that is just as affected as explicit UNIQUE constraints.
-
-**Severity:** Critical — process crash. Affects ANY `REPLACE`/`INSERT OR REPLACE` on attached DB tables with composite primary keys.
-
----
-
-## Bug 29: INSERT OR REPLACE panic extends to expression indexes on attached DB
-
-**Repro:**
-```sql
-ATTACH ':memory:' AS mem;
-CREATE TABLE mem.t(id INTEGER PRIMARY KEY, email TEXT);
-CREATE UNIQUE INDEX mem.idx_lower_email ON t(LOWER(email));
-INSERT INTO mem.t VALUES(1, 'Alice@test.com');
-INSERT OR REPLACE INTO mem.t VALUES(2, 'alice@test.com');
--- thread panicked at core/translate/insert.rs:3691: index to exist
-```
-
-**Expected:** Should replace the row that conflicts on the expression index.
-
-**Root cause:** Same as Bugs 4 and 28 — `resolver.schema()` returns main schema which doesn't have the expression index.
-
-**Severity:** Critical — process crash on any REPLACE with expression-based UNIQUE indexes on attached DBs.
-
----
-
-## Bug 30: DDL and SELECT on attached DB open unnecessary transactions on main database
-
-**Repro:**
-```sql
-ATTACH ':memory:' AS mem;
-CREATE TABLE mem.t(id INTEGER PRIMARY KEY, val TEXT);
-INSERT INTO mem.t VALUES(1, 'test');
-
--- DDL on attached DB opens WRITE transaction on main:
-EXPLAIN CREATE TABLE mem.t2(id INTEGER PRIMARY KEY);
--- Shows: Transaction iDb=0 tx_mode=Write AND Transaction iDb=2 tx_mode=Write
--- sqlite3 only shows: Transaction iDb=2
-
--- Even SELECT on attached DB opens READ transaction on main:
-EXPLAIN SELECT * FROM mem.t;
--- Shows: Transaction iDb=0 tx_mode=Read AND Transaction iDb=2 tx_mode=Read
--- sqlite3 only shows: Transaction iDb=2
-```
-
-**Expected (sqlite3):** Only open transactions on the databases actually involved in the operation.
-
-**Root cause:** Transaction emission always includes main database (iDb=0) regardless of which databases are actually accessed. This extends Bug 16 (which documented the issue for DML) to DDL and read-only operations as well.
-
-**Severity:** Medium — unnecessary lock contention on main DB for all attached DB operations, including read-only queries.
-
----
-
-## Bug 31: SAVEPOINT ROLLBACK doesn't undo DDL (CREATE TABLE) on attached databases
-
-**Repro:**
-```sql
-ATTACH ':memory:' AS mem;
-BEGIN;
-SAVEPOINT sp1;
-CREATE TABLE mem.t(id INTEGER PRIMARY KEY);
-INSERT INTO mem.t VALUES(1);
-ROLLBACK TO sp1;
--- Table still exists, data still present!
-SELECT * FROM mem.t;
--- Returns: 1
-```
-
-**Expected (sqlite3):**
-```
-Error: no such table: mem.t
-```
-In sqlite3, `ROLLBACK TO sp1` undoes both the CREATE TABLE and the INSERT.
-
-**Root cause:** Extends Bug 5 (SAVEPOINT ROLLBACK doesn't undo writes on attached databases) to DDL operations. Neither schema changes (CREATE TABLE, CREATE INDEX) nor DML changes (INSERT, UPDATE, DELETE) are rolled back by SAVEPOINT on attached databases.
-
-**Severity:** Critical — silent data/schema corruption. Code expecting transactional DDL protection gets neither on attached databases.
-
----
-
-## Bug 32: Experimental feature flags not propagated to attached DB schema (generated columns)
-
-**Repro:**
+**Repro (generated columns):**
 ```sql
 -- Start tursodb with: --experimental-attach --experimental-generated-columns
 ATTACH ':memory:' AS mem;
@@ -604,7 +576,6 @@ INSERT INTO mem.t(id, first, last) VALUES(1, 'John', 'Doe');
 
 Also affects attaching a sqlite3-created DB with generated columns:
 ```sql
--- sqlite3 creates: CREATE TABLE t(... full TEXT GENERATED ALWAYS AS (...) VIRTUAL)
 ATTACH '/path/to/gen_col.db' AS gv;
 SELECT * FROM gv.t;
 -- Same error: generated_columns feature is not enabled
@@ -612,15 +583,13 @@ SELECT * FROM gv.t;
 
 The same feature works correctly on the main database.
 
-**Expected:** Generated columns should work on attached databases when the `--experimental-generated-columns` flag is enabled.
-
 **Root cause:** In `core/connection.rs:1642-1644`, `attach_database()` creates `DatabaseOpts` with only `.with_views()` and `.with_custom_types()`. It's missing `.with_generated_columns(self.db.experimental_generated_columns_enabled())`. When the attached DB's schema is re-parsed via `ParseSchema`, the Schema object doesn't have `generated_columns_enabled = true`, so any table with generated columns is rejected.
 
 **Severity:** High — makes generated columns completely unusable on any attached database.
 
 ---
 
-## Bug 33: `immutable=1` URI parameter ignored for ATTACH — allows writes to immutable database
+## Bug 29: `immutable=1` URI parameter ignored for ATTACH — allows writes to immutable database *(was Bug 33)*
 
 **Repro:**
 ```sql
@@ -648,7 +617,7 @@ The data is actually written to disk — verified with sqlite3 after detach.
 
 ---
 
-## Bug 34: `mode=rw` URI parameter ignored for ATTACH — creates files that don't exist
+## Bug 30: `mode=rw` URI parameter ignored for ATTACH — creates files that don't exist *(was Bug 34)*
 
 **Repro:**
 ```sql
@@ -670,44 +639,14 @@ In SQLite's URI scheme:
 
 **Root cause:** The `mode=rw` parameter's "don't create" semantics are not enforced. The file is opened with `O_CREAT` regardless of the mode parameter.
 
-**Severity:** Medium — creates unexpected files on disk. Could cause issues in deployment scripts that rely on `mode=rw` to verify a database exists before using it.
+**Severity:** Medium — creates unexpected files on disk.
 
 ---
 
-## Bug 35: `file:` URI with empty path fails in ATTACH (should create in-memory DB)
-
-**Repro:**
-```sql
-ATTACH 'file:' AS empty_uri;
--- Error: I/O error (open): entity not found
-
-ATTACH 'file:?mode=memory' AS mem;
--- Error: I/O error (open): entity not found
-```
-
-**Expected (sqlite3 behavior):**
-```sql
-ATTACH 'file:' AS empty_uri;
--- Succeeds, creates in-memory DB
-CREATE TABLE empty_uri.t(id INTEGER);
-INSERT INTO empty_uri.t VALUES(1);
-SELECT * FROM empty_uri.t;
--- Returns: 1
-```
-
-In sqlite3, `file:` with an empty path creates a temporary/in-memory database. Similarly, `file:?mode=memory` creates an in-memory DB. tursodb fails on both because it tries to open a file with an empty path.
-
-**Root cause:** The URI parser in `from_uri_attached` doesn't handle the empty-path case. When the path component of the file: URI is empty, it should be treated as `:memory:` (or a temporary DB).
-
-**Severity:** Medium — prevents valid URI patterns for in-memory attached databases.
-
----
-
-## Bug 36: ATTACH on read-only file (chmod 444) fails instead of opening in read-only mode
+## Bug 31: ATTACH on read-only file (chmod 444) fails instead of opening in read-only mode *(was Bug 36)*
 
 **Repro:**
 ```bash
-# Create a DB and make it read-only
 sqlite3 /tmp/readonly.db "CREATE TABLE t(id PRIMARY KEY, val TEXT); INSERT INTO t VALUES(1, 'test');"
 chmod 444 /tmp/readonly.db
 ```
