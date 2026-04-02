@@ -974,3 +974,97 @@
 34. `mode=rw` URI parameter creates non-existent files for ATTACH
 35. `file:` URI with empty path fails in ATTACH (should create in-memory DB)
 36. ATTACH on read-only file (chmod 444) fails instead of opening read-only
+
+### Round 11: Deep Edge Case & Schema Introspection Bug Hunting (2026-04-02)
+
+#### Tests performed (working correctly):
+- INSERT OR REPLACE with simple PK on attached DB (no UNIQUE constraint)
+- ALTER TABLE RENAME TO existing name in attached DB (correctly rejected)
+- REPLACE INTO + FK CASCADE on attached DB
+- UPDATE RETURNING + trigger on attached DB
+- Cross-DB INSERT ON CONFLICT DO UPDATE with subquery source
+- ALTER TABLE ADD COLUMN with FK on attached DB
+- Cross-DB INSERT SELECT with proper name resolution
+- AUTOINCREMENT independence across schemas (sqlite_sequence per-DB)
+- Self-referencing trigger on attached DB
+- Table alias conflicting with schema name (correctly resolved)
+- INSERT OR ABORT in multi-DB transaction (correctly keeps txn open)
+- Same-name index in main and attached (both coexist)
+- ALTER TABLE RENAME to name existing in another schema (allowed)
+- DROP TABLE cascade (indexes + triggers removed) on attached DB
+- INSERT OR ROLLBACK cross-DB (correctly rolls back entire txn)
+- FK CASCADE with same-name tables in different schemas (correctly uses own FK rules)
+- DROP VIEW on attached DB (works, even with same-name view in main)
+- DROP TRIGGER on attached DB (works, even with same-name trigger in main)
+- DROP INDEX on attached DB (works, even with same-name index in main)
+- DDL ROLLBACK (BEGIN + CREATE TABLE + ROLLBACK) on attached DB (works)
+- ATTACH/DETACH cycle with database_list (correct ID reuse)
+- json_each on attached DB data
+- WAL checkpoint on attached DB
+- Schema migration pattern (CREATE/INSERT/DROP/RENAME) on attached DB
+- Complex DEFAULT expressions on attached DB (datetime, random, hex)
+- Complex cross-DB UPDATE with correlated subquery
+- Cross-DB INSERT SELECT with trigger on dest
+- Complex correlated subquery in SELECT list cross-DB
+- CROSS JOIN between main and attached
+- Multiple operations (INSERT/UPDATE/DELETE/ALTER/DROP) in sequence on attached DB
+- COLLATE NOCASE with index on attached DB
+- LIKE ESCAPE on attached DB
+- GROUP_CONCAT DISTINCT on attached DB
+- Negative rowid on attached DB
+- Self-join (hierarchical query) on attached DB
+- UPSERT with excluded + schema-qualified reference on attached DB
+- 3-way cross-DB JOIN with different table names
+- BETWEEN with subqueries from main on attached DB
+- INSERT SELECT with column aliases into attached DB
+- Zero-length text and blob values on attached DB
+- INSERT with complex expressions (abs, upper, lower, round) on attached DB
+- LIKE on attached sqlite_master (works)
+- sqlite_master UNION across 3 schemas
+- .read command with ATTACH in read file
+- .dump with attached DBs (only dumps main, same as sqlite3)
+- .tables with pattern and attached DBs
+- .indexes with unqualified table name from attached DB
+- ANALYZE on attached DB (qualified)
+- BEFORE UPDATE trigger with WHEN clause on attached DB
+- DELETE from attached with IN subquery from main
+- Page reuse after DROP TABLE on in-memory attached DB (pages freed and reused)
+- MODIFYING sqlite_sequence directly on attached DB (works)
+- Multi-value INSERT with constraint violation on attached DB (statement rollback works)
+- CREATE INDEX after data exists on attached DB (index populated correctly)
+- COMMIT with only attached DB changes (works)
+- total()/sum()/avg() on attached DB (correct)
+- Deeply nested correlated subquery on attached DB (correct)
+- Mixed INSERT with errors on attached DB (correct error recovery)
+- Subquery with schema-name alias (correctly resolved)
+- CREATE TABLE same name in main and attached (allowed)
+- COLLATE NOCASE + UNIQUE + INSERT OR REPLACE on attached DB (panics - Bug 4 confirmed)
+- .schema output for attached DB with views/triggers/indexes
+
+#### Bugs confirmed from previous rounds:
+- Bug 2: Views in attached schemas (confirmed)
+- Bug 4: INSERT OR REPLACE panic (confirmed with COLLATE NOCASE + UNIQUE, EXPLAIN also panics)
+- Bug 6: PRAGMA integrity_check, index_list/info/xinfo, freelist_count all ignore schema qualifier (confirmed)
+- Bug 10: Three-part references broken in cross-DB cartesian product between two attached DBs
+- Bug 11: Optimizer doesn't use indexes on attached DB (LIKE optimization also doesn't work)
+- Bug 16: Unnecessary transaction on main for all attached DB operations (confirmed in bytecode)
+- Bug 22: .schema adds extra schema prefix to table name in CREATE INDEX (confirmed)
+- Bug 23: count(*) on empty attached DB sqlite_master I/O error (confirmed on re-ATTACH cycle)
+
+#### Unsupported features (not ATTACH-specific):
+- FILTER clause in aggregate functions ("not supported yet")
+- WITHOUT ROWID tables ("not supported")
+- UPDATE...FROM clause ("not supported")
+- .mode json ("not available, only list/pretty/line")
+- Recursive CTEs ("not supported yet")
+- REINDEX ("not supported yet")
+
+#### Unrelated bugs found:
+- INSERT INTO view gives "no such table" instead of "cannot modify view" (affects both main and attached)
+
+#### Bugs Found (Round 11):
+37. Function-style pragmas (pragma_table_info, pragma_index_list, pragma_table_xinfo) don't search attached databases
+38. PRAGMA integrity_check on attached DB: wrong roots list (only sqlite_master, misses user tables) → false corruption
+39. PRAGMA integrity_check error prefix always says "main" for attached DBs
+40. `.schema TABLE_NAME` doesn't search attached databases
+41. `.schema` shows wrong view column info (`x` instead of `id,val`) for attached DB views

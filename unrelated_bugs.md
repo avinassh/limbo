@@ -147,3 +147,24 @@ Successfully adds the column. sqlite3 supports expression defaults in ALTER TABL
 
 **Actual (tursodb):**
 Rejects with "Cannot add a column with non-constant default". This prevents using common patterns like `DEFAULT (datetime('now'))` or `DEFAULT (random())` when adding columns to existing tables. Not ATTACH-specific.
+
+## 8. INSERT INTO view gives "no such table" instead of "cannot modify view"
+
+**Repro:**
+```sql
+CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+CREATE VIEW v AS SELECT * FROM t;
+INSERT INTO v VALUES(2, 'b');
+```
+
+**Expected (sqlite3):**
+```
+Parse error: cannot modify v because it is a view
+```
+
+**Actual (tursodb):**
+```
+Parse error: no such table: v
+```
+
+Views exist as schema objects but the INSERT/UPDATE/DELETE code paths don't recognize them. Instead of giving the proper "cannot modify view" error, tursodb doesn't find the view at all when used as a DML target. Affects both main and attached databases.

@@ -1,6 +1,6 @@
 # ATTACH Bugs Found
 
-*46 raw bugs found across 10 rounds, merged into 31 distinct issues below. Original bug numbers preserved in parentheses for traceability.*
+*51 raw bugs found across 11 rounds, merged into 36 distinct issues below. Original bug numbers preserved in parentheses for traceability.*
 
 ---
 
@@ -671,3 +671,150 @@ sqlite3 detects the file permissions and automatically opens the database in rea
 **Root cause:** `attach_database()` opens the file with read-write flags. When the file is read-only (permissions 444), the open fails. There's no fallback to open the file in read-only mode, unlike sqlite3 which automatically downgrades to read-only.
 
 **Severity:** Medium — prevents attaching any database file that doesn't have write permissions, even for read-only access.
+
+---
+
+## Bug 32: Function-style pragmas (table-valued) don't search attached databases
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t(id INTEGER PRIMARY KEY, val TEXT, num INTEGER);
+-- Function-style pragma (FROM clause) - returns empty:
+SELECT * FROM pragma_table_info('t');
+-- Statement-style pragma - works correctly:
+PRAGMA m1.table_info(t);
+```
+
+Also affects `pragma_index_list()` and `pragma_table_xinfo()`:
+```sql
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t(id INTEGER PRIMARY KEY, val TEXT);
+CREATE INDEX m1.idx ON t(val);
+SELECT * FROM pragma_index_list('t');      -- Empty!
+SELECT * FROM pragma_table_xinfo('t');     -- Empty!
+PRAGMA m1.index_list(t);                   -- Works correctly
+PRAGMA m1.table_xinfo(t);                  -- Doesn't exist as statement pragma, but table_info works
+```
+
+**Expected (sqlite3 behavior):** `SELECT * FROM pragma_table_info('t')` searches all schemas (main → temp → attached) and returns column info for `t` found in `m1`.
+
+**Root cause:** The function-style pragma implementation only searches the main schema when resolving the table name argument. It doesn't fall back to attached database schemas like the `PRAGMA schema.function(arg)` statement syntax does.
+
+**Severity:** Medium — prevents using pragmas as table-valued functions for schema introspection on attached databases. Blocks patterns like `SELECT ... FROM sqlite_master m, pragma_table_info(m.name)` for attached DB schemas.
+
+---
+
+## Bug 33: PRAGMA integrity_check on attached DB produces false corruption reports *(extends Bug 6)*
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO m1.t VALUES(1, 'a'),(2, 'b');
+PRAGMA m1.integrity_check;
+-- Returns: *** in database main ***\nPage 2: never used
+```
+
+**Expected:** `ok` (the database is perfectly valid).
+
+**Bytecode analysis:**
+```
+-- Main DB: IntegrityCk roots=[2, 1]  -- includes table (page 2) and sqlite_master (page 1)
+-- Attached: IntegrityCk roots=[1]     -- ONLY sqlite_master, MISSING table (page 2)
+```
+
+The IntegrityCk instruction correctly targets `db=2` (attached DB), so it reads the right pager. But the roots list only includes root page 1 (sqlite_master), omitting all user table and index root pages. This causes every user table page to be reported as "never used" — a false corruption report.
+
+Additionally, the error prefix is hardcoded as `"*** in database main ***"` instead of using the actual database name. `PRAGMA m1.quick_check` exhibits the same two issues.
+
+**Root cause:** When emitting the IntegrityCk instruction for attached DBs, the code doesn't enumerate user table root pages from the attached schema. It only includes sqlite_master's root page (1). The error message prefix string is also hardcoded to "main".
+
+**Severity:** High — PRAGMA integrity_check is completely broken on attached databases: always reports false corruption, never says "ok", and attributes errors to the wrong database. Gives false negative confidence when actually checking main.
+
+---
+
+## Bug 34: `.schema TABLE_NAME` doesn't search attached databases
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t(id INTEGER PRIMARY KEY, val TEXT);
+CREATE INDEX m1.idx ON t(val);
+.schema t
+-- Returns: (empty)
+```
+
+**Expected (sqlite3):**
+```sql
+.schema t
+-- Returns:
+-- CREATE TABLE m1.t(id INTEGER PRIMARY KEY, val TEXT);
+-- CREATE INDEX m1.idx ON t(val);
+```
+
+Note: `.schema` without arguments correctly shows schemas from all databases. Only the filtered form `.schema TABLE_NAME` fails to search attached DBs.
+
+**Root cause:** The `.schema TABLE_NAME` command only searches the main schema for matching table names. It doesn't fall back to attached databases like sqlite3 does.
+
+**Severity:** Low — workaround is to use `.schema m1.t` (qualified name) or `.schema` (all schemas).
+
+---
+
+## Bug 35: `.schema` shows wrong view column info for attached DB views
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t(id INTEGER PRIMARY KEY, val TEXT);
+CREATE VIEW m1.v AS SELECT * FROM t;
+.schema
+```
+
+**tursodb output:**
+```
+CREATE VIEW v AS SELECT * FROM t;
+/* v(x) */
+```
+
+**sqlite3 output:**
+```
+CREATE VIEW m1.v AS SELECT * FROM t
+/* m1.v(id,val) */;
+```
+
+Three differences:
+1. Column info says `x` instead of `id,val` — wrong column names
+2. View name missing schema prefix (`v` instead of `m1.v`)
+3. Missing schema prefix in column info comment
+
+Note: `PRAGMA m1.table_info(v)` correctly returns `id` and `val` columns. The issue is in the `.schema` display code.
+
+**Root cause:** When `.schema` generates the view column comment for attached DB views, it fails to resolve the view's SELECT body against the attached schema (same root cause as Bug 2 — view body resolution). The fallback produces an incorrect default column name `x`.
+
+**Severity:** Low — cosmetic display issue in `.schema` output. `PRAGMA m1.table_info(v)` provides correct results.
+
+---
+
+## Bug 36: PRAGMA integrity_check error prefix always says "main" for all databases
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO m1.t VALUES(1, 'a');
+PRAGMA m1.integrity_check;
+-- Output includes: *** in database main ***
+-- Should say: *** in database m1 ***
+```
+
+**Bytecode evidence:**
+```
+5     String8  0  5  0  '*** in database main ***'
+```
+
+The error prefix string is a compile-time constant "main" regardless of which database is being checked. Combined with Bug 33 (false corruption reports), this means integrity check errors on attached DBs are both incorrect and misattributed to main.
+
+**Root cause:** In `core/translate/pragma.rs`, the integrity check error prefix is hardcoded as `"*** in database main ***"` instead of interpolating the actual schema name.
+
+**Severity:** Medium — misidentifies which database has integrity issues when checking attached databases.
