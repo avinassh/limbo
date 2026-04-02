@@ -1,6 +1,6 @@
 # ATTACH Bugs Found
 
-*56 raw bugs found across 12 rounds, merged into 41 distinct issues below. Original bug numbers preserved in parentheses for traceability.*
+*61 raw bugs found across 13 rounds, merged into 46 distinct issues below. Original bug numbers preserved in parentheses for traceability.*
 
 ---
 
@@ -992,3 +992,145 @@ The optimizer DOES correctly handle:
 **Root cause:** The index selection logic in the optimizer doesn't search the attached database schema for available indexes. It only considers indexes from the main schema.
 
 **Severity:** Critical — every non-PK indexed query on attached databases does O(n) full table scan instead of O(log n) index lookup. This makes attached databases unsuitable for any performance-sensitive workload.
+
+---
+
+## Bug 42: SAVEPOINT ROLLBACK after DDL + DML produces spurious "page is dirty" error
+
+**Repro:**
+```sql
+BEGIN;
+SAVEPOINT sp1;
+CREATE TABLE mt(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO mt VALUES(1, 'before');
+ROLLBACK TO sp1;
+-- Error: page 2 is dirty
+```
+
+**Expected (sqlite3):** No error. ROLLBACK TO cleanly undoes the DDL and DML.
+
+**Actual (tursodb):** `Error: page 2 is dirty` before the expected "no such table" error. The DDL IS correctly rolled back (table doesn't exist after rollback), but the pager reports a spurious error about a dirty page.
+
+Also occurs when ATTACH is involved:
+```sql
+BEGIN;
+SAVEPOINT sp1;
+CREATE TABLE mt(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO mt VALUES(1, 'main_data');
+ATTACH ':memory:' AS m1;
+ROLLBACK TO sp1;
+-- Error: page 2 is dirty
+```
+
+**Root cause:** When rolling back a savepoint that includes DDL operations, the pager's dirty page tracking isn't properly cleaned up. The rollback correctly undoes the schema changes, but the pager still flags pages as dirty.
+
+**Severity:** Medium — the rollback itself works (DDL is undone), but the spurious error may confuse applications and cause them to think the rollback failed. Note: this bug is NOT ATTACH-specific (occurs on main DB too), but it compounds with ATTACH transactions.
+
+---
+
+## Bug 43: SAVEPOINT ROLLBACK doesn't undo DML on attached DBs even with DML-only changes
+
+**Extended confirmation of Bug 5 with DML-only scenario:**
+
+```sql
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t1(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO m1.t1 VALUES(1, 'original');
+BEGIN;
+SAVEPOINT sp1;
+INSERT INTO m1.t1 VALUES(2, 'should_rollback');
+UPDATE m1.t1 SET val = 'modified' WHERE id = 1;
+ROLLBACK TO sp1;
+COMMIT;
+SELECT * FROM m1.t1 ORDER BY id;
+-- Returns: 1|modified AND 2|should_rollback
+-- Expected: 1|original (only)
+```
+
+**Expected (sqlite3):** Only row 1 with 'original' value.
+
+**Actual (tursodb):** Both the INSERT and UPDATE persist despite ROLLBACK TO sp1. Even DML-only changes (no DDL) on attached databases are not rolled back by SAVEPOINT ROLLBACK.
+
+**Severity:** Critical — this is the DML-only case of Bug 5, confirming that SAVEPOINT is completely non-functional for all change types on attached databases.
+
+---
+
+## Bug 44: EXPLAIN SAVEPOINT bytecode doesn't include attached database savepoint operations
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t1(id INTEGER PRIMARY KEY);
+INSERT INTO m1.t1 VALUES(1);
+EXPLAIN SAVEPOINT sp1;
+-- Shows only:
+-- 0 Init 0 3 0 ... Start at 3
+-- 1 Savepoint 0 0 0 sp1 op=Begin, name=sp1
+-- 2 Halt 0 0 0
+-- 3 Goto 0 1 0
+```
+
+**Expected (sqlite3):** The savepoint should also acquire sub-journals/savepoints on all attached databases, not just main.
+
+**Root cause:** Combined with Bug 15 (BEGIN IMMEDIATE doesn't emit Transaction for attached DBs) and Bug 5 (SAVEPOINT ROLLBACK doesn't work on attached), this confirms that the entire savepoint mechanism is not wired up for attached databases. The Savepoint opcode only operates on the main database's pager.
+
+**Severity:** High — explains why Bug 5 occurs. Savepoints are fundamentally not implemented for attached databases at the bytecode level.
+
+---
+
+## Bug 45: ANALYZE on attached DB after schema changes correctly updates stats but optimizer still ignores them
+
+**Repro:**
+```sql
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t1(id INTEGER PRIMARY KEY, val TEXT, score INTEGER);
+CREATE INDEX m1.idx_score ON t1(score);
+INSERT INTO m1.t1 VALUES(1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40), (5, 'e', 50);
+ANALYZE m1;
+SELECT * FROM m1.sqlite_stat1;
+-- Returns: t1||5 AND t1|idx_score|5 1 (stats correctly computed)
+EXPLAIN QUERY PLAN SELECT * FROM m1.t1 WHERE score = 30;
+-- Returns: SCAN t1 (should be: SEARCH t1 USING INDEX idx_score)
+```
+
+**Expected (sqlite3):** After ANALYZE, the optimizer uses the statistics to choose the index.
+
+**Actual:** ANALYZE correctly writes statistics to m1.sqlite_stat1, but the optimizer completely ignores them. The query plan is identical whether or not ANALYZE has been run — it always does a full table scan.
+
+This is distinct from Bug 11 (optimizer doesn't use indexes on attached databases) because it specifically shows that even with correct statistics data, the optimizer doesn't consider attached DB indexes. It rules out "missing statistics" as the cause of Bug 11.
+
+**Root cause:** The optimizer doesn't load/consider sqlite_stat1 data from attached database schemas when making query planning decisions.
+
+**Severity:** High — ANALYZE is wasted work on attached databases. Combined with Bug 11, there is no way to get the optimizer to use non-PK indexes on attached databases.
+
+---
+
+## Bug 46: MIN/MAX aggregate optimization not applied on attached database indexes
+
+**Repro:**
+```sql
+CREATE TABLE main_t(id INTEGER PRIMARY KEY, score INTEGER);
+CREATE INDEX main_idx ON main_t(score);
+INSERT INTO main_t VALUES(1, 50), (2, 10), (3, 90), (4, 30);
+
+ATTACH ':memory:' AS m1;
+CREATE TABLE m1.t1(id INTEGER PRIMARY KEY, score INTEGER);
+CREATE INDEX m1.idx ON t1(score);
+INSERT INTO m1.t1 VALUES(1, 50), (2, 10), (3, 90), (4, 30);
+
+EXPLAIN QUERY PLAN SELECT MIN(score) FROM main_t;
+-- Returns: SCAN main_t USING COVERING INDEX main_idx (fast path)
+
+EXPLAIN QUERY PLAN SELECT MIN(score) FROM m1.t1;
+-- Returns: SCAN t1 (full table scan)
+```
+
+**Expected (sqlite3):** Both queries use the covering index optimization for MIN/MAX.
+
+**Actual:** The MIN/MAX covering index optimization only works on main database indexes. Attached database indexes are completely ignored, forcing a full table scan even for simple `SELECT MIN(col) FROM table` where an index on `col` exists.
+
+Both queries return the correct value (10), but the attached DB version does O(n) work instead of O(1).
+
+**Root cause:** Same as Bug 11 — the optimizer's index consideration logic doesn't search attached database schemas. Specifically confirmed for the MIN/MAX aggregate optimization path which uses a covering index to find the minimum/maximum value in O(1) by reading the first/last index entry.
+
+**Severity:** High — MIN/MAX on indexed columns is a very common pattern. O(n) vs O(1) can be significant for large tables.

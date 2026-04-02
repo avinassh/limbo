@@ -194,3 +194,24 @@ Parse error: ORDER BY expression in compound SELECT must be a column number or n
 ```
 
 sqlite3 allows COLLATE in ORDER BY of compound SELECT. tursodb rejects it. Not ATTACH-specific.
+
+## 10. SAVEPOINT ROLLBACK after DDL produces spurious "page is dirty" error
+
+**Repro:**
+```sql
+BEGIN;
+SAVEPOINT sp1;
+CREATE TABLE mt(id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO mt VALUES(1, 'before');
+ROLLBACK TO sp1;
+-- Error: page 2 is dirty
+-- Then: Parse error: no such table: mt (correct - table was rolled back)
+```
+
+**Expected (sqlite3):**
+No error. ROLLBACK TO SAVEPOINT cleanly undoes the CREATE TABLE and INSERT without any pager errors.
+
+**Actual (tursodb):**
+The DDL rollback works correctly (table doesn't exist after rollback), but the pager produces a spurious `Error: page 2 is dirty` message before the expected "no such table" error. This error may confuse applications that check for errors during transaction management.
+
+Not ATTACH-specific — occurs on main database. But it compounds with ATTACH transactions (Bug 42 in attach_bugs.md).
