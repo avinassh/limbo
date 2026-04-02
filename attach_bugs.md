@@ -1,6 +1,6 @@
 # ATTACH Bugs Found
 
-*40 bugs found, merged into 26 distinct issues below. Original bug numbers preserved in parentheses for traceability.*
+*45 bugs found, merged into 31 distinct issues below. Original bug numbers preserved in parentheses for traceability. Bugs 32-36 found in Round 10.*
 
 ---
 
@@ -586,3 +586,149 @@ In sqlite3, `ROLLBACK TO sp1` undoes both the CREATE TABLE and the INSERT.
 **Root cause:** Extends Bug 5 (SAVEPOINT ROLLBACK doesn't undo writes on attached databases) to DDL operations. Neither schema changes (CREATE TABLE, CREATE INDEX) nor DML changes (INSERT, UPDATE, DELETE) are rolled back by SAVEPOINT on attached databases.
 
 **Severity:** Critical — silent data/schema corruption. Code expecting transactional DDL protection gets neither on attached databases.
+
+---
+
+## Bug 32: Experimental feature flags not propagated to attached DB schema (generated columns)
+
+**Repro:**
+```sql
+-- Start tursodb with: --experimental-attach --experimental-generated-columns
+ATTACH ':memory:' AS mem;
+CREATE TABLE mem.t(id INTEGER PRIMARY KEY, first TEXT, last TEXT, full TEXT GENERATED ALWAYS AS (first || ' ' || last) VIRTUAL);
+-- CREATE TABLE succeeds, but schema re-parse fails:
+INSERT INTO mem.t(id, first, last) VALUES(1, 'John', 'Doe');
+-- Error: table 't' uses generated columns but the generated_columns feature is not enabled
+-- Error: no such table: t
+```
+
+Also affects attaching a sqlite3-created DB with generated columns:
+```sql
+-- sqlite3 creates: CREATE TABLE t(... full TEXT GENERATED ALWAYS AS (...) VIRTUAL)
+ATTACH '/path/to/gen_col.db' AS gv;
+SELECT * FROM gv.t;
+-- Same error: generated_columns feature is not enabled
+```
+
+The same feature works correctly on the main database.
+
+**Expected:** Generated columns should work on attached databases when the `--experimental-generated-columns` flag is enabled.
+
+**Root cause:** In `core/connection.rs:1642-1644`, `attach_database()` creates `DatabaseOpts` with only `.with_views()` and `.with_custom_types()`. It's missing `.with_generated_columns(self.db.experimental_generated_columns_enabled())`. When the attached DB's schema is re-parsed via `ParseSchema`, the Schema object doesn't have `generated_columns_enabled = true`, so any table with generated columns is rejected.
+
+**Severity:** High — makes generated columns completely unusable on any attached database.
+
+---
+
+## Bug 33: `immutable=1` URI parameter ignored for ATTACH — allows writes to immutable database
+
+**Repro:**
+```sql
+-- Create a DB with sqlite3 first:
+-- sqlite3 /tmp/immut.db "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT); INSERT INTO t VALUES(1, 'original');"
+
+ATTACH 'file:/tmp/immut.db?immutable=1' AS imm;
+SELECT * FROM imm.t;
+-- Returns: 1|original (read works)
+
+INSERT INTO imm.t VALUES(2, 'new');
+-- No error! Write succeeds!
+
+SELECT * FROM imm.t;
+-- Returns: 1|original AND 2|new
+```
+
+The data is actually written to disk — verified with sqlite3 after detach.
+
+**Expected (sqlite3 behavior):** `INSERT INTO imm.t VALUES(2, 'new');` fails with "attempt to write a readonly database".
+
+**Root cause:** The `immutable=1` URI parameter is parsed but not enforced. The database is opened in read-write mode regardless. The `mode=ro` parameter works correctly, but `immutable=1` does not apply read-only enforcement.
+
+**Severity:** High — silent data corruption. `immutable=1` is used when a DB is known not to change (e.g., read-only media, shared reference data). Allowing writes violates this contract.
+
+---
+
+## Bug 34: `mode=rw` URI parameter ignored for ATTACH — creates files that don't exist
+
+**Repro:**
+```sql
+-- /tmp/nonexistent.db does NOT exist
+ATTACH 'file:/tmp/nonexistent.db?mode=rw' AS rw;
+-- No error! File is created on disk.
+
+CREATE TABLE rw.t(id INTEGER PRIMARY KEY);
+INSERT INTO rw.t VALUES(1);
+SELECT * FROM rw.t;
+-- Returns: 1
+```
+
+**Expected (sqlite3 behavior):** `ATTACH 'file:/tmp/nonexistent.db?mode=rw' AS rw;` fails with "unable to open database".
+
+In SQLite's URI scheme:
+- `mode=rw` means "read-write, do NOT create"
+- `mode=rwc` means "read-write, create if needed" (default)
+
+**Root cause:** The `mode=rw` parameter's "don't create" semantics are not enforced. The file is opened with `O_CREAT` regardless of the mode parameter.
+
+**Severity:** Medium — creates unexpected files on disk. Could cause issues in deployment scripts that rely on `mode=rw` to verify a database exists before using it.
+
+---
+
+## Bug 35: `file:` URI with empty path fails in ATTACH (should create in-memory DB)
+
+**Repro:**
+```sql
+ATTACH 'file:' AS empty_uri;
+-- Error: I/O error (open): entity not found
+
+ATTACH 'file:?mode=memory' AS mem;
+-- Error: I/O error (open): entity not found
+```
+
+**Expected (sqlite3 behavior):**
+```sql
+ATTACH 'file:' AS empty_uri;
+-- Succeeds, creates in-memory DB
+CREATE TABLE empty_uri.t(id INTEGER);
+INSERT INTO empty_uri.t VALUES(1);
+SELECT * FROM empty_uri.t;
+-- Returns: 1
+```
+
+In sqlite3, `file:` with an empty path creates a temporary/in-memory database. Similarly, `file:?mode=memory` creates an in-memory DB. tursodb fails on both because it tries to open a file with an empty path.
+
+**Root cause:** The URI parser in `from_uri_attached` doesn't handle the empty-path case. When the path component of the file: URI is empty, it should be treated as `:memory:` (or a temporary DB).
+
+**Severity:** Medium — prevents valid URI patterns for in-memory attached databases.
+
+---
+
+## Bug 36: ATTACH on read-only file (chmod 444) fails instead of opening in read-only mode
+
+**Repro:**
+```bash
+# Create a DB and make it read-only
+sqlite3 /tmp/readonly.db "CREATE TABLE t(id PRIMARY KEY, val TEXT); INSERT INTO t VALUES(1, 'test');"
+chmod 444 /tmp/readonly.db
+```
+
+```sql
+ATTACH '/tmp/readonly.db' AS ro;
+-- Error: I/O error (open): permission denied
+```
+
+**Expected (sqlite3 behavior):**
+```sql
+ATTACH '/tmp/readonly.db' AS ro;
+-- Succeeds, opens in read-only mode
+SELECT * FROM ro.t;
+-- Returns: 1|test
+INSERT INTO ro.t VALUES(2, 'new');
+-- Error: attempt to write a readonly database
+```
+
+sqlite3 detects the file permissions and automatically opens the database in read-only mode. tursodb fails to open the file at all because it always tries to open in read-write mode first.
+
+**Root cause:** `attach_database()` opens the file with read-write flags. When the file is read-only (permissions 444), the open fails. There's no fallback to open the file in read-only mode, unlike sqlite3 which automatically downgrades to read-only.
+
+**Severity:** Medium — prevents attaching any database file that doesn't have write permissions, even for read-only access.
