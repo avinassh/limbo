@@ -14399,6 +14399,83 @@ fn op_vacuum_into_inner(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Plain VACUUM opcode
+// ---------------------------------------------------------------------------
+
+/// Holds the state for the plain VACUUM operation across async yields.
+pub(crate) struct OpVacuumState {
+    /// Database index being vacuumed.
+    db: usize,
+    /// State machine for the plain VACUUM operation.
+    sub_state: crate::vdbe::vacuum::PlainVacuumSubState,
+}
+
+impl Default for OpVacuumState {
+    fn default() -> Self {
+        Self {
+            db: crate::MAIN_DB_ID,
+            sub_state: crate::vdbe::vacuum::PlainVacuumSubState::Preflight,
+        }
+    }
+}
+
+/// Plain VACUUM - compact the database in place via temp-build + direct-WAL
+/// copy-back. The opcode owns the source transaction lifecycle.
+pub fn op_vacuum(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(Vacuum { db }, insn);
+
+    if state.op_vacuum_state.is_none() {
+        state.op_vacuum_state = Some(OpVacuumState {
+            db: *db,
+            sub_state: crate::vdbe::vacuum::PlainVacuumSubState::Preflight,
+        });
+    }
+
+    let vacuum_state = state.op_vacuum_state.as_mut().unwrap();
+
+    match crate::vdbe::vacuum::plain_vacuum_step(
+        &program.connection,
+        vacuum_state.db,
+        &mut vacuum_state.sub_state,
+    ) {
+        Ok(InsnFunctionStepResult::Step) => {
+            state.op_vacuum_state = None;
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Ok(InsnFunctionStepResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
+            unreachable!("plain_vacuum_step only returns Step or IO")
+        }
+        Err(err) => {
+            if let Err(cleanup_err) = cleanup_op_vacuum_state(&program.connection, state) {
+                tracing::error!("VACUUM cleanup failed after error: {cleanup_err}");
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Clean up plain VACUUM state on error or abort. Rolls back the source
+/// transaction if it was acquired, restores connection state, and drops
+/// temp resources.
+pub(crate) fn cleanup_op_vacuum_state(
+    connection: &Arc<Connection>,
+    state: &mut ProgramState,
+) -> Result<()> {
+    let Some(vacuum_state) = state.op_vacuum_state.take() else {
+        return Ok(());
+    };
+    crate::vdbe::vacuum::plain_vacuum_cleanup(connection, vacuum_state.db, &vacuum_state.sub_state);
+    Ok(())
+}
+
 fn with_header<T, F>(
     pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,

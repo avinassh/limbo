@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::error::LimboError;
 use crate::schema::TypeDef;
 use crate::storage::sqlite3_ondisk::{CacheSize, DatabaseHeader, TextEncoding};
-use crate::types::IOResult;
+use crate::util::IOExt;
 use crate::vdbe::execute::InsnFunctionStepResult;
 use crate::Result;
 use crate::{Connection, Database, DatabaseOpts, EncryptionOpts, OpenFlags};
@@ -713,11 +713,19 @@ pub(crate) fn vacuum_into_step(
                         schema.get_btree_table(table_name)
                     });
 
-                let (select_sql, insert_sql) = build_copy_sql(
+                let (select_sql, mut insert_sql) = build_copy_sql(
                     &config.escaped_schema_name,
                     &escaped_table_name,
                     source_btree_table.as_deref(),
                 )?;
+
+                // sqlite_sequence may already have rows from the AUTOINCREMENT
+                // tracking that ran during the table data copy. Use INSERT OR
+                // REPLACE so the source counter values overwrite any stale
+                // auto-generated ones (matches SQLite vacuum.c behavior).
+                if entry.is_sqlite_sequence() {
+                    insert_sql = insert_sql.replacen("INSERT INTO", "INSERT OR REPLACE INTO", 1);
+                }
 
                 // SELECT from source, INSERT into destination.
                 let select_stmt = config.source_conn.prepare_internal(&select_sql)?;
@@ -1077,6 +1085,607 @@ pub(crate) fn build_copy_sql(
         format!("INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
 
     Ok((select_sql, insert_sql))
+}
+
+// ---------------------------------------------------------------------------
+// Plain VACUUM engine - copy-back state machine
+// ---------------------------------------------------------------------------
+
+/// Sub-states for the plain VACUUM opcode state machine.
+///
+/// The opcode owns the source transaction lifecycle directly: it begins the
+/// read and write transactions on the source pager, builds a temp image via
+/// the shared temp-build engine, then copies the compacted image back into the
+/// source WAL using the batched prepare_frames → WriteBatch → commit path.
+pub(crate) enum PlainVacuumSubState {
+    /// Validate preconditions (auto_commit, active statements, readonly, memory,
+    /// MVCC, WAL-backed pager).
+    Preflight,
+    /// `pager.begin_read_tx()` on the source.
+    BeginSourceReadTx,
+    /// `pager.begin_write_tx()` on the source. May yield IO.
+    BeginSourceWriteTx,
+    /// Read source page-1 header metadata for the temp-build config.
+    ReadSourceMetadata,
+    /// Create temp DB and run the shared temp-build engine.
+    BuildTempImage {
+        config: Box<VacuumIntoConfig>,
+        temp_db: Box<InternalVacuumTempDb>,
+        state: Box<VacuumIntoState>,
+    },
+    /// Open a read transaction on the committed temp pager for copy-back reads.
+    BeginTempReadTx { temp_db: Box<InternalVacuumTempDb> },
+    /// Read a single temp page for the current batch.
+    ReadTempPage {
+        temp_db: Box<InternalVacuumTempDb>,
+        total_pages: u32,
+        /// Next page number to read (1-based). The page at `next_page - 1` is
+        /// the one we just issued a read for and are awaiting.
+        next_page: u32,
+        prev_prepared: Option<crate::storage::wal::PreparedFrames>,
+        /// Accumulated pages for the current batch.
+        batch_pages: Vec<crate::storage::pager::PageRef>,
+        /// Completion for the in-flight read.
+        read_completion: crate::io::Completion,
+        /// The PageRef being read.
+        reading_page: crate::storage::pager::PageRef,
+    },
+    /// Write a prepared batch to the WAL file.
+    WriteBatch {
+        temp_db: Box<InternalVacuumTempDb>,
+        total_pages: u32,
+        next_page: u32,
+        prev_prepared: Option<crate::storage::wal::PreparedFrames>,
+        completions: Vec<crate::io::Completion>,
+    },
+    /// Fsync the WAL if sync mode requires it.
+    SyncWal {
+        temp_db: Box<InternalVacuumTempDb>,
+        sync_completion: crate::io::Completion,
+    },
+    /// Publish: commit_prepared_frames + finish_append_frames_commit + schema reload.
+    Publish { temp_db: Box<InternalVacuumTempDb> },
+    /// Clean up after successful commit.
+    Done,
+}
+
+impl Default for PlainVacuumSubState {
+    fn default() -> Self {
+        Self::Preflight
+    }
+}
+
+/// The batch size for copy-back: how many temp pages to read per batch.
+const VACUUM_COPY_BATCH_SIZE: u32 = 64;
+
+/// Step the plain VACUUM state machine once. Returns `IO` to yield or `Step`
+/// when the entire operation is complete.
+pub(crate) fn plain_vacuum_step(
+    connection: &Arc<Connection>,
+    db: usize,
+    sub_state: &mut PlainVacuumSubState,
+) -> Result<InsnFunctionStepResult> {
+    use crate::io::WriteBatch as IOWriteBatch;
+    use crate::types::IOCompletions;
+    use crate::SyncMode;
+    use std::sync::atomic::Ordering;
+
+    loop {
+        let current = std::mem::take(sub_state);
+        match current {
+            PlainVacuumSubState::Preflight => {
+                // 1. Must be in auto-commit mode (no explicit transaction).
+                if !connection.auto_commit.load(Ordering::SeqCst) {
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM from within a transaction".to_string(),
+                    ));
+                }
+                // 2. No other active root statements on this connection.
+                if connection.n_active_root_statements.load(Ordering::SeqCst) != 1 {
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM - SQL statements in progress".to_string(),
+                    ));
+                }
+                // 3. Reject readonly database.
+                if connection.is_readonly(db) {
+                    return Err(LimboError::ReadOnly);
+                }
+                // 4. Reject MVCC mode.
+                let source_db = connection.get_source_database(db);
+                if source_db.mvcc_enabled() {
+                    return Err(LimboError::InternalError(
+                        "VACUUM is not supported in MVCC mode yet".to_string(),
+                    ));
+                }
+                // 5. Reject in-memory databases.
+                if source_db.path.starts_with(":memory:") || source_db.path.is_empty() {
+                    return Err(LimboError::InternalError(
+                        "cannot VACUUM an in-memory database".to_string(),
+                    ));
+                }
+                // 6. Reject non-WAL pagers.
+                let pager = connection.get_pager_from_database_index(&db);
+                if pager.wal.is_none() {
+                    return Err(LimboError::InternalError(
+                        "VACUUM requires a WAL-mode database".to_string(),
+                    ));
+                }
+                *sub_state = PlainVacuumSubState::BeginSourceReadTx;
+                continue;
+            }
+
+            PlainVacuumSubState::BeginSourceReadTx => {
+                let pager = connection.get_pager_from_database_index(&db);
+                pager.begin_read_tx()?;
+                *sub_state = PlainVacuumSubState::BeginSourceWriteTx;
+                continue;
+            }
+
+            PlainVacuumSubState::BeginSourceWriteTx => {
+                let pager = connection.get_pager_from_database_index(&db);
+                match pager.begin_write_tx()? {
+                    crate::IOResult::Done(()) => {
+                        // Write lock acquired. Set connection state.
+                        connection.auto_commit.store(false, Ordering::SeqCst);
+                        connection.set_tx_state(crate::connection::TransactionState::Write {
+                            schema_did_change: false,
+                        });
+                        *sub_state = PlainVacuumSubState::ReadSourceMetadata;
+                        continue;
+                    }
+                    crate::IOResult::IO(io) => {
+                        // Need to yield for IO (e.g. page1 allocation).
+                        *sub_state = PlainVacuumSubState::BeginSourceWriteTx;
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+            }
+
+            PlainVacuumSubState::ReadSourceMetadata => {
+                let source_db = connection.get_source_database(db);
+                let pager = connection.get_pager_from_database_index(&db);
+
+                // Read page size from pager (cached after begin_read_tx).
+                let page_size = pager.get_page_size().map(|ps| ps.get()).unwrap_or(4096);
+
+                // Read reserved bytes.
+                let reserved_space: u8 = match connection.get_reserved_bytes() {
+                    Some(val) => val,
+                    None => {
+                        let io = &*pager.io;
+                        io.block(|| pager.with_header(|h| h.reserved_space))?
+                    }
+                };
+
+                // Read header metadata for the destination.
+                let io = &*pager.io;
+                let destination_header: VacuumDestinationHeader = io.block(|| {
+                    pager.with_header(VacuumDestinationHeader::plain_vacuum_from_source_header)
+                })?;
+                // Create temp database.
+                let temp_db = open_internal_vacuum_temp_db(
+                    connection,
+                    &source_db,
+                    page_size,
+                    reserved_space,
+                )?;
+
+                // Capture source symbols for schema replay.
+                let source_symbols = {
+                    let syms = connection.syms.read();
+                    SourceSymbols {
+                        functions: syms
+                            .functions
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        vtab_modules: syms
+                            .vtab_modules
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        index_methods: syms
+                            .index_methods
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    }
+                };
+
+                // Capture custom types.
+                let source_custom_types: Vec<(String, Arc<TypeDef>)> =
+                    connection.with_schema(db, |schema| {
+                        schema
+                            .type_registry
+                            .iter()
+                            .filter(|(_, td)| !td.is_builtin)
+                            .map(|(name, td)| (name.clone(), td.clone()))
+                            .collect()
+                    });
+
+                let config = VacuumIntoConfig {
+                    source_conn: connection.clone(),
+                    escaped_schema_name: "main".to_string(),
+                    database_id: db,
+                    destination_header,
+                    source_symbols,
+                    source_custom_types,
+                    source_mvcc_enabled: false, // Rejected MVCC above
+                };
+
+                let vi_state = VacuumIntoState::new(temp_db.conn.clone());
+
+                *sub_state = PlainVacuumSubState::BuildTempImage {
+                    config: Box::new(config),
+                    temp_db: Box::new(temp_db),
+                    state: Box::new(vi_state),
+                };
+                continue;
+            }
+
+            PlainVacuumSubState::BuildTempImage {
+                config,
+                temp_db,
+                mut state,
+            } => {
+                match vacuum_into_step(&config, &mut state)? {
+                    InsnFunctionStepResult::Step => {
+                        // Temp build complete. Move to read tx on temp.
+                        drop(config);
+                        drop(state);
+                        *sub_state = PlainVacuumSubState::BeginTempReadTx { temp_db };
+                        continue;
+                    }
+                    InsnFunctionStepResult::IO(io) => {
+                        *sub_state = PlainVacuumSubState::BuildTempImage {
+                            config,
+                            temp_db,
+                            state,
+                        };
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    _ => unreachable!("vacuum_into_step only returns Step or IO"),
+                }
+            }
+
+            PlainVacuumSubState::BeginTempReadTx { temp_db } => {
+                // The shared temp-build engine committed via SQL COMMIT, which
+                // ends the write transaction but leaves the WAL read mark held.
+                // End that read tx first, then start a fresh one so WAL lookups
+                // see the committed temp image.
+                let temp_pager = temp_db.conn.get_pager();
+                temp_pager.end_read_tx();
+                temp_pager.begin_read_tx()?;
+
+                // Determine the compacted image size from temp page 1 header.
+                let io = &*temp_pager.io;
+                let total_pages: u32 =
+                    io.block(|| temp_pager.with_header(|h| h.database_size.get()))?;
+
+                if total_pages == 0 {
+                    // Empty database — nothing to copy back. Clean up the
+                    // source write tx and connection state we acquired earlier.
+                    drop(temp_db);
+                    let source_pager = connection.get_pager_from_database_index(&db);
+                    source_pager.end_write_tx();
+                    source_pager.end_read_tx();
+                    connection.auto_commit.store(true, Ordering::SeqCst);
+                    connection.set_tx_state(crate::connection::TransactionState::None);
+                    *sub_state = PlainVacuumSubState::Done;
+                    continue;
+                }
+
+                // Start reading the first temp page.
+                let temp_pager = temp_db.conn.get_pager();
+                let (page_ref, completion) = temp_pager.read_page_no_cache(1, None, false)?;
+
+                *sub_state = PlainVacuumSubState::ReadTempPage {
+                    temp_db,
+                    total_pages,
+                    next_page: 2, // page 1 is being read now
+                    prev_prepared: None,
+                    batch_pages: Vec::new(),
+                    read_completion: completion,
+                    reading_page: page_ref,
+                };
+                continue;
+            }
+
+            PlainVacuumSubState::ReadTempPage {
+                temp_db,
+                total_pages,
+                next_page,
+                prev_prepared,
+                mut batch_pages,
+                read_completion,
+                reading_page,
+            } => {
+                // Wait for the current read to complete.
+                if !read_completion.finished() {
+                    *sub_state = PlainVacuumSubState::ReadTempPage {
+                        temp_db,
+                        total_pages,
+                        next_page,
+                        prev_prepared,
+                        batch_pages,
+                        read_completion: read_completion.clone(),
+                        reading_page,
+                    };
+                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                        read_completion,
+                    )));
+                }
+                if !read_completion.succeeded() {
+                    return Err(LimboError::InternalError(
+                        "VACUUM: temp page read failed".to_string(),
+                    ));
+                }
+
+                // Accumulate the completed page.
+                batch_pages.push(reading_page);
+
+                // If batch is full or we've read all pages, prepare WAL frames.
+                let batch_full = batch_pages.len() >= VACUUM_COPY_BATCH_SIZE as usize;
+                let all_read = next_page > total_pages;
+
+                if batch_full || all_read {
+                    // Prepare WAL frames from this batch.
+                    let source_pager = connection.get_pager_from_database_index(&db);
+                    let wal = source_pager
+                        .wal
+                        .as_ref()
+                        .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
+                    let page_sz = source_pager.get_page_size_unchecked();
+
+                    // Initialize WAL header if needed (first batch only).
+                    if prev_prepared.is_none() {
+                        if let Some(c) = wal.prepare_wal_start(page_sz)? {
+                            source_pager.io.wait_for_completion(c)?;
+                            let c = wal.prepare_wal_finish(source_pager.get_sync_type())?;
+                            source_pager.io.wait_for_completion(c)?;
+                        }
+                    }
+
+                    let db_size_on_commit = if all_read { Some(total_pages) } else { None };
+
+                    let prepared = wal.prepare_frames(
+                        &batch_pages,
+                        page_sz,
+                        db_size_on_commit,
+                        prev_prepared.as_ref(),
+                    )?;
+
+                    // Submit writes via WriteBatch.
+                    let wal_file = wal.wal_file()?;
+                    let mut batch = IOWriteBatch::new(wal_file);
+                    batch.writev(prepared.offset, &prepared.bufs);
+                    let completions = batch.submit()?;
+
+                    *sub_state = PlainVacuumSubState::WriteBatch {
+                        temp_db,
+                        total_pages,
+                        next_page,
+                        prev_prepared: Some(prepared),
+                        completions,
+                    };
+                    continue;
+                }
+
+                // Batch not full, more pages to read. Issue next read.
+                let temp_pager = temp_db.conn.get_pager();
+                let (page_ref, completion) =
+                    temp_pager.read_page_no_cache(next_page as i64, None, false)?;
+
+                *sub_state = PlainVacuumSubState::ReadTempPage {
+                    temp_db,
+                    total_pages,
+                    next_page: next_page + 1,
+                    prev_prepared,
+                    batch_pages,
+                    read_completion: completion,
+                    reading_page: page_ref,
+                };
+                continue;
+            }
+
+            PlainVacuumSubState::WriteBatch {
+                temp_db,
+                total_pages,
+                next_page,
+                prev_prepared,
+                completions,
+            } => {
+                // Wait for all writes in this batch. We yield on the first
+                // unfinished completion; re-entry will re-check them all.
+                let pending = completions.iter().find(|c| !c.finished()).cloned();
+                if let Some(pending) = pending {
+                    *sub_state = PlainVacuumSubState::WriteBatch {
+                        temp_db,
+                        total_pages,
+                        next_page,
+                        prev_prepared,
+                        completions,
+                    };
+                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(pending)));
+                }
+
+                // Check for write errors.
+                for c in &completions {
+                    if !c.succeeded() {
+                        return Err(LimboError::InternalError(
+                            "VACUUM: WAL write failed".to_string(),
+                        ));
+                    }
+                }
+
+                // Commit this batch's prepared frames to advance WAL state.
+                let source_pager = connection.get_pager_from_database_index(&db);
+                let wal = source_pager.wal.as_ref().unwrap();
+                if let Some(ref prepared) = prev_prepared {
+                    wal.commit_prepared_frames(std::slice::from_ref(prepared));
+                }
+
+                // More pages to copy?
+                if next_page <= total_pages {
+                    // Start reading the next page.
+                    let temp_pager = temp_db.conn.get_pager();
+                    let (page_ref, completion) =
+                        temp_pager.read_page_no_cache(next_page as i64, None, false)?;
+
+                    *sub_state = PlainVacuumSubState::ReadTempPage {
+                        temp_db,
+                        total_pages,
+                        next_page: next_page + 1,
+                        prev_prepared,
+                        batch_pages: Vec::new(),
+                        read_completion: completion,
+                        reading_page: page_ref,
+                    };
+                    continue;
+                }
+
+                // All pages written. Fsync if sync mode requires it.
+                let sync_mode = connection.get_sync_mode();
+                if sync_mode == SyncMode::Full {
+                    let sync_c = wal.sync(source_pager.get_sync_type())?;
+                    *sub_state = PlainVacuumSubState::SyncWal {
+                        temp_db,
+                        sync_completion: sync_c,
+                    };
+                    continue;
+                }
+
+                // No sync needed — proceed directly to publish.
+                *sub_state = PlainVacuumSubState::Publish { temp_db };
+                continue;
+            }
+
+            PlainVacuumSubState::SyncWal {
+                temp_db,
+                sync_completion,
+            } => {
+                if !sync_completion.finished() {
+                    *sub_state = PlainVacuumSubState::SyncWal {
+                        temp_db,
+                        sync_completion: sync_completion.clone(),
+                    };
+                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                        sync_completion,
+                    )));
+                }
+                if !sync_completion.succeeded() {
+                    return Err(LimboError::InternalError(
+                        "VACUUM: WAL fsync failed".to_string(),
+                    ));
+                }
+                *sub_state = PlainVacuumSubState::Publish { temp_db };
+                continue;
+            }
+
+            PlainVacuumSubState::Publish { temp_db } => {
+                let source_pager = connection.get_pager_from_database_index(&db);
+                let wal = source_pager
+                    .wal
+                    .as_ref()
+                    .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
+
+                // Publish the WAL transaction to shared state.
+                wal.finish_append_frames_commit()?;
+
+                // Release source write lock and old read lock.
+                source_pager.end_write_tx();
+                source_pager.end_read_tx();
+
+                // Invalidate page cache and schema cookie so fresh reads see
+                // the newly committed WAL frames.
+                source_pager.clear_page_cache(false);
+                source_pager.set_schema_cookie(None);
+
+                // Drop temp resources before schema reload.
+                drop(temp_db);
+
+                // Start a fresh read tx that sees the committed WAL frames.
+                // Set tx_state to Read so `reparse_schema`'s internal
+                // Transaction opcode skips begin_read_tx (one is already active).
+                source_pager.begin_read_tx()?;
+                connection.set_tx_state(crate::connection::TransactionState::Read);
+
+                // Reload the schema from the new database pages. The compacted
+                // image may have different rootpage assignments, so the in-memory
+                // schema must be rebuilt from sqlite_schema on disk rather than
+                // reusing the old table definitions with a bumped cookie.
+                connection.reparse_schema()?;
+
+                // Publish the freshly parsed schema to the shared Database so
+                // other connections see the new cookie and table definitions.
+                {
+                    let schema = connection.schema.read().clone();
+                    let source_db = connection.get_source_database(db);
+                    source_db.update_schema_if_newer(schema);
+                }
+
+                // End the schema-reload read tx.
+                source_pager.end_read_tx();
+
+                // Restore connection state.
+                connection.auto_commit.store(true, Ordering::SeqCst);
+                connection.set_tx_state(crate::connection::TransactionState::None);
+
+                *sub_state = PlainVacuumSubState::Done;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+
+            PlainVacuumSubState::Done => {
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
+}
+
+/// Roll back the source transaction and restore connection state after a
+/// plain VACUUM failure. This must be called before dropping the vacuum
+/// opcode state to preserve rollback-before-unlock ordering.
+///
+/// The `sub_state` tells us how far the vacuum progressed; if it never got
+/// past Preflight we have not touched any pager or connection state so
+/// there is nothing to undo (and blindly resetting auto_commit / tx_state
+/// would clobber an existing user transaction).
+pub(crate) fn plain_vacuum_cleanup(
+    connection: &Arc<Connection>,
+    db: usize,
+    sub_state: &PlainVacuumSubState,
+) {
+    use std::sync::atomic::Ordering;
+
+    // Preflight is the initial check phase — no locks acquired, no
+    // connection state modified.  Nothing to clean up.
+    if matches!(sub_state, PlainVacuumSubState::Preflight) {
+        return;
+    }
+
+    // BeginSourceReadTx started a pager read tx but has not yet changed
+    // auto_commit or tx_state.  End the read lock and return.
+    if matches!(sub_state, PlainVacuumSubState::BeginSourceReadTx) {
+        let pager = connection.get_pager_from_database_index(&db);
+        pager.end_read_tx();
+        return;
+    }
+
+    // Past BeginSourceWriteTx: we modified auto_commit and tx_state and
+    // may hold a write lock.  Roll back the pager transaction and restore
+    // connection state.
+    let tx_state = connection.get_tx_state();
+    if matches!(
+        tx_state,
+        crate::connection::TransactionState::Write { .. }
+            | crate::connection::TransactionState::Read
+    ) {
+        let pager = connection.get_pager_from_database_index(&db);
+        pager.rollback_tx(connection);
+    }
+
+    connection.auto_commit.store(true, Ordering::SeqCst);
+    connection.set_tx_state(crate::connection::TransactionState::None);
 }
 
 #[cfg(test)]

@@ -50,7 +50,7 @@ use crate::{
             OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState,
             OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
             OpNoConflictState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
-            OpVacuumIntoState,
+            OpVacuumIntoState, OpVacuumState,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -467,6 +467,7 @@ pub struct ProgramState {
     op_transaction_state: OpTransactionState,
     op_journal_mode_state: OpJournalModeState,
     op_vacuum_into_state: Option<OpVacuumIntoState>,
+    pub(crate) op_vacuum_state: Option<OpVacuumState>,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -583,6 +584,7 @@ impl ProgramState {
             op_transaction_state: OpTransactionState::Start,
             op_journal_mode_state: OpJournalModeState::default(),
             op_vacuum_into_state: None,
+            op_vacuum_state: None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -2060,6 +2062,16 @@ impl Program {
                 &mut abort_error,
                 err,
                 "Failed to clean up VACUUM INTO state during abort",
+            );
+        }
+
+        // Plain VACUUM owns the source transaction directly. Roll back and
+        // restore connection state before any further abort logic.
+        if let Err(err) = execute::cleanup_op_vacuum_state(&self.connection, state) {
+            capture_abort_error(
+                &mut abort_error,
+                err,
+                "Failed to clean up VACUUM state during abort",
             );
         }
 
