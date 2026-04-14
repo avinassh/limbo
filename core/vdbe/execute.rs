@@ -14112,7 +14112,7 @@ pub(crate) enum OpVacuumIntoSubState {
     #[default]
     Init,
     /// Build compacted destination database
-    Build(Box<crate::vdbe::vacuum::VacuumInto>),
+    Build,
     /// Operation complete
     Done,
 }
@@ -14125,6 +14125,13 @@ pub(crate) struct OpVacuumIntoState {
     database_id: usize,
     /// Escaped schema name for safe SQL interpolation
     escaped_schema_name: String,
+    /// Keep dest_db alive while vacuum is in progress.
+    #[allow(dead_code)]
+    dest_db: Option<Arc<crate::Database>>,
+    /// Configuration for the shared VACUUM INTO build state machine.
+    vacuum_into_config: Option<crate::vdbe::vacuum::VacuumIntoConfig>,
+    /// State for the shared VACUUM INTO build state machine.
+    vacuum_into_state: Option<crate::vdbe::vacuum::VacuumIntoState>,
 }
 
 /// VACUUM INTO - create a compacted copy of the database at the specified path.
@@ -14346,6 +14353,30 @@ fn op_vacuum_into_inner(
                 // must be set before page 1 is allocated (before any schema operations)
                 dest_conn.set_reserved_bytes(reserved_space)?;
 
+                // Capture source symbols needed for schema replay (functions, vtab
+                // modules, index methods). We skip vtabs - those are live instances
+                // tied to the source connection and not needed for compiling schema SQL.
+                let source_symbols = {
+                    let source_syms = program.connection.syms.read();
+                    SourceSymbols {
+                        functions: source_syms
+                            .functions
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        vtab_modules: source_syms
+                            .vtab_modules
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        index_methods: source_syms
+                            .index_methods
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    }
+                };
+
                 // Capture source custom type definitions so that STRICT tables with
                 // custom type columns can resolve those types during CREATE TABLE
                 // replay on the destination.
@@ -14370,22 +14401,37 @@ fn op_vacuum_into_inner(
                     source_mvcc_enabled: source_db.mvcc_enabled(),
                 };
 
-                vacuum_state.sub_state = OpVacuumIntoSubState::Build(Box::new(VacuumInto::new(
-                    config, dest_db, dest_conn,
-                )));
+                vacuum_state.dest_db = Some(dest_db);
+                vacuum_state.vacuum_into_config = Some(config);
+                vacuum_state.vacuum_into_state = Some(VacuumIntoState::new(dest_conn));
+                vacuum_state.sub_state = OpVacuumIntoSubState::Build;
                 continue;
             }
 
-            OpVacuumIntoSubState::Build(mut vacuum_into) => match vacuum_into.step()? {
-                IOResult::Done(()) => {
-                    vacuum_state.sub_state = OpVacuumIntoSubState::Done;
-                    continue;
+            OpVacuumIntoSubState::Build => {
+                let config = vacuum_state
+                    .vacuum_into_config
+                    .as_ref()
+                    .expect("VacuumIntoConfig must be set in Build state");
+                let vi_state = vacuum_state
+                    .vacuum_into_state
+                    .as_mut()
+                    .expect("VacuumIntoState must be set in Build state");
+
+                match vacuum_into_step(config, vi_state)? {
+                    InsnFunctionStepResult::Step => {
+                        vacuum_state.sub_state = OpVacuumIntoSubState::Done;
+                        continue;
+                    }
+                    InsnFunctionStepResult::IO(io) => {
+                        vacuum_state.sub_state = OpVacuumIntoSubState::Build;
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    InsnFunctionStepResult::Done | InsnFunctionStepResult::Row => {
+                        unreachable!("vacuum_into_step only returns Step or IO")
+                    }
                 }
-                IOResult::IO(io) => {
-                    vacuum_state.sub_state = OpVacuumIntoSubState::Build(vacuum_into);
-                    return Ok(InsnFunctionStepResult::IO(io));
-                }
-            },
+            }
 
             OpVacuumIntoSubState::Done => {
                 // Commit the source transaction started in Init.

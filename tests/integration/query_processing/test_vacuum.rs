@@ -3506,3 +3506,55 @@ fn test_plain_vacuum_rejects_active_statement(tmp_db: TempDatabase) -> anyhow::R
     stmt.reset()?;
     Ok(())
 }
+
+/// Plain VACUUM reduces page_count when rows are deleted, and a subsequent
+/// checkpoint truncates the .db file to the compacted size.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
+fn test_plain_vacuum_reduces_page_count(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Insert enough data to grow the database well past the minimum.
+    for i in 0..200 {
+        conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", "x".repeat(100)))?;
+    }
+
+    let pre_pages: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
+    assert!(
+        pre_pages[0].0 > 5,
+        "source should have multiple pages, got: {}",
+        pre_pages[0].0
+    );
+
+    // Delete most rows to create free pages.
+    conn.execute("DELETE FROM t WHERE a >= 10")?;
+
+    // page_count should not have decreased yet (deleted pages are on freelist).
+    let after_delete_pages: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
+    assert_eq!(after_delete_pages[0].0, pre_pages[0].0);
+
+    conn.execute("VACUUM")?;
+
+    // After VACUUM the compacted image should be smaller.
+    let post_vacuum_pages: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
+    assert!(
+        post_vacuum_pages[0].0 < pre_pages[0].0,
+        "page_count should decrease after VACUUM: before={}, after={}",
+        pre_pages[0].0,
+        post_vacuum_pages[0].0
+    );
+
+    // Checkpoint to flush WAL into .db file.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    // After checkpoint the reported page count should still reflect the
+    // compacted size.
+    let post_checkpoint_pages: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
+    assert_eq!(post_checkpoint_pages[0].0, post_vacuum_pages[0].0);
+
+    // Data integrity: the 10 remaining rows should be intact.
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(rows[0].0, 10);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}

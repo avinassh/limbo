@@ -1,6 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::LimboError;
+use crate::ext::VTabImpl;
+use crate::function::ExternalFunc;
+use crate::index_method::IndexMethod;
 use crate::schema::TypeDef;
 use crate::storage::sqlite3_ondisk::{CacheSize, DatabaseHeader, TextEncoding};
 use crate::util::IOExt;
@@ -343,35 +347,11 @@ pub(crate) struct VacuumIntoConfig {
     pub source_mvcc_enabled: bool,
 }
 
-pub(crate) struct VacuumInto {
-    config: VacuumIntoConfig,
-    state: VacuumIntoState,
-}
-
-impl VacuumInto {
-    pub fn new(
-        config: VacuumIntoConfig,
-        dest_db: Arc<Database>,
-        dest_conn: Arc<Connection>,
-    ) -> Self {
-        Self {
-            config,
-            state: VacuumIntoState::new(dest_db, dest_conn),
-        }
-    }
-
-    pub fn step(&mut self) -> Result<IOResult<()>> {
-        vacuum_into_step(&self.config, &mut self.state)
-    }
-}
-
 /// State for the VACUUM INTO engine. Holds the destination connection and all
 /// intermediate state needed across async yields.
-struct VacuumIntoState {
-    /// Keep the destination database alive while VACUUM INTO is in progress.
-    #[allow(dead_code)]
-    dest_db: Arc<Database>,
-    dest_conn: Arc<Connection>,
+pub(crate) struct VacuumIntoState {
+    /// Destination connection - lives here, not in each sub-state variant.
+    pub dest_conn: Arc<Connection>,
     sub_state: VacuumIntoSubState,
     /// Typed schema entries collected from sqlite_schema, ordered by rowid.
     schema_entries: Vec<SchemaEntry>,
@@ -379,16 +359,15 @@ struct VacuumIntoState {
     tables_to_create: Vec<usize>,
     /// Storage-backed tables whose data to copy.
     tables_to_copy: Vec<usize>,
-    /// User-defined secondary indexes to CREATE.
+    /// User-defined secondary indexes to CREATE (deferred for performance).
     indexes_to_create: Vec<usize>,
-    /// Triggers, views, custom indexes, and rootpage = 0 objects.
+    /// Triggers, views, and rootpage = 0 objects (deferred to avoid trigger firing).
     post_data_entries: Vec<usize>,
 }
 
 impl VacuumIntoState {
-    fn new(dest_db: Arc<Database>, dest_conn: Arc<Connection>) -> Self {
+    pub fn new(dest_conn: Arc<Connection>) -> Self {
         Self {
-            dest_db,
             dest_conn,
             sub_state: VacuumIntoSubState::Init,
             schema_entries: Vec::new(),
@@ -406,7 +385,7 @@ impl VacuumIntoState {
 
 /// Sub-states for the VACUUM INTO engine state machine.
 #[derive(Default)]
-enum VacuumIntoSubState {
+pub(crate) enum VacuumIntoSubState {
     /// Mirror symbols/types, set perf flags, begin dest tx, prepare schema query.
     #[default]
     Init,
@@ -475,7 +454,7 @@ enum VacuumIntoSubState {
 pub(crate) fn vacuum_into_step(
     config: &VacuumIntoConfig,
     state: &mut VacuumIntoState,
-) -> Result<IOResult<()>> {
+) -> Result<InsnFunctionStepResult> {
     loop {
         let current_sub_state = std::mem::take(&mut state.sub_state);
 
@@ -485,22 +464,24 @@ pub(crate) fn vacuum_into_step(
                 // modules, index methods). We skip vtabs - those are live instances
                 // tied to the source connection and not needed for compiling schema SQL.
                 {
-                    let source_syms = config.source_conn.syms.read();
                     let mut dest_syms = state.dest_conn.syms.write();
                     dest_syms.functions.extend(
-                        source_syms
+                        config
+                            .source_symbols
                             .functions
                             .iter()
                             .map(|(k, v)| (k.clone(), v.clone())),
                     );
                     dest_syms.vtab_modules.extend(
-                        source_syms
+                        config
+                            .source_symbols
                             .vtab_modules
                             .iter()
                             .map(|(k, v)| (k.clone(), v.clone())),
                     );
                     dest_syms.index_methods.extend(
-                        source_syms
+                        config
+                            .source_symbols
                             .index_methods
                             .iter()
                             .map(|(k, v)| (k.clone(), v.clone())),
@@ -595,7 +576,7 @@ pub(crate) fn vacuum_into_step(
                             .take_io_completions()
                             .expect("StepResult::IO returned but no completions available");
                         state.sub_state = VacuumIntoSubState::CollectSchemaRows { schema_stmt };
-                        return Ok(IOResult::IO(io));
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
                         return Err(LimboError::Busy);
@@ -659,7 +640,7 @@ pub(crate) fn vacuum_into_step(
                         dest_schema_stmt,
                         idx,
                     };
-                    return Ok(IOResult::IO(io));
+                    return Ok(InsnFunctionStepResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
@@ -793,7 +774,7 @@ pub(crate) fn vacuum_into_step(
                         dest_insert_stmt,
                         table_idx,
                     };
-                    return Ok(IOResult::IO(io));
+                    return Ok(InsnFunctionStepResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
@@ -826,7 +807,7 @@ pub(crate) fn vacuum_into_step(
                         dest_insert_stmt,
                         table_idx,
                     };
-                    return Ok(IOResult::IO(io));
+                    return Ok(InsnFunctionStepResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
@@ -874,7 +855,7 @@ pub(crate) fn vacuum_into_step(
                         dest_schema_stmt,
                         idx,
                     };
-                    return Ok(IOResult::IO(io));
+                    return Ok(InsnFunctionStepResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
@@ -918,7 +899,7 @@ pub(crate) fn vacuum_into_step(
                         dest_schema_stmt,
                         idx,
                     };
-                    return Ok(IOResult::IO(io));
+                    return Ok(InsnFunctionStepResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
@@ -941,7 +922,7 @@ pub(crate) fn vacuum_into_step(
             VacuumIntoSubState::Done => {
                 // Commit the destination transaction started in Init state.
                 state.dest_conn.execute("COMMIT")?;
-                return Ok(IOResult::Done(()));
+                return Ok(InsnFunctionStepResult::Step);
             }
         }
     }
@@ -1115,6 +1096,17 @@ pub(crate) enum PlainVacuumSubState {
     },
     /// Open a read transaction on the committed temp pager for copy-back reads.
     BeginTempReadTx { temp_db: Box<InternalVacuumTempDb> },
+    /// Initialize the source WAL header if needed (one-time before first batch).
+    /// Two IO steps: write the header, then fsync to set `initialized = true`.
+    PrepareSourceWal {
+        temp_db: Box<InternalVacuumTempDb>,
+        total_pages: u32,
+        /// The completion to wait on: first the header write, then the fsync.
+        completion: crate::io::Completion,
+        /// `false` while waiting for the header write, `true` while waiting for
+        /// the fsync from `prepare_wal_finish`.
+        fsync_phase: bool,
+    },
     /// Read a single temp page for the current batch.
     ReadTempPage {
         temp_db: Box<InternalVacuumTempDb>,
@@ -1375,7 +1367,26 @@ pub(crate) fn plain_vacuum_step(
                     continue;
                 }
 
-                // Start reading the first temp page.
+                // Initialize the source WAL header before the first batch.
+                let source_pager = connection.get_pager_from_database_index(&db);
+                let wal = source_pager
+                    .wal
+                    .as_ref()
+                    .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
+                let page_sz = source_pager.get_page_size_unchecked();
+
+                if let Some(header_write_c) = wal.prepare_wal_start(page_sz)? {
+                    // WAL not yet initialized — yield on the header write.
+                    *sub_state = PlainVacuumSubState::PrepareSourceWal {
+                        temp_db,
+                        total_pages,
+                        completion: header_write_c,
+                        fsync_phase: false,
+                    };
+                    continue;
+                }
+
+                // WAL already initialized — go straight to reading temp pages.
                 let temp_pager = temp_db.conn.get_pager();
                 let (page_ref, completion) = temp_pager.read_page_no_cache(1, None, false)?;
 
@@ -1386,6 +1397,60 @@ pub(crate) fn plain_vacuum_step(
                     prev_prepared: None,
                     batch_pages: Vec::new(),
                     read_completion: completion,
+                    reading_page: page_ref,
+                };
+                continue;
+            }
+
+            PlainVacuumSubState::PrepareSourceWal {
+                temp_db,
+                total_pages,
+                completion,
+                fsync_phase,
+            } => {
+                if !completion.finished() {
+                    *sub_state = PlainVacuumSubState::PrepareSourceWal {
+                        temp_db,
+                        total_pages,
+                        completion: completion.clone(),
+                        fsync_phase,
+                    };
+                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                        completion,
+                    )));
+                }
+                if !completion.succeeded() {
+                    return Err(LimboError::InternalError(
+                        "VACUUM: WAL header init failed".to_string(),
+                    ));
+                }
+
+                if !fsync_phase {
+                    // Header write done — issue the fsync via prepare_wal_finish
+                    // to set WAL `initialized = true`.
+                    let source_pager = connection.get_pager_from_database_index(&db);
+                    let wal = source_pager.wal.as_ref().unwrap();
+                    let sync_c = wal.prepare_wal_finish(source_pager.get_sync_type())?;
+                    *sub_state = PlainVacuumSubState::PrepareSourceWal {
+                        temp_db,
+                        total_pages,
+                        completion: sync_c,
+                        fsync_phase: true,
+                    };
+                    continue;
+                }
+
+                // WAL header fully initialized. Start reading temp pages.
+                let temp_pager = temp_db.conn.get_pager();
+                let (page_ref, read_c) = temp_pager.read_page_no_cache(1, None, false)?;
+
+                *sub_state = PlainVacuumSubState::ReadTempPage {
+                    temp_db,
+                    total_pages,
+                    next_page: 2,
+                    prev_prepared: None,
+                    batch_pages: Vec::new(),
+                    read_completion: read_c,
                     reading_page: page_ref,
                 };
                 continue;
@@ -1429,22 +1494,14 @@ pub(crate) fn plain_vacuum_step(
                 let all_read = next_page > total_pages;
 
                 if batch_full || all_read {
-                    // Prepare WAL frames from this batch.
+                    // Prepare WAL frames from this batch. WAL header was already
+                    // initialized in PrepareSourceWal before reading started.
                     let source_pager = connection.get_pager_from_database_index(&db);
                     let wal = source_pager
                         .wal
                         .as_ref()
                         .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
                     let page_sz = source_pager.get_page_size_unchecked();
-
-                    // Initialize WAL header if needed (first batch only).
-                    if prev_prepared.is_none() {
-                        if let Some(c) = wal.prepare_wal_start(page_sz)? {
-                            source_pager.io.wait_for_completion(c)?;
-                            let c = wal.prepare_wal_finish(source_pager.get_sync_type())?;
-                            source_pager.io.wait_for_completion(c)?;
-                        }
-                    }
 
                     let db_size_on_commit = if all_read { Some(total_pages) } else { None };
 
@@ -1518,7 +1575,15 @@ pub(crate) fn plain_vacuum_step(
                     }
                 }
 
-                // Commit this batch's prepared frames to advance WAL state.
+                // Commit this batch's prepared frames to advance local WAL
+                // index state (page→frame mapping, max_frame, checksum).
+                //
+                // We intentionally skip finalize_committed_pages() here. That
+                // call clears dirty flags and sets WAL tags on PageRefs that
+                // live in the source page cache. Our pages come from the temp
+                // pager's read_page_no_cache — they are not in the source page
+                // cache and have no dirty state to clear. The source page cache
+                // is invalidated wholesale via clear_page_cache() in Publish.
                 let source_pager = connection.get_pager_from_database_index(&db);
                 let wal = source_pager.wal.as_ref().unwrap();
                 if let Some(ref prepared) = prev_prepared {
@@ -1544,7 +1609,10 @@ pub(crate) fn plain_vacuum_step(
                     continue;
                 }
 
-                // All pages written. Fsync if sync mode requires it.
+                // All pages written. Fsync WAL if sync mode requires it.
+                // NORMAL mode skips fsync on WAL commit (fsyncs happen on
+                // checkpoint and WAL restart instead). This matches the regular
+                // pager commit path in Pager::commit_tx / CommitState.
                 let sync_mode = connection.get_sync_mode();
                 if sync_mode == SyncMode::Full {
                     let sync_c = wal.sync(source_pager.get_sync_type())?;
