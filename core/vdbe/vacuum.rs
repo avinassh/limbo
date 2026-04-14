@@ -216,6 +216,10 @@ impl VacuumIntoState {
             post_data_entries: Vec::new(),
         }
     }
+
+    pub(crate) fn cleanup_after_error(&mut self) {
+        self.sub_state = VacuumIntoSubState::Done;
+    }
 }
 
 /// Sub-states for the VACUUM INTO engine state machine.
@@ -339,7 +343,7 @@ fn vacuum_into_step(
                 }
 
                 // Performance optimizations for destination database (matches SQLite vacuum.c):
-                // 1. Disable fsync - destination is a new file, if crash occurs we just delete it
+                // 1. Disable fsync - destination is a new user-visible output file
                 // 2. Disable foreign key checks - source data is already consistent
                 // These match SQLite's vacuum.c optimizations (PAGER_SYNCHRONOUS_OFF, ~SQLITE_ForeignKeys)
                 state.dest_conn.set_sync_mode(crate::SyncMode::Off);

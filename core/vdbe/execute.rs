@@ -14164,11 +14164,46 @@ pub fn op_vacuum_into(
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
         Err(err) => {
-            // Reset state on error
-            state.op_vacuum_into_state = None;
+            if let Err(cleanup_err) = cleanup_op_vacuum_into_state(&program.connection, state) {
+                tracing::error!("VACUUM INTO cleanup failed after error: {cleanup_err}");
+            }
             Err(err)
         }
     }
+}
+
+pub(crate) fn cleanup_op_vacuum_into_state(
+    connection: &Arc<Connection>,
+    state: &mut ProgramState,
+) -> Result<()> {
+    let Some(mut vacuum_state) = state.op_vacuum_into_state.take() else {
+        return Ok(());
+    };
+
+    let mut cleanup_error = None;
+
+    if let Some(vacuum_into_state) = vacuum_state.vacuum_into_state.as_mut() {
+        vacuum_into_state.cleanup_after_error();
+    }
+
+    vacuum_state.vacuum_into_state = None;
+    vacuum_state.dest_db = None;
+
+    if state.auto_txn_cleanup == TxnCleanup::RollbackTxn {
+        match connection.execute("ROLLBACK") {
+            Ok(()) => {
+                state.auto_txn_cleanup = TxnCleanup::None;
+            }
+            Err(err) => {
+                cleanup_error.get_or_insert(err);
+            }
+        }
+    }
+
+    if let Some(err) = cleanup_error {
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn op_vacuum_into_inner(
@@ -14288,6 +14323,8 @@ fn op_vacuum_into_inner(
                     .with_views(source_db.experimental_views_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled())
                     .with_custom_types(source_db.experimental_custom_types_enabled())
+                    .with_encryption(source_db.experimental_encryption_enabled())
+                    .with_attach(source_db.experimental_attach_enabled())
                     .with_generated_columns(source_db.experimental_generated_columns_enabled());
 
                 // Always use PlatformIO for the destination file, even if source
@@ -14488,6 +14525,66 @@ mod tests {
         let partition_idx = ht.partition_for_keys(&probe_key);
 
         (ht, probe_key, partition_idx)
+    }
+
+    #[test]
+    fn test_vacuum_into_busy_after_source_begin_rolls_back_source_txn() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        let source_txn_progress_calls = Arc::new(AtomicUsize::new(0));
+        let did_interrupt = Arc::new(AtomicBool::new(false));
+        let conn_for_progress = conn.clone();
+        let source_txn_progress_calls_for_handler = source_txn_progress_calls.clone();
+        let did_interrupt_for_handler = did_interrupt.clone();
+        conn.set_progress_handler(
+            1,
+            Some(Box::new(move || {
+                if !conn_for_progress.get_auto_commit() {
+                    let calls =
+                        source_txn_progress_calls_for_handler.fetch_add(1, Ordering::SeqCst);
+                    calls >= 10 && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
+                } else {
+                    false
+                }
+            })),
+        );
+
+        let dest_dir = tempfile::TempDir::new().unwrap();
+        let dest_path = dest_dir.path().join("busy_vacuum.db");
+        let dest_path = dest_path.to_str().expect("temp path should be UTF-8");
+        let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path}'")).unwrap();
+        let step = stmt.step().unwrap();
+        conn.set_progress_handler(0, None);
+
+        assert!(
+            matches!(step, StepResult::Busy),
+            "progress interruption inside VACUUM INTO should surface as Busy, got {step:?}"
+        );
+        assert!(
+            source_txn_progress_calls.load(Ordering::SeqCst) > 10,
+            "test should interrupt after VACUUM INTO opens the source transaction"
+        );
+        assert!(
+            did_interrupt.load(Ordering::SeqCst),
+            "progress handler should have interrupted VACUUM INTO exactly once"
+        );
+        assert!(
+            conn.get_auto_commit(),
+            "Busy cleanup should roll back the source transaction before returning"
+        );
     }
 
     #[test]

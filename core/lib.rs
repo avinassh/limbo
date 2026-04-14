@@ -1720,6 +1720,10 @@ impl Database {
         self.opts.enable_custom_types
     }
 
+    pub fn experimental_encryption_enabled(&self) -> bool {
+        self.opts.enable_encryption
+    }
+
     pub fn experimental_attach_enabled(&self) -> bool {
         self.opts.enable_attach
     }
