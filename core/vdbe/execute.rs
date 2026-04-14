@@ -14140,7 +14140,7 @@ pub(crate) struct OpVacuumIntoState {
 ///    internal storage-backed tables
 /// 5. Creates user-defined secondary indexes after data copy for performance
 ///    (backing-btree indexes for custom index methods are excluded here)
-/// 6. Copies meta values (user_version, application_id) from source to destination
+/// 6. Finalizes destination page-1 metadata
 /// 7. Creates triggers, views, and rootpage = 0 objects last (after data copy).
 ///    Custom index methods (FTS, vector) recreate and backfill their backing
 ///    indexes from the copied table data in this phase.
@@ -14211,7 +14211,10 @@ fn op_vacuum_into_inner(
     state: &mut ProgramState,
     insn: &Insn,
 ) -> Result<InsnFunctionStepResult> {
-    use crate::vdbe::vacuum::{VacuumInto, VacuumIntoConfig};
+    use crate::vdbe::vacuum::{
+        vacuum_destination_opts, vacuum_into_step, SourceSymbols, VacuumDestinationHeader,
+        VacuumIntoConfig, VacuumIntoState,
+    };
 
     load_insn!(
         VacuumInto {
@@ -14281,24 +14284,29 @@ fn op_vacuum_into_inner(
                 let source_db = program.connection.get_source_database(database_id);
                 program.connection.execute("BEGIN")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                let user_version: i32 = extract_pragma_int(
-                    &program
-                        .connection
-                        .pragma_query(&format!("\"{escaped_schema_name}\".user_version"))?,
-                    "user_version",
-                )?;
-                let application_id: i32 = extract_pragma_int(
-                    &program
-                        .connection
-                        .pragma_query(&format!("\"{escaped_schema_name}\".application_id"))?,
-                    "application_id",
-                )?;
                 let page_size: u32 = extract_pragma_int(
                     &program
                         .connection
                         .pragma_query(&format!("\"{escaped_schema_name}\".page_size"))?,
                     "page_size",
                 )?;
+                let source_pager = program
+                    .connection
+                    .get_pager_from_database_index(&database_id);
+                let destination_header = if let Some(mv_store) =
+                    program.connection.mv_store_for_db(database_id)
+                {
+                    let tx_id = program.connection.get_mv_tx_id_for_db(database_id);
+                    mv_store.with_header(
+                        VacuumDestinationHeader::vacuum_into_from_source_header,
+                        tx_id.as_ref(),
+                    )?
+                } else {
+                    source_pager.io.block(|| {
+                        source_pager
+                            .with_header(VacuumDestinationHeader::vacuum_into_from_source_header)
+                    })?
+                };
 
                 let reserved_space: u8 = if !is_attached_db(database_id) {
                     // For main or temp db prefer cached value to avoid blocking I/O
@@ -14319,13 +14327,7 @@ fn op_vacuum_into_inner(
 
                 // Mirror source feature flags to the destination so schema replay
                 // can resolve custom types, generated columns, vtab modules, etc.
-                let dest_opts = crate::DatabaseOpts::new()
-                    .with_views(source_db.experimental_views_enabled())
-                    .with_index_method(source_db.experimental_index_method_enabled())
-                    .with_custom_types(source_db.experimental_custom_types_enabled())
-                    .with_encryption(source_db.experimental_encryption_enabled())
-                    .with_attach(source_db.experimental_attach_enabled())
-                    .with_generated_columns(source_db.experimental_generated_columns_enabled());
+                let dest_opts = vacuum_destination_opts(&source_db);
 
                 // Always use PlatformIO for the destination file, even if source
                 // is in-memory. This ensures VACUUM INTO writes to disk.
@@ -14362,8 +14364,8 @@ fn op_vacuum_into_inner(
                     source_conn: program.connection.clone(),
                     escaped_schema_name: escaped_schema_name.clone(),
                     database_id,
-                    source_user_version: user_version,
-                    source_application_id: application_id,
+                    destination_header,
+                    source_symbols,
                     source_custom_types,
                     source_mvcc_enabled: source_db.mvcc_enabled(),
                 };

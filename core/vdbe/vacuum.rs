@@ -2,9 +2,11 @@ use std::sync::Arc;
 
 use crate::error::LimboError;
 use crate::schema::TypeDef;
+use crate::storage::sqlite3_ondisk::{CacheSize, DatabaseHeader, TextEncoding};
 use crate::types::IOResult;
+use crate::vdbe::execute::InsnFunctionStepResult;
 use crate::Result;
-use crate::{Connection, Database};
+use crate::{Connection, Database, DatabaseOpts, EncryptionOpts, OpenFlags};
 use turso_macros::turso_assert;
 
 /// A representation of a row from `sqlite_schema`.
@@ -141,6 +143,186 @@ pub(crate) fn classify_schema_entries(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Destination configuration and metadata policy
+// ---------------------------------------------------------------------------
+
+/// Destination feature flags needed for schema replay during a vacuum build.
+pub(crate) fn vacuum_destination_opts(source_db: &Database) -> DatabaseOpts {
+    DatabaseOpts::new()
+        .with_views(source_db.experimental_views_enabled())
+        .with_index_method(source_db.experimental_index_method_enabled())
+        .with_custom_types(source_db.experimental_custom_types_enabled())
+        .with_encryption(source_db.experimental_encryption_enabled())
+        .with_attach(source_db.experimental_attach_enabled())
+        .with_generated_columns(source_db.experimental_generated_columns_enabled())
+}
+
+/// Page-1 metadata that the build engine must finalize before destination commit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VacuumHeaderMetadata {
+    schema_cookie: u32,
+    default_page_cache_size: CacheSize,
+    text_encoding: TextEncoding,
+    user_version: i32,
+    application_id: i32,
+}
+
+impl VacuumHeaderMetadata {
+    fn from_source_header(source: &DatabaseHeader) -> Self {
+        Self {
+            schema_cookie: source.schema_cookie.get().wrapping_add(1),
+            default_page_cache_size: source.default_page_cache_size,
+            text_encoding: source.text_encoding,
+            user_version: source.user_version.get(),
+            application_id: source.application_id.get(),
+        }
+    }
+
+    fn apply_to(self, header: &mut DatabaseHeader) {
+        header.schema_cookie = self.schema_cookie.into();
+        header.default_page_cache_size = self.default_page_cache_size;
+        header.text_encoding = self.text_encoding;
+        header.user_version = self.user_version.into();
+        header.application_id = self.application_id.into();
+    }
+}
+
+/// Header policy for the compacted destination image.
+pub(crate) enum VacuumDestinationHeader {
+    /// `VACUUM INTO` creates an independent output database, but SQLite still
+    /// writes the same compacted-image metadata as plain `VACUUM`.
+    VacuumInto(VacuumHeaderMetadata),
+    /// Plain `VACUUM` builds a replacement image, so the temp image's page 1
+    /// must already contain the final source header values before copy-back.
+    #[allow(dead_code)]
+    PlainVacuum(VacuumHeaderMetadata),
+}
+
+impl VacuumDestinationHeader {
+    pub(crate) fn vacuum_into_from_source_header(source: &DatabaseHeader) -> Self {
+        Self::VacuumInto(VacuumHeaderMetadata::from_source_header(source))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn plain_vacuum_from_source_header(source: &DatabaseHeader) -> Self {
+        Self::PlainVacuum(VacuumHeaderMetadata::from_source_header(source))
+    }
+
+    fn metadata(&self) -> VacuumHeaderMetadata {
+        match self {
+            Self::VacuumInto(metadata) | Self::PlainVacuum(metadata) => *metadata,
+        }
+    }
+}
+
+/// File-backed internal temp database used by plain `VACUUM`.
+///
+/// The temp directory is dropped after the connection and database handles so
+/// host files can be closed before the directory cleanup runs.
+#[allow(dead_code)]
+pub(crate) struct InternalVacuumTempDb {
+    pub conn: Arc<Connection>,
+    pub db: Arc<Database>,
+    pub path: String,
+    #[cfg(not(target_family = "wasm"))]
+    _temp_dir: tempfile::TempDir,
+}
+
+#[allow(dead_code)]
+fn internal_temp_encryption(
+    source_conn: &Arc<Connection>,
+) -> Result<(Option<EncryptionOpts>, Option<crate::EncryptionKey>)> {
+    let Some(cipher_mode) = source_conn.get_encryption_cipher_mode() else {
+        return Ok((None, None));
+    };
+    let encryption_key = source_conn.encryption_key.read().clone().ok_or_else(|| {
+        LimboError::InternalError(
+            "encrypted plain VACUUM temp image requires source encryption key".to_string(),
+        )
+    })?;
+    let encryption_opts = EncryptionOpts {
+        cipher: cipher_mode.to_string(),
+        hexkey: hex::encode(encryption_key.as_slice()),
+    };
+    Ok((Some(encryption_opts), Some(encryption_key)))
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[allow(dead_code)]
+pub(crate) fn open_internal_vacuum_temp_db(
+    source_conn: &Arc<Connection>,
+    source_db: &Arc<Database>,
+    page_size: u32,
+    reserved_space: u8,
+) -> Result<InternalVacuumTempDb> {
+    let temp_dir = tempfile::tempdir().map_err(|e| crate::error::io_error(e, "tempdir"))?;
+    let path = temp_dir.path().join("tursodb_vacuum_temp.db");
+    let path = path
+        .to_str()
+        .ok_or_else(|| LimboError::InternalError("vacuum temp path is not valid UTF-8".into()))?
+        .to_string();
+
+    let (encryption_opts, encryption_key) = internal_temp_encryption(source_conn)?;
+    let db = Database::open_file_with_flags(
+        source_db.io.clone(),
+        &path,
+        OpenFlags::Create,
+        vacuum_destination_opts(source_db),
+        encryption_opts,
+    )?;
+    let conn = db.connect_with_encryption(encryption_key)?;
+    conn.reset_page_size(page_size)?;
+    conn.set_reserved_bytes(reserved_space)?;
+    conn.wal_auto_checkpoint_disable();
+
+    Ok(InternalVacuumTempDb {
+        conn,
+        db,
+        path,
+        _temp_dir: temp_dir,
+    })
+}
+
+#[cfg(target_family = "wasm")]
+#[allow(dead_code)]
+pub(crate) fn open_internal_vacuum_temp_db(
+    _source_conn: &Arc<Connection>,
+    _source_db: &Arc<Database>,
+    _page_size: u32,
+    _reserved_space: u8,
+) -> Result<InternalVacuumTempDb> {
+    Err(LimboError::InternalError(
+        "plain VACUUM requires a file-backed internal temp database".to_string(),
+    ))
+}
+
+fn finalize_destination_header(
+    dest_conn: &Arc<Connection>,
+    destination_header: &VacuumDestinationHeader,
+) -> Result<crate::IOResult<()>> {
+    let metadata = destination_header.metadata();
+    if let Some(mv_store) = dest_conn.mv_store_for_db(crate::MAIN_DB_ID) {
+        let tx_id = dest_conn.get_mv_tx_id_for_db(crate::MAIN_DB_ID);
+        return mv_store
+            .with_header_mut(|header| metadata.apply_to(header), tx_id.as_ref())
+            .map(crate::IOResult::Done);
+    }
+    let pager = dest_conn.pager.load();
+    pager.with_header_mut(|header| metadata.apply_to(header))
+}
+
+// ---------------------------------------------------------------------------
+// VACUUM INTO engine - reusable "build compacted copy" state machine
+// ---------------------------------------------------------------------------
+
+/// Pre-captured source symbols needed for schema replay on the destination.
+pub(crate) struct SourceSymbols {
+    pub functions: HashMap<String, Arc<ExternalFunc>>,
+    pub vtab_modules: HashMap<String, Arc<VTabImpl>>,
+    pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
+}
+
 /// Configuration for the VACUUM INTO engine. Provided by the caller (opcode
 /// handler) after reading source metadata and setting up the destination DB.
 pub(crate) struct VacuumIntoConfig {
@@ -151,10 +333,10 @@ pub(crate) struct VacuumIntoConfig {
     pub escaped_schema_name: String,
     /// Database index for schema lookups on the source connection.
     pub database_id: usize,
-    /// Source `user_version` pragma value to copy to destination.
-    pub source_user_version: i32,
-    /// Source `application_id` pragma value to copy to destination.
-    pub source_application_id: i32,
+    /// Destination header metadata policy.
+    pub destination_header: VacuumDestinationHeader,
+    /// Pre-captured source symbols (functions, vtab modules, index methods).
+    pub source_symbols: SourceSymbols,
     /// Pre-captured source custom type definitions for STRICT table replay.
     pub source_custom_types: Vec<(String, Arc<TypeDef>)>,
     /// Whether the source database has MVCC enabled.
@@ -251,8 +433,6 @@ enum VacuumIntoSubState {
         dest_insert_stmt: Box<crate::Statement>,
         table_idx: usize,
     },
-    /// Copy meta values (user_version, application_id) from source to destination
-    CopyMetaValues,
     /// Prepare CREATE INDEX statement on destination (idx into indexes_to_create)
     PrepareCreateIndex { idx: usize },
     /// Step through CREATE INDEX statement on destination
@@ -267,6 +447,8 @@ enum VacuumIntoSubState {
         dest_schema_stmt: Box<crate::Statement>,
         idx: usize,
     },
+    /// Finalize page-1 metadata before committing the destination image.
+    FinalizeDestinationHeader,
     /// Operation complete
     Done,
 }
@@ -286,11 +468,11 @@ enum VacuumIntoSubState {
 ///    internal storage-backed tables
 /// 5. Creates user-defined secondary indexes after data copy for performance
 ///    (backing-btree indexes for custom index methods are excluded here)
-/// 6. Copies meta values (user_version, application_id) from source to destination
-/// 7. Creates triggers, views, and rootpage = 0 objects last (after data copy).
+/// 6. Creates triggers, views, and rootpage = 0 objects last (after data copy).
 ///    Custom index methods (FTS, vector) recreate and backfill their backing
 ///    indexes from the copied table data in this phase.
-fn vacuum_into_step(
+/// 7. Finalizes destination page-1 metadata, then commits the destination transaction.
+pub(crate) fn vacuum_into_step(
     config: &VacuumIntoConfig,
     state: &mut VacuumIntoState,
 ) -> Result<IOResult<()>> {
@@ -491,8 +673,8 @@ fn vacuum_into_step(
             VacuumIntoSubState::StartCopyTable { table_idx } => {
                 let tables_len = state.tables_to_copy.len();
                 if table_idx >= tables_len {
-                    // Done copying all tables, proceed to meta values
-                    state.sub_state = VacuumIntoSubState::CopyMetaValues;
+                    // Done copying all tables, proceed to deferred indexes.
+                    state.sub_state = VacuumIntoSubState::PrepareCreateIndex { idx: 0 };
                     continue;
                 }
 
@@ -643,25 +825,6 @@ fn vacuum_into_step(
                 }
             },
 
-            VacuumIntoSubState::CopyMetaValues => {
-                // Copy meta values to destination database
-                // Use pragma_update to set user_version and application_id
-                // Note: schema_version is not copied - VACUUM INTO creates a new file so
-                // there's no cache to invalidate. The destination will have its own
-                // schema_version based on the schema operations performed.
-                state
-                    .dest_conn
-                    .pragma_update("user_version", config.source_user_version.to_string())?;
-                state
-                    .dest_conn
-                    .pragma_update("application_id", config.source_application_id.to_string())?;
-
-                // Phase 3: Create user-defined secondary indexes after data copy
-                // for performance (avoids maintaining indexes during bulk insert).
-                state.sub_state = VacuumIntoSubState::PrepareCreateIndex { idx: 0 };
-                continue;
-            }
-
             // Phase 3: Create user-defined secondary indexes.
             VacuumIntoSubState::PrepareCreateIndex { idx } => {
                 let entries_len = state.indexes_to_create.len();
@@ -714,7 +877,7 @@ fn vacuum_into_step(
             VacuumIntoSubState::PreparePostData { idx } => {
                 let entries_len = state.post_data_entries.len();
                 if idx >= entries_len {
-                    state.sub_state = VacuumIntoSubState::Done;
+                    state.sub_state = VacuumIntoSubState::FinalizeDestinationHeader;
                     continue;
                 }
 
@@ -753,6 +916,19 @@ fn vacuum_into_step(
                     return Err(LimboError::Busy);
                 }
             },
+
+            VacuumIntoSubState::FinalizeDestinationHeader => {
+                match finalize_destination_header(&state.dest_conn, &config.destination_header)? {
+                    crate::IOResult::Done(()) => {}
+                    crate::IOResult::IO(io) => {
+                        state.sub_state = VacuumIntoSubState::FinalizeDestinationHeader;
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+
+                state.sub_state = VacuumIntoSubState::Done;
+                continue;
+            }
 
             VacuumIntoSubState::Done => {
                 // Commit the destination transaction started in Init state.
@@ -901,4 +1077,166 @@ pub(crate) fn build_copy_sql(
         format!("INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
 
     Ok((select_sql, insert_sql))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::encryption::{CipherMode, EncryptionKey};
+    use crate::util::IOExt;
+
+    #[test]
+    fn vacuum_header_policy_bumps_schema_cookie_and_preserves_sqlite_metadata() {
+        let mut source = DatabaseHeader::default();
+        source.schema_cookie = u32::MAX.into();
+        source.default_page_cache_size = CacheSize::new(123);
+        source.text_encoding = TextEncoding::Utf8;
+        source.user_version = 7.into();
+        source.application_id = 12.into();
+
+        let VacuumHeaderMetadata {
+            schema_cookie,
+            default_page_cache_size,
+            text_encoding,
+            user_version,
+            application_id,
+        } = VacuumHeaderMetadata::from_source_header(&source);
+
+        assert_eq!(schema_cookie, 0);
+        assert_eq!(default_page_cache_size, CacheSize::new(123));
+        assert_eq!(text_encoding, TextEncoding::Utf8);
+        assert_eq!(user_version, 7);
+        assert_eq!(application_id, 12);
+
+        let VacuumDestinationHeader::VacuumInto(into_metadata) =
+            VacuumDestinationHeader::vacuum_into_from_source_header(&source)
+        else {
+            panic!("vacuum_into_from_source_header must build the VACUUM INTO policy");
+        };
+        assert_eq!(into_metadata.schema_cookie, 0);
+
+        let VacuumDestinationHeader::PlainVacuum(plain_metadata) =
+            VacuumDestinationHeader::plain_vacuum_from_source_header(&source)
+        else {
+            panic!("plain_vacuum_from_source_header must build the plain VACUUM policy");
+        };
+        assert_eq!(plain_metadata.schema_cookie, 0);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_header_policy_updates_destination_header() -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().join("source.db");
+        let source_path = source_path.to_str().unwrap();
+        let source_db = Database::open_file_with_flags(
+            io,
+            source_path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )?;
+        let source_conn = source_db.connect()?;
+        let temp = open_internal_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
+
+        let mut source_header = DatabaseHeader::default();
+        source_header.schema_cookie = 41.into();
+        source_header.default_page_cache_size = CacheSize::new(321);
+        source_header.text_encoding = TextEncoding::Utf8;
+        source_header.user_version = 17.into();
+        source_header.application_id = 29.into();
+        let policy = VacuumDestinationHeader::vacuum_into_from_source_header(&source_header);
+
+        temp.conn.execute("BEGIN")?;
+        match finalize_destination_header(&temp.conn, &policy)? {
+            crate::IOResult::Done(()) => {}
+            crate::IOResult::IO(_) => panic!("fresh temp header should not need async I/O"),
+        }
+        temp.conn.execute("COMMIT")?;
+
+        let pager = temp.conn.pager.load();
+        let header = pager.io.block(|| {
+            pager.with_header(|header| {
+                (
+                    header.schema_cookie.get(),
+                    header.default_page_cache_size,
+                    header.text_encoding,
+                    header.user_version.get(),
+                    header.application_id.get(),
+                )
+            })
+        })?;
+
+        assert_eq!(
+            header,
+            (42, CacheSize::new(321), TextEncoding::Utf8, 17, 29)
+        );
+
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn internal_vacuum_temp_db_uses_source_runtime_and_disables_auto_checkpoint() -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().join("source.db");
+        let source_path = source_path.to_str().unwrap();
+        let source_db = Database::open_file_with_flags(
+            io,
+            source_path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )?;
+        let source_conn = source_db.connect()?;
+
+        let temp = open_internal_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
+
+        assert!(Arc::ptr_eq(&temp.db.io, &source_db.io));
+        assert_ne!(temp.path, source_db.path);
+        assert!(temp.conn.is_wal_auto_checkpoint_disabled());
+        assert_eq!(temp.conn.get_page_size().get(), 4096);
+        assert_eq!(temp.conn.get_reserved_bytes(), Some(0));
+
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn internal_vacuum_temp_db_preserves_source_encryption() -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().join("encrypted-source.db");
+        let source_path = source_path.to_str().unwrap();
+        let key_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let key = EncryptionKey::from_hex_string(key_hex)?;
+        let source_db = Database::open_file_with_flags(
+            io,
+            source_path,
+            OpenFlags::Create,
+            DatabaseOpts::new().with_encryption(true),
+            Some(EncryptionOpts {
+                cipher: CipherMode::Aes256Gcm.to_string(),
+                hexkey: key_hex.to_string(),
+            }),
+        )?;
+        let source_conn = source_db.connect_with_encryption(Some(key))?;
+        let reserved_space = source_conn
+            .get_reserved_bytes()
+            .expect("encrypted source should have reserved bytes");
+
+        let temp = open_internal_vacuum_temp_db(&source_conn, &source_db, 4096, reserved_space)?;
+
+        assert!(temp.db.experimental_encryption_enabled());
+        assert_eq!(
+            temp.conn.get_encryption_cipher_mode(),
+            source_conn.get_encryption_cipher_mode()
+        );
+        assert!(temp.conn.encryption_key.read().is_some());
+        assert_eq!(temp.conn.get_reserved_bytes(), Some(reserved_space));
+
+        Ok(())
+    }
 }

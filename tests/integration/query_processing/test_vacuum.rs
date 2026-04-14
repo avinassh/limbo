@@ -613,7 +613,7 @@ fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
     );
 }
 
-/// Test VACUUM INTO preserves meta values: user_version, application_id
+/// Test VACUUM INTO preserves and bumps meta values like SQLite.
 /// Note: Some pragmas don't work correctly with MVCC yet
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
@@ -626,6 +626,7 @@ fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Resul
     // Test 1: Normal positive values
     conn.execute("PRAGMA user_version = 42")?;
     conn.execute("PRAGMA application_id = 12345")?;
+    let source_schema_version: Vec<(i64,)> = conn.exec_rows("PRAGMA schema_version");
 
     let source_hash1 = compute_dbhash(&tmp_db);
     let dest_path1 = dest_dir.path().join("vacuumed1.db");
@@ -640,6 +641,12 @@ fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Resul
     assert_eq!(uv, vec![(42,)], "user_version should be 42");
     let aid: Vec<(i64,)> = dest_conn1.exec_rows("PRAGMA application_id");
     assert_eq!(aid, vec![(12345,)], "application_id should be 12345");
+    let schema_version: Vec<(i64,)> = dest_conn1.exec_rows("PRAGMA schema_version");
+    assert_eq!(
+        schema_version,
+        vec![(source_schema_version[0].0 + 1,)],
+        "schema_version should be source schema_version + 1"
+    );
 
     // Test 2: Boundary values (negative user_version, max application_id)
     conn.execute("PRAGMA user_version = -1")?;
