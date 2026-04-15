@@ -195,7 +195,6 @@ pub(crate) enum VacuumDestinationHeader {
     VacuumInto(VacuumHeaderMetadata),
     /// Plain `VACUUM` builds a replacement image, so the temp image's page 1
     /// must already contain the final source header values before copy-back.
-    #[allow(dead_code)]
     PlainVacuum(VacuumHeaderMetadata),
 }
 

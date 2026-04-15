@@ -467,7 +467,7 @@ pub struct ProgramState {
     op_transaction_state: OpTransactionState,
     op_journal_mode_state: OpJournalModeState,
     op_vacuum_into_state: Option<Box<OpVacuumIntoState>>,
-    pub(crate) op_vacuum_state: Option<Box<OpVacuumState>>,
+    op_vacuum_state: Option<Box<OpVacuumState>>,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -2054,20 +2054,10 @@ impl Program {
 
         let mut abort_error: Option<LimboError> = None;
 
-        // VACUUM INTO state can own internal helper statements whose drop path
+        // VACUUM state can own internal helper statements whose drop path
         // releases nested guards. Clean it before checking whether this program
         // is itself nested; otherwise abort could skip top-level cleanup.
-        if let Err(err) = execute::cleanup_op_vacuum_into_state(&self.connection, state) {
-            capture_abort_error(
-                &mut abort_error,
-                err,
-                "Failed to clean up VACUUM INTO state during abort",
-            );
-        }
-
-        // Plain VACUUM owns the source transaction directly. Roll back and
-        // restore connection state before any further abort logic.
-        if let Err(err) = execute::cleanup_op_vacuum_state(&self.connection, state) {
+        if let Err(err) = execute::cleanup_vacuum_state(&self.connection, state) {
             capture_abort_error(
                 &mut abort_error,
                 err,

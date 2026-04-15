@@ -14179,7 +14179,22 @@ pub fn op_vacuum_into(
     }
 }
 
-pub(crate) fn cleanup_op_vacuum_into_state(
+/// Clean up any VACUUM or VACUUM INTO state on error or abort.
+/// Only one of the two can be active at a time; this handles whichever is set.
+pub(crate) fn cleanup_vacuum_state(
+    connection: &Arc<Connection>,
+    state: &mut ProgramState,
+) -> Result<()> {
+    if state.op_vacuum_into_state.is_some() {
+        cleanup_op_vacuum_into_state(connection, state)
+    } else if state.op_vacuum_state.is_some() {
+        cleanup_op_vacuum_state(connection, state)
+    } else {
+        Ok(())
+    }
+}
+
+fn cleanup_op_vacuum_into_state(
     connection: &Arc<Connection>,
     state: &mut ProgramState,
 ) -> Result<()> {
@@ -14507,7 +14522,7 @@ pub fn op_vacuum(
 /// Clean up plain VACUUM state on error or abort. Rolls back the source
 /// transaction if it was acquired, restores connection state, and drops
 /// temp resources.
-pub(crate) fn cleanup_op_vacuum_state(
+fn cleanup_op_vacuum_state(
     connection: &Arc<Connection>,
     state: &mut ProgramState,
 ) -> Result<()> {
