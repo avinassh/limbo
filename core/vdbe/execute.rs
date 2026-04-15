@@ -14522,10 +14522,7 @@ pub fn op_vacuum(
 /// Clean up plain VACUUM state on error or abort. Rolls back the source
 /// transaction if it was acquired, restores connection state, and drops
 /// temp resources.
-fn cleanup_op_vacuum_state(
-    connection: &Arc<Connection>,
-    state: &mut ProgramState,
-) -> Result<()> {
+fn cleanup_op_vacuum_state(connection: &Arc<Connection>, state: &mut ProgramState) -> Result<()> {
     let Some(vacuum_state) = state.op_vacuum_state.take() else {
         return Ok(());
     };
