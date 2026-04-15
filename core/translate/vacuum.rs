@@ -34,15 +34,24 @@ pub fn translate_vacuum(
             Ok(())
         }
         None => {
-            // Plain VACUUM - compact database in place.
-            // Schema-qualified VACUUM is not supported yet.
-            if schema_name != "main" {
-                bail_parse_error!("VACUUM of schema '{}' is not supported", schema_name);
+            // Plain VACUUM is experimental — only available in debug/test builds.
+            #[cfg(not(debug_assertions))]
+            {
+                bail_parse_error!(
+                    "VACUUM is not supported yet. Use VACUUM INTO 'filename' to create a compacted copy."
+                );
             }
-            program.emit_insn(Insn::Vacuum {
-                db: crate::MAIN_DB_ID,
-            });
-            Ok(())
+            #[cfg(debug_assertions)]
+            {
+                // Schema-qualified VACUUM is not supported yet.
+                if schema_name != "main" {
+                    bail_parse_error!("VACUUM of schema '{}' is not supported", schema_name);
+                }
+                program.emit_insn(Insn::Vacuum {
+                    db: crate::MAIN_DB_ID,
+                });
+                Ok(())
+            }
         }
     }
 }
