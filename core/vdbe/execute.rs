@@ -14219,8 +14219,8 @@ fn op_vacuum_into_inner(
     insn: &Insn,
 ) -> Result<InsnFunctionStepResult> {
     use crate::vdbe::vacuum::{
-        vacuum_destination_opts, vacuum_into_step, SourceSymbols, VacuumDestinationHeader,
-        VacuumIntoConfig, VacuumIntoState,
+        vacuum_destination_opts, vacuum_into_step, VacuumDestinationHeader, VacuumIntoConfig,
+        VacuumIntoState,
     };
 
     load_insn!(
@@ -14240,11 +14240,11 @@ fn op_vacuum_into_inner(
             return Ok(InsnFunctionStepResult::Step);
         }
 
-        state.op_vacuum_into_state = Some(OpVacuumIntoState {
+        state.op_vacuum_into_state = Some(Box::new(OpVacuumIntoState {
             escaped_schema_name: schema_name.replace('"', "\"\""),
             database_id,
             ..Default::default()
-        });
+        }));
     }
 
     let vacuum_state = state.op_vacuum_into_state.as_mut().unwrap();
@@ -14353,29 +14353,30 @@ fn op_vacuum_into_inner(
                 // must be set before page 1 is allocated (before any schema operations)
                 dest_conn.set_reserved_bytes(reserved_space)?;
 
-                // Capture source symbols needed for schema replay (functions, vtab
-                // modules, index methods). We skip vtabs - those are live instances
-                // tied to the source connection and not needed for compiling schema SQL.
-                let source_symbols = {
+                // Mirror source symbols directly into destination for schema replay,
+                // avoiding an intermediate clone through SourceSymbols.
+                {
                     let source_syms = program.connection.syms.read();
-                    SourceSymbols {
-                        functions: source_syms
+                    let mut dest_syms = dest_conn.syms.write();
+                    dest_syms.functions.extend(
+                        source_syms
                             .functions
                             .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        vtab_modules: source_syms
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                    dest_syms.vtab_modules.extend(
+                        source_syms
                             .vtab_modules
                             .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        index_methods: source_syms
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                    dest_syms.index_methods.extend(
+                        source_syms
                             .index_methods
                             .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    }
-                };
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                }
 
                 // Capture source custom type definitions so that STRICT tables with
                 // custom type columns can resolve those types during CREATE TABLE
@@ -14396,7 +14397,6 @@ fn op_vacuum_into_inner(
                     escaped_schema_name: escaped_schema_name.clone(),
                     database_id,
                     destination_header,
-                    source_symbols,
                     source_custom_types,
                     source_mvcc_enabled: source_db.mvcc_enabled(),
                 };
@@ -14455,15 +14455,9 @@ pub(crate) struct OpVacuumState {
     db: usize,
     /// State machine for the plain VACUUM operation.
     sub_state: crate::vdbe::vacuum::PlainVacuumSubState,
-}
-
-impl Default for OpVacuumState {
-    fn default() -> Self {
-        Self {
-            db: crate::MAIN_DB_ID,
-            sub_state: crate::vdbe::vacuum::PlainVacuumSubState::Preflight,
-        }
-    }
+    /// Independent progress flags for cleanup — survive `std::mem::take`
+    /// on `sub_state` so the error/abort path always knows what to undo.
+    progress: crate::vdbe::vacuum::PlainVacuumProgress,
 }
 
 /// Plain VACUUM - compact the database in place via temp-build + direct-WAL
@@ -14477,10 +14471,11 @@ pub fn op_vacuum(
     load_insn!(Vacuum { db }, insn);
 
     if state.op_vacuum_state.is_none() {
-        state.op_vacuum_state = Some(OpVacuumState {
+        state.op_vacuum_state = Some(Box::new(OpVacuumState {
             db: *db,
             sub_state: crate::vdbe::vacuum::PlainVacuumSubState::Preflight,
-        });
+            progress: crate::vdbe::vacuum::PlainVacuumProgress::default(),
+        }));
     }
 
     let vacuum_state = state.op_vacuum_state.as_mut().unwrap();
@@ -14489,6 +14484,7 @@ pub fn op_vacuum(
         &program.connection,
         vacuum_state.db,
         &mut vacuum_state.sub_state,
+        &mut vacuum_state.progress,
     ) {
         Ok(InsnFunctionStepResult::Step) => {
             state.op_vacuum_state = None;
@@ -14518,7 +14514,12 @@ pub(crate) fn cleanup_op_vacuum_state(
     let Some(vacuum_state) = state.op_vacuum_state.take() else {
         return Ok(());
     };
-    crate::vdbe::vacuum::plain_vacuum_cleanup(connection, vacuum_state.db, &vacuum_state.sub_state);
+    crate::vdbe::vacuum::plain_vacuum_cleanup(
+        connection,
+        vacuum_state.db,
+        vacuum_state.sub_state,
+        &vacuum_state.progress,
+    );
     Ok(())
 }
 

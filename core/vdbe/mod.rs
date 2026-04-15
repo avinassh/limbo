@@ -466,8 +466,8 @@ pub struct ProgramState {
     op_row_id_state: OpRowIdState,
     op_transaction_state: OpTransactionState,
     op_journal_mode_state: OpJournalModeState,
-    op_vacuum_into_state: Option<OpVacuumIntoState>,
-    pub(crate) op_vacuum_state: Option<OpVacuumState>,
+    op_vacuum_into_state: Option<Box<OpVacuumIntoState>>,
+    pub(crate) op_vacuum_state: Option<Box<OpVacuumState>>,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset

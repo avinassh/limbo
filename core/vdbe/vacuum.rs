@@ -1,10 +1,6 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::LimboError;
-use crate::ext::VTabImpl;
-use crate::function::ExternalFunc;
-use crate::index_method::IndexMethod;
 use crate::schema::TypeDef;
 use crate::storage::sqlite3_ondisk::{CacheSize, DatabaseHeader, TextEncoding};
 use crate::util::IOExt;
@@ -320,15 +316,10 @@ fn finalize_destination_header(
 // VACUUM INTO engine - reusable "build compacted copy" state machine
 // ---------------------------------------------------------------------------
 
-/// Pre-captured source symbols needed for schema replay on the destination.
-pub(crate) struct SourceSymbols {
-    pub functions: HashMap<String, Arc<ExternalFunc>>,
-    pub vtab_modules: HashMap<String, Arc<VTabImpl>>,
-    pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
-}
-
 /// Configuration for the VACUUM INTO engine. Provided by the caller (opcode
 /// handler) after reading source metadata and setting up the destination DB.
+/// Callers must mirror source symbols (functions, vtab modules, index methods)
+/// directly into dest_conn.syms before starting the state machine.
 pub(crate) struct VacuumIntoConfig {
     /// Source connection - used for `prepare_internal` and `with_schema` during
     /// schema collection and data copy.
@@ -339,8 +330,6 @@ pub(crate) struct VacuumIntoConfig {
     pub database_id: usize,
     /// Destination header metadata policy.
     pub destination_header: VacuumDestinationHeader,
-    /// Pre-captured source symbols (functions, vtab modules, index methods).
-    pub source_symbols: SourceSymbols,
     /// Pre-captured source custom type definitions for STRICT table replay.
     pub source_custom_types: Vec<(String, Arc<TypeDef>)>,
     /// Whether the source database has MVCC enabled.
@@ -460,34 +449,6 @@ pub(crate) fn vacuum_into_step(
 
         match current_sub_state {
             VacuumIntoSubState::Init => {
-                // Mirror source symbols needed for schema replay (functions, vtab
-                // modules, index methods). We skip vtabs - those are live instances
-                // tied to the source connection and not needed for compiling schema SQL.
-                {
-                    let mut dest_syms = state.dest_conn.syms.write();
-                    dest_syms.functions.extend(
-                        config
-                            .source_symbols
-                            .functions
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                    dest_syms.vtab_modules.extend(
-                        config
-                            .source_symbols
-                            .vtab_modules
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                    dest_syms.index_methods.extend(
-                        config
-                            .source_symbols
-                            .index_methods
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                }
-
                 // Mirror source custom type definitions into destination schema
                 // so that STRICT tables with custom type columns can resolve
                 // those types during CREATE TABLE replay.
@@ -694,19 +655,16 @@ pub(crate) fn vacuum_into_step(
                         schema.get_btree_table(table_name)
                     });
 
-                let (select_sql, mut insert_sql) = build_copy_sql(
-                    &config.escaped_schema_name,
-                    &escaped_table_name,
-                    source_btree_table.as_deref(),
-                )?;
-
                 // sqlite_sequence may already have rows from the AUTOINCREMENT
                 // tracking that ran during the table data copy. Use INSERT OR
                 // REPLACE so the source counter values overwrite any stale
                 // auto-generated ones (matches SQLite vacuum.c behavior).
-                if entry.is_sqlite_sequence() {
-                    insert_sql = insert_sql.replacen("INSERT INTO", "INSERT OR REPLACE INTO", 1);
-                }
+                let (select_sql, insert_sql) = build_copy_sql(
+                    &config.escaped_schema_name,
+                    &escaped_table_name,
+                    source_btree_table.as_deref(),
+                    entry.is_sqlite_sequence(),
+                )?;
 
                 // SELECT from source, INSERT into destination.
                 let select_stmt = config.source_conn.prepare_internal(&select_sql)?;
@@ -950,6 +908,7 @@ pub(crate) fn build_copy_sql(
     escaped_schema_name: &str,
     escaped_table_name: &str,
     source_btree_table: Option<&crate::schema::BTreeTable>,
+    or_replace: bool,
 ) -> Result<(String, String)> {
     let Some(btree) = source_btree_table else {
         // Storage-backed tables must have schema metadata. If we get here,
@@ -1062,8 +1021,13 @@ pub(crate) fn build_copy_sql(
 
     let select_sql =
         format!("SELECT {select_cols} FROM \"{escaped_schema_name}\".\"{escaped_table_name}\"");
+    let insert_prefix = if or_replace {
+        "INSERT OR REPLACE INTO"
+    } else {
+        "INSERT INTO"
+    };
     let insert_sql =
-        format!("INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
+        format!("{insert_prefix} \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
 
     Ok((select_sql, insert_sql))
 }
@@ -1071,6 +1035,23 @@ pub(crate) fn build_copy_sql(
 // ---------------------------------------------------------------------------
 // Plain VACUUM engine - copy-back state machine
 // ---------------------------------------------------------------------------
+
+/// Independent progress flags for plain VACUUM cleanup. These track which
+/// resources the opcode has acquired and are **not** cleared by
+/// `std::mem::take` on the sub-state enum. The cleanup function reads these
+/// to decide what to roll back regardless of where the state machine was
+/// when the error occurred.
+#[derive(Default)]
+pub(crate) struct PlainVacuumProgress {
+    /// Source pager read transaction was started.
+    pub read_tx_open: bool,
+    /// Source pager write transaction was acquired and `auto_commit`/`tx_state`
+    /// were modified.
+    pub write_tx_open: bool,
+    /// WAL commit was published via `finish_append_frames_commit`. Once true
+    /// the compacted image is durable and rollback must not be attempted.
+    pub commit_published: bool,
+}
 
 /// Sub-states for the plain VACUUM opcode state machine.
 ///
@@ -1114,7 +1095,10 @@ pub(crate) enum PlainVacuumSubState {
         /// Next page number to read (1-based). The page at `next_page - 1` is
         /// the one we just issued a read for and are awaiting.
         next_page: u32,
-        prev_prepared: Option<crate::storage::wal::PreparedFrames>,
+        /// Boxed to shrink the enum — PreparedFrames contains Vecs and is ~80+
+        /// bytes unboxed. Only created once per batch, so boxing adds no
+        /// allocation overhead in the hot path.
+        prev_prepared: Option<Box<crate::storage::wal::PreparedFrames>>,
         /// Accumulated pages for the current batch.
         batch_pages: Vec<crate::storage::pager::PageRef>,
         /// Completion for the in-flight read.
@@ -1127,7 +1111,7 @@ pub(crate) enum PlainVacuumSubState {
         temp_db: Box<InternalVacuumTempDb>,
         total_pages: u32,
         next_page: u32,
-        prev_prepared: Option<crate::storage::wal::PreparedFrames>,
+        prev_prepared: Option<Box<crate::storage::wal::PreparedFrames>>,
         completions: Vec<crate::io::Completion>,
     },
     /// Fsync the WAL if sync mode requires it.
@@ -1152,15 +1136,24 @@ const VACUUM_COPY_BATCH_SIZE: u32 = 64;
 
 /// Step the plain VACUUM state machine once. Returns `IO` to yield or `Step`
 /// when the entire operation is complete.
+///
+/// `progress` independently tracks which resources the opcode has acquired so
+/// that cleanup can roll back correctly even when `sub_state` has been taken
+/// by `std::mem::take` at the top of the loop.
 pub(crate) fn plain_vacuum_step(
     connection: &Arc<Connection>,
     db: usize,
     sub_state: &mut PlainVacuumSubState,
+    progress: &mut PlainVacuumProgress,
 ) -> Result<InsnFunctionStepResult> {
     use crate::io::WriteBatch as IOWriteBatch;
     use crate::types::IOCompletions;
     use crate::SyncMode;
     use std::sync::atomic::Ordering;
+
+    // Capture the source pager once per step call. The pager never changes
+    // during a VACUUM, so this avoids repeated ArcSwap loads in the loop.
+    let source_pager = connection.get_pager_from_database_index(&db);
 
     loop {
         let current = std::mem::take(sub_state);
@@ -1189,15 +1182,31 @@ pub(crate) fn plain_vacuum_step(
                         "VACUUM is not supported in MVCC mode yet".to_string(),
                     ));
                 }
-                // 5. Reject in-memory databases.
-                if source_db.path.starts_with(":memory:") || source_db.path.is_empty() {
+                // 5. Reject in-memory databases. Use the same memory-like
+                // path classification as attach/open (connection.rs:2216).
+                {
+                    let path = &source_db.path;
+                    let is_memory_db =
+                        path == ":memory:" || path.starts_with("file::memory:") || path.is_empty();
+                    if is_memory_db {
+                        return Err(LimboError::InternalError(
+                            "cannot VACUUM an in-memory database".to_string(),
+                        ));
+                    }
+                }
+                // 6. Reject auto-vacuum databases until preservation is
+                // implemented. An auto-vacuum source overwritten with a
+                // non-auto-vacuum temp image would leave the pager's
+                // in-memory mode stale, causing pointer-map corruption.
+                if source_pager.get_auto_vacuum_mode()
+                    != crate::storage::pager::AutoVacuumMode::None
+                {
                     return Err(LimboError::InternalError(
-                        "cannot VACUUM an in-memory database".to_string(),
+                        "VACUUM is not supported for auto-vacuum databases yet".to_string(),
                     ));
                 }
-                // 6. Reject non-WAL pagers.
-                let pager = connection.get_pager_from_database_index(&db);
-                if pager.wal.is_none() {
+                // 7. Reject non-WAL pagers.
+                if source_pager.wal.is_none() {
                     return Err(LimboError::InternalError(
                         "VACUUM requires a WAL-mode database".to_string(),
                     ));
@@ -1207,21 +1216,21 @@ pub(crate) fn plain_vacuum_step(
             }
 
             PlainVacuumSubState::BeginSourceReadTx => {
-                let pager = connection.get_pager_from_database_index(&db);
-                pager.begin_read_tx()?;
+                source_pager.begin_read_tx()?;
+                progress.read_tx_open = true;
                 *sub_state = PlainVacuumSubState::BeginSourceWriteTx;
                 continue;
             }
 
             PlainVacuumSubState::BeginSourceWriteTx => {
-                let pager = connection.get_pager_from_database_index(&db);
-                match pager.begin_write_tx()? {
+                match source_pager.begin_write_tx()? {
                     crate::IOResult::Done(()) => {
                         // Write lock acquired. Set connection state.
                         connection.auto_commit.store(false, Ordering::SeqCst);
                         connection.set_tx_state(crate::connection::TransactionState::Write {
                             schema_did_change: false,
                         });
+                        progress.write_tx_open = true;
                         *sub_state = PlainVacuumSubState::ReadSourceMetadata;
                         continue;
                     }
@@ -1235,25 +1244,35 @@ pub(crate) fn plain_vacuum_step(
 
             PlainVacuumSubState::ReadSourceMetadata => {
                 let source_db = connection.get_source_database(db);
-                let pager = connection.get_pager_from_database_index(&db);
 
                 // Read page size from pager (cached after begin_read_tx).
-                let page_size = pager.get_page_size().map(|ps| ps.get()).unwrap_or(4096);
+                let page_size = source_pager
+                    .get_page_size()
+                    .map(|ps| ps.get())
+                    .unwrap_or(4096);
 
-                // Read reserved bytes.
-                let reserved_space: u8 = match connection.get_reserved_bytes() {
-                    Some(val) => val,
-                    None => {
-                        let io = &*pager.io;
-                        io.block(|| pager.with_header(|h| h.reserved_space))?
-                    }
-                };
-
-                // Read header metadata for the destination.
-                let io = &*pager.io;
-                let destination_header: VacuumDestinationHeader = io.block(|| {
-                    pager.with_header(VacuumDestinationHeader::plain_vacuum_from_source_header)
-                })?;
+                // Read reserved bytes and header metadata in a single
+                // with_header call to avoid redundant page-1 access.
+                let io = &*source_pager.io;
+                let (reserved_space, destination_header): (u8, VacuumDestinationHeader) =
+                    match connection.get_reserved_bytes() {
+                        Some(val) => {
+                            let dh = io.block(|| {
+                                source_pager.with_header(
+                                    VacuumDestinationHeader::plain_vacuum_from_source_header,
+                                )
+                            })?;
+                            (val, dh)
+                        }
+                        None => io.block(|| {
+                            source_pager.with_header(|h| {
+                                (
+                                    h.reserved_space,
+                                    VacuumDestinationHeader::plain_vacuum_from_source_header(h),
+                                )
+                            })
+                        })?,
+                    };
                 // Create temp database.
                 let temp_db = open_internal_vacuum_temp_db(
                     connection,
@@ -1262,27 +1281,30 @@ pub(crate) fn plain_vacuum_step(
                     reserved_space,
                 )?;
 
-                // Capture source symbols for schema replay.
-                let source_symbols = {
-                    let syms = connection.syms.read();
-                    SourceSymbols {
-                        functions: syms
+                // Mirror source symbols directly into temp DB for schema replay,
+                // avoiding an intermediate clone through SourceSymbols.
+                {
+                    let source_syms = connection.syms.read();
+                    let mut dest_syms = temp_db.conn.syms.write();
+                    dest_syms.functions.extend(
+                        source_syms
                             .functions
                             .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        vtab_modules: syms
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                    dest_syms.vtab_modules.extend(
+                        source_syms
                             .vtab_modules
                             .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        index_methods: syms
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                    dest_syms.index_methods.extend(
+                        source_syms
                             .index_methods
                             .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    }
-                };
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                }
 
                 // Capture custom types.
                 let source_custom_types: Vec<(String, Arc<TypeDef>)> =
@@ -1300,7 +1322,6 @@ pub(crate) fn plain_vacuum_step(
                     escaped_schema_name: "main".to_string(),
                     database_id: db,
                     destination_header,
-                    source_symbols,
                     source_custom_types,
                     source_mvcc_enabled: false, // Rejected MVCC above
                 };
@@ -1358,9 +1379,10 @@ pub(crate) fn plain_vacuum_step(
                     // Empty database — nothing to copy back. Clean up the
                     // source write tx and connection state we acquired earlier.
                     drop(temp_db);
-                    let source_pager = connection.get_pager_from_database_index(&db);
                     source_pager.end_write_tx();
                     source_pager.end_read_tx();
+                    progress.write_tx_open = false;
+                    progress.read_tx_open = false;
                     connection.auto_commit.store(true, Ordering::SeqCst);
                     connection.set_tx_state(crate::connection::TransactionState::None);
                     *sub_state = PlainVacuumSubState::Done;
@@ -1368,7 +1390,6 @@ pub(crate) fn plain_vacuum_step(
                 }
 
                 // Initialize the source WAL header before the first batch.
-                let source_pager = connection.get_pager_from_database_index(&db);
                 let wal = source_pager
                     .wal
                     .as_ref()
@@ -1395,7 +1416,7 @@ pub(crate) fn plain_vacuum_step(
                     total_pages,
                     next_page: 2, // page 1 is being read now
                     prev_prepared: None,
-                    batch_pages: Vec::new(),
+                    batch_pages: Vec::with_capacity(VACUUM_COPY_BATCH_SIZE as usize),
                     read_completion: completion,
                     reading_page: page_ref,
                 };
@@ -1428,7 +1449,6 @@ pub(crate) fn plain_vacuum_step(
                 if !fsync_phase {
                     // Header write done — issue the fsync via prepare_wal_finish
                     // to set WAL `initialized = true`.
-                    let source_pager = connection.get_pager_from_database_index(&db);
                     let wal = source_pager.wal.as_ref().unwrap();
                     let sync_c = wal.prepare_wal_finish(source_pager.get_sync_type())?;
                     *sub_state = PlainVacuumSubState::PrepareSourceWal {
@@ -1449,7 +1469,7 @@ pub(crate) fn plain_vacuum_step(
                     total_pages,
                     next_page: 2,
                     prev_prepared: None,
-                    batch_pages: Vec::new(),
+                    batch_pages: Vec::with_capacity(VACUUM_COPY_BATCH_SIZE as usize),
                     read_completion: read_c,
                     reading_page: page_ref,
                 };
@@ -1496,7 +1516,6 @@ pub(crate) fn plain_vacuum_step(
                 if batch_full || all_read {
                     // Prepare WAL frames from this batch. WAL header was already
                     // initialized in PrepareSourceWal before reading started.
-                    let source_pager = connection.get_pager_from_database_index(&db);
                     let wal = source_pager
                         .wal
                         .as_ref()
@@ -1509,7 +1528,7 @@ pub(crate) fn plain_vacuum_step(
                         &batch_pages,
                         page_sz,
                         db_size_on_commit,
-                        prev_prepared.as_ref(),
+                        prev_prepared.as_deref(),
                     )?;
 
                     // Submit writes via WriteBatch.
@@ -1522,7 +1541,7 @@ pub(crate) fn plain_vacuum_step(
                         temp_db,
                         total_pages,
                         next_page,
-                        prev_prepared: Some(prepared),
+                        prev_prepared: Some(Box::new(prepared)),
                         completions,
                     };
                     continue;
@@ -1584,10 +1603,9 @@ pub(crate) fn plain_vacuum_step(
                 // pager's read_page_no_cache — they are not in the source page
                 // cache and have no dirty state to clear. The source page cache
                 // is invalidated wholesale via clear_page_cache() in Publish.
-                let source_pager = connection.get_pager_from_database_index(&db);
                 let wal = source_pager.wal.as_ref().unwrap();
                 if let Some(ref prepared) = prev_prepared {
-                    wal.commit_prepared_frames(std::slice::from_ref(prepared));
+                    wal.commit_prepared_frames(std::slice::from_ref(prepared.as_ref()));
                 }
 
                 // More pages to copy?
@@ -1602,7 +1620,7 @@ pub(crate) fn plain_vacuum_step(
                         total_pages,
                         next_page: next_page + 1,
                         prev_prepared,
-                        batch_pages: Vec::new(),
+                        batch_pages: Vec::with_capacity(VACUUM_COPY_BATCH_SIZE as usize),
                         read_completion: completion,
                         reading_page: page_ref,
                     };
@@ -1651,18 +1669,30 @@ pub(crate) fn plain_vacuum_step(
             }
 
             PlainVacuumSubState::Publish { temp_db } => {
-                let source_pager = connection.get_pager_from_database_index(&db);
                 let wal = source_pager
                     .wal
                     .as_ref()
                     .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
 
-                // Publish the WAL transaction to shared state.
+                // Publish the WAL transaction to shared state. Once this
+                // succeeds the compacted image is durable — rollback must
+                // not be attempted even if later schema reload fails.
                 wal.finish_append_frames_commit()?;
+                progress.commit_published = true;
 
                 // Release source write lock and old read lock.
                 source_pager.end_write_tx();
                 source_pager.end_read_tx();
+                progress.write_tx_open = false;
+                progress.read_tx_open = false;
+
+                // Restore connection bookkeeping immediately. The commit is
+                // durable so there is nothing to roll back; restoring here
+                // means the connection is never left poisoned even if the
+                // schema reload below fails. (Matches SQLite vacuum.c which
+                // restores autocommit before schema reset.)
+                connection.auto_commit.store(true, Ordering::SeqCst);
+                connection.set_tx_state(crate::connection::TransactionState::None);
 
                 // Invalidate page cache and schema cookie so fresh reads see
                 // the newly committed WAL frames.
@@ -1672,32 +1702,28 @@ pub(crate) fn plain_vacuum_step(
                 // Drop temp resources before schema reload.
                 drop(temp_db);
 
-                // Start a fresh read tx that sees the committed WAL frames.
-                // Set tx_state to Read so `reparse_schema`'s internal
-                // Transaction opcode skips begin_read_tx (one is already active).
+                // Schema reload under a self-contained read guard. If this
+                // fails the connection is still usable — the cleared schema
+                // cookie will trigger a re-read on the next operation.
                 source_pager.begin_read_tx()?;
                 connection.set_tx_state(crate::connection::TransactionState::Read);
 
-                // Reload the schema from the new database pages. The compacted
-                // image may have different rootpage assignments, so the in-memory
-                // schema must be rebuilt from sqlite_schema on disk rather than
-                // reusing the old table definitions with a bumped cookie.
-                connection.reparse_schema()?;
+                let reload_result = connection.reparse_schema();
 
-                // Publish the freshly parsed schema to the shared Database so
-                // other connections see the new cookie and table definitions.
-                {
+                if reload_result.is_ok() {
+                    // Publish the freshly parsed schema to the shared Database
+                    // so other connections see the new cookie and table defs.
                     let schema = connection.schema.read().clone();
                     let source_db = connection.get_source_database(db);
                     source_db.update_schema_if_newer(schema);
                 }
 
-                // End the schema-reload read tx.
+                // Always end the schema-reload read tx and restore state,
+                // whether the reload succeeded or failed.
                 source_pager.end_read_tx();
-
-                // Restore connection state.
-                connection.auto_commit.store(true, Ordering::SeqCst);
                 connection.set_tx_state(crate::connection::TransactionState::None);
+
+                reload_result?;
 
                 *sub_state = PlainVacuumSubState::Done;
                 return Ok(InsnFunctionStepResult::Step);
@@ -1711,45 +1737,46 @@ pub(crate) fn plain_vacuum_step(
 }
 
 /// Roll back the source transaction and restore connection state after a
-/// plain VACUUM failure. This must be called before dropping the vacuum
-/// opcode state to preserve rollback-before-unlock ordering.
+/// plain VACUUM failure. Uses `progress` flags to decide what to undo —
+/// these are independent of the sub-state enum and survive `std::mem::take`.
 ///
-/// The `sub_state` tells us how far the vacuum progressed; if it never got
-/// past Preflight we have not touched any pager or connection state so
-/// there is nothing to undo (and blindly resetting auto_commit / tx_state
-/// would clobber an existing user transaction).
+/// `sub_state` is taken by value so helper statements inside
+/// `BuildTempImage` are dropped before we attempt `rollback_tx`. This
+/// avoids the nestedness suppression bug where live helper statements keep
+/// `Connection::nestedness > 0`, making `rollback_tx` a no-op.
 pub(crate) fn plain_vacuum_cleanup(
     connection: &Arc<Connection>,
     db: usize,
-    sub_state: &PlainVacuumSubState,
+    sub_state: PlainVacuumSubState,
+    progress: &PlainVacuumProgress,
 ) {
     use std::sync::atomic::Ordering;
 
-    // Preflight is the initial check phase — no locks acquired, no
-    // connection state modified.  Nothing to clean up.
-    if matches!(sub_state, PlainVacuumSubState::Preflight) {
+    // Nothing acquired — nothing to undo.
+    if !progress.read_tx_open && !progress.write_tx_open {
         return;
     }
 
-    // BeginSourceReadTx started a pager read tx but has not yet changed
-    // auto_commit or tx_state.  End the read lock and return.
-    if matches!(sub_state, PlainVacuumSubState::BeginSourceReadTx) {
+    // Drop the sub-state first to release any temp-build helper statements.
+    // Their Drop impls decrement Connection::nestedness, which must happen
+    // before rollback_tx (which is a no-op while nested).
+    drop(sub_state);
+
+    if progress.commit_published {
+        // The compacted image was already durably committed. We must not
+        // roll back — just restore connection bookkeeping.
         let pager = connection.get_pager_from_database_index(&db);
+        pager.end_write_tx();
         pager.end_read_tx();
-        return;
-    }
-
-    // Past BeginSourceWriteTx: we modified auto_commit and tx_state and
-    // may hold a write lock.  Roll back the pager transaction and restore
-    // connection state.
-    let tx_state = connection.get_tx_state();
-    if matches!(
-        tx_state,
-        crate::connection::TransactionState::Write { .. }
-            | crate::connection::TransactionState::Read
-    ) {
+    } else if progress.write_tx_open {
+        // Write transaction open but not yet committed — roll back.
         let pager = connection.get_pager_from_database_index(&db);
         pager.rollback_tx(connection);
+    } else {
+        // Only read transaction — just release the read lock.
+        let pager = connection.get_pager_from_database_index(&db);
+        pager.end_read_tx();
+        return; // auto_commit and tx_state were never modified.
     }
 
     connection.auto_commit.store(true, Ordering::SeqCst);
