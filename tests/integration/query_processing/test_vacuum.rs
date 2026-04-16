@@ -3544,13 +3544,12 @@ fn test_plain_vacuum_reduces_page_count(tmp_db: TempDatabase) -> anyhow::Result<
         post_vacuum_pages[0].0
     );
 
-    // Checkpoint to flush WAL into .db file.
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
-
-    // After checkpoint the reported page count should still reflect the
-    // compacted size.
-    let post_checkpoint_pages: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
-    assert_eq!(post_checkpoint_pages[0].0, post_vacuum_pages[0].0);
+    // VACUUM includes a TRUNCATE checkpoint, so the WAL should be empty.
+    let wal_path = format!("{}-wal", tmp_db.path.display());
+    let wal_size = std::fs::metadata(&wal_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert_eq!(wal_size, 0, "WAL should be truncated to zero after VACUUM");
 
     // Data integrity: the 10 remaining rows should be intact.
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM t");

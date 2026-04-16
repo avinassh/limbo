@@ -1133,8 +1133,16 @@ pub(crate) enum VacuumInPlacePhase {
         temp_db: Box<VacuumTempDb>,
         sync_completion: crate::io::Completion,
     },
-    /// Publish: commit_prepared_frames + finish_append_frames_commit + schema reload.
+    /// Publish: commit_prepared_frames + finish_append_frames_commit, release
+    /// locks, drop temp resources.
     PublishWalCommit { temp_db: Box<VacuumTempDb> },
+    /// TRUNCATE checkpoint: copy WAL frames back into the DB file and truncate
+    /// the WAL to zero. The pager's internal state machine handles the multi-step
+    /// IO (backfill → sync DB → truncate WAL). Non-fatal if it fails — data is
+    /// already durable in the WAL.
+    Checkpoint,
+    /// Reload the schema from the freshly committed (and possibly checkpointed) DB.
+    SchemaReload,
     /// Clean up after successful commit.
     Done,
 }
@@ -1650,23 +1658,21 @@ pub(crate) fn vacuum_in_place_step(
                 wal.finish_append_frames_commit()?;
                 cleanup_state.wal_commit_published = true;
 
-                // Release source write lock and old read lock.
+                // Release source write lock and read lock.
                 source_pager.end_write_tx();
                 source_pager.end_read_tx();
                 cleanup_state.source_write_tx_open = false;
                 cleanup_state.source_read_tx_open = false;
 
-                // Release the checkpoint serialization lock now that commit
-                // is done. Future checkpoint support will run here, before
-                // releasing this lock.
+                // Release the checkpoint serialization lock so the TRUNCATE
+                // checkpoint below can re-acquire it through the normal path.
                 wal.release_checkpoint_lock();
                 cleanup_state.checkpoint_lock_held = false;
 
                 // Restore connection bookkeeping immediately. The commit is
                 // durable so there is nothing to roll back; restoring here
                 // means the connection is never left poisoned even if the
-                // schema reload below fails. (Matches SQLite vacuum.c which
-                // restores autocommit before schema reset.)
+                // checkpoint or schema reload below fails.
                 connection.auto_commit.store(true, Ordering::SeqCst);
                 connection.set_tx_state(crate::connection::TransactionState::None);
 
@@ -1675,9 +1681,43 @@ pub(crate) fn vacuum_in_place_step(
                 source_pager.clear_page_cache(false);
                 source_pager.set_schema_cookie(None);
 
-                // Drop temp resources before schema reload.
+                // Drop temp resources before checkpoint.
                 drop(temp_db);
 
+                *phase = VacuumInPlacePhase::Checkpoint;
+                continue;
+            }
+
+            VacuumInPlacePhase::Checkpoint => {
+                // TRUNCATE checkpoint: copy WAL frames into the DB file,
+                // sync the DB, then truncate the WAL to zero bytes.
+                // Non-fatal if it fails — data is already durable in the WAL
+                // and will be checkpointed by the next auto-checkpoint.
+                let sync_mode = connection.get_sync_mode();
+                match source_pager.checkpoint(
+                    crate::storage::wal::CheckpointMode::Truncate {
+                        upper_bound_inclusive: None,
+                    },
+                    sync_mode,
+                    true,
+                ) {
+                    Ok(crate::IOResult::Done(_)) => {
+                        *phase = VacuumInPlacePhase::SchemaReload;
+                        continue;
+                    }
+                    Ok(crate::IOResult::IO(io)) => {
+                        *phase = VacuumInPlacePhase::Checkpoint;
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    Err(err) => {
+                        tracing::info!("VACUUM post-commit checkpoint failed (non-fatal): {err}");
+                        *phase = VacuumInPlacePhase::SchemaReload;
+                        continue;
+                    }
+                }
+            }
+
+            VacuumInPlacePhase::SchemaReload => {
                 // Schema reload under a self-contained read guard. If this
                 // fails the connection is still usable — the cleared schema
                 // cookie will trigger a re-read on the next operation.
