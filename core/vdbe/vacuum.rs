@@ -288,6 +288,47 @@ fn finalize_vacuum_target_header(
 // Vacuum target build engine
 // ---------------------------------------------------------------------------
 
+/// Copy functions, vtab modules, and index methods from one connection to
+/// another so that schema replay on the target sees the same symbols as
+/// the source.
+pub(crate) fn mirror_symbols(source: &Connection, target: &Connection) {
+    let source_syms = source.syms.read();
+    let mut target_syms = target.syms.write();
+    target_syms.functions.extend(
+        source_syms
+            .functions
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
+    target_syms.vtab_modules.extend(
+        source_syms
+            .vtab_modules
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
+    target_syms.index_methods.extend(
+        source_syms
+            .index_methods
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
+}
+
+/// Capture non-builtin custom type definitions from the source schema.
+pub(crate) fn capture_custom_types(
+    source: &Connection,
+    db_id: usize,
+) -> Vec<(String, Arc<TypeDef>)> {
+    source.with_schema(db_id, |schema| {
+        schema
+            .type_registry
+            .iter()
+            .filter(|(_, td)| !td.is_builtin)
+            .map(|(name, td)| (name.clone(), td.clone()))
+            .collect()
+    })
+}
+
 /// Configuration for building a compacted vacuum target database. Provided by
 /// the caller after reading source metadata and setting up the target DB.
 /// Callers must mirror source symbols (functions, vtab modules, index methods)
@@ -1036,11 +1077,9 @@ pub(crate) enum VacuumInPlacePhase {
     /// Validate preconditions (auto_commit, active statements, readonly, memory,
     /// MVCC, WAL-backed pager).
     Preflight,
-    /// Acquire both read and write transactions on the source pager.
-    /// The WAL requires a read tx before a write tx (the write path needs the
-    /// read snapshot). `begin_write_tx` may yield IO for page1 allocation, so
-    /// this is a two-phase state: first attempt acquires read + tries write,
-    /// re-entry after IO yield retries only the write (read is already held).
+    /// Acquire exclusive access on the source WAL via `begin_exclusive_tx`:
+    /// checkpoint_lock is already held from Preflight, this acquires
+    /// read_locks[0] exclusively + write_lock in one shot.
     BeginSourceTx,
     /// Read source database header metadata for the target-build config.
     ReadSourceMetadata,
@@ -1195,26 +1234,21 @@ pub(crate) fn vacuum_in_place_step(
             }
 
             VacuumInPlacePhase::BeginSourceTx => {
-                // The WAL requires a read tx before a write tx. On first
-                // entry we start the read tx; on re-entry after an IO yield
-                // from begin_write_tx the read tx is already held.
-                if !cleanup_state.source_read_tx_open {
-                    source_pager.begin_read_tx()?;
-                    cleanup_state.source_read_tx_open = true;
-                }
-                match source_pager.begin_write_tx()? {
+                // Acquire exclusive WAL access in one shot:
+                // read_locks[0] exclusively + write_lock + connection snapshot.
+                // Checkpoint lock was already acquired in Preflight.
+                match source_pager.begin_exclusive_tx()? {
                     crate::IOResult::Done(()) => {
-                        // Write lock acquired. Set connection state.
                         connection.auto_commit.store(false, Ordering::SeqCst);
                         connection.set_tx_state(crate::connection::TransactionState::Write {
                             schema_did_change: false,
                         });
+                        cleanup_state.source_read_tx_open = true;
                         cleanup_state.source_write_tx_open = true;
                         *phase = VacuumInPlacePhase::ReadSourceMetadata;
                         continue;
                     }
                     crate::IOResult::IO(io) => {
-                        // Need to yield for IO (e.g. page1 allocation).
                         *phase = VacuumInPlacePhase::BeginSourceTx;
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
@@ -1251,41 +1285,8 @@ pub(crate) fn vacuum_in_place_step(
                 let temp_db =
                     open_vacuum_temp_db(connection, &source_db, page_size, reserved_space)?;
 
-                // Mirror source symbols directly into temp DB for schema replay,
-                // avoiding an intermediate clone through SourceSymbols.
-                {
-                    let source_syms = connection.syms.read();
-                    let mut target_syms = temp_db.conn.syms.write();
-                    target_syms.functions.extend(
-                        source_syms
-                            .functions
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                    target_syms.vtab_modules.extend(
-                        source_syms
-                            .vtab_modules
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                    target_syms.index_methods.extend(
-                        source_syms
-                            .index_methods
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                }
-
-                // Capture custom types.
-                let source_custom_types: Vec<(String, Arc<TypeDef>)> =
-                    connection.with_schema(db, |schema| {
-                        schema
-                            .type_registry
-                            .iter()
-                            .filter(|(_, td)| !td.is_builtin)
-                            .map(|(name, td)| (name.clone(), td.clone()))
-                            .collect()
-                    });
+                mirror_symbols(connection, &temp_db.conn);
+                let source_custom_types = capture_custom_types(connection, db);
 
                 let config = VacuumTargetBuildConfig {
                     source_conn: connection.clone(),

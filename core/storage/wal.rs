@@ -513,6 +513,22 @@ pub trait Wal: Debug + Send + Sync {
     /// `try_begin_checkpoint_lock`.
     fn release_checkpoint_lock(&self);
 
+    /// Acquire exclusive access for VACUUM: checkpoint_lock + read_locks[0]
+    /// (exclusive) + write_lock, then install a fresh connection snapshot.
+    ///
+    /// This replaces the normal `begin_read_tx` + `begin_write_tx` path for
+    /// VACUUM, which needs exclusive access rather than a shared reader
+    /// upgraded to a writer. Holding `read_locks[0]` exclusively blocks new
+    /// readers; holding `write_lock` blocks new writers; holding
+    /// `checkpoint_lock` blocks concurrent checkpointers.
+    ///
+    /// The caller must already hold the checkpoint lock (via
+    /// `try_begin_checkpoint_lock`).
+    ///
+    /// On return the connection holds all three locks. Release via the normal
+    /// `end_write_tx` + `end_read_tx` + `release_checkpoint_lock` sequence.
+    fn begin_exclusive_tx(&self) -> Result<()>;
+
     #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -1844,6 +1860,66 @@ impl Wal for WalFile {
         self.with_shared(|shared| {
             shared.checkpoint_lock.unlock();
         });
+    }
+
+    fn begin_exclusive_tx(&self) -> Result<()> {
+        turso_assert!(
+            self.max_frame_read_lock_index.load(Ordering::Acquire) == NO_LOCK_HELD,
+            "begin_exclusive_tx: must not already hold a read lock"
+        );
+        turso_assert!(
+            !self.holds_write_lock(),
+            "begin_exclusive_tx: must not already hold the write lock"
+        );
+
+        self.with_shared(|shared| {
+            // 1. Exclusive lock on read_locks[0] — blocks all new readers.
+            if !shared.read_locks[0].write() {
+                return Err(LimboError::Busy);
+            }
+            // 2. Write lock — blocks all writers.
+            if !shared.write_lock.write() {
+                shared.read_locks[0].unlock();
+                return Err(LimboError::Busy);
+            }
+            Ok(())
+        })?;
+
+        // Install connection state with a fresh snapshot.
+        let snapshot = self.with_shared(Self::load_shared_snapshot);
+        self.install_connection_state(WalConnectionState::new(
+            snapshot,
+            ReadGuardKind::DbFile,
+        ));
+        turso_assert!(
+            self.write_lock_held
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "begin_exclusive_tx: write_lock_held already set"
+        );
+
+        // Try to restart the log (same as begin_write_tx).
+        let result = self.try_restart_log_before_write();
+        if let Err(LimboError::Busy) | Ok(()) = &result {
+            return Ok(());
+        }
+
+        // Restart failed with a non-Busy error — release locks.
+        self.with_shared(|shared| {
+            shared.write_lock.unlock();
+        });
+        turso_assert!(
+            self.write_lock_held
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "begin_exclusive_tx: write_lock_held not set during rollback"
+        );
+        // Leave read_locks[0] + checkpoint_lock held — caller owns those
+        // via cleanup_state and will release them.
+        // Actually, on error we should release read_locks[0] too.
+        self.end_read_tx();
+
+        Err(result.expect_err("Ok case handled above"))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

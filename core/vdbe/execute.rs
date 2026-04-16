@@ -14230,8 +14230,9 @@ fn op_vacuum_into_inner(
     insn: &Insn,
 ) -> Result<InsnFunctionStepResult> {
     use crate::vdbe::vacuum::{
-        vacuum_target_build_step, vacuum_target_opts_from_source, VacuumDbHeaderMeta,
-        VacuumTargetBuildConfig, VacuumTargetBuildContext,
+        capture_custom_types, mirror_symbols, vacuum_target_build_step,
+        vacuum_target_opts_from_source, VacuumDbHeaderMeta, VacuumTargetBuildConfig,
+        VacuumTargetBuildContext,
     };
 
     load_insn!(
@@ -14360,44 +14361,9 @@ fn op_vacuum_into_inner(
                 // must be set before page 1 is allocated (before any schema operations)
                 output_conn.set_reserved_bytes(reserved_space)?;
 
-                // Mirror source symbols directly into output for schema replay,
-                // avoiding an intermediate clone through SourceSymbols.
-                {
-                    let source_syms = program.connection.syms.read();
-                    let mut output_syms = output_conn.syms.write();
-                    output_syms.functions.extend(
-                        source_syms
-                            .functions
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                    output_syms.vtab_modules.extend(
-                        source_syms
-                            .vtab_modules
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                    output_syms.index_methods.extend(
-                        source_syms
-                            .index_methods
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                }
-
-                // Capture source custom type definitions so that STRICT tables with
-                // custom type columns can resolve those types during CREATE TABLE
-                // replay on the output.
-                let source_custom_types: Vec<(String, Arc<crate::schema::TypeDef>)> = program
-                    .connection
-                    .with_schema(source_db_id, |source_schema| {
-                        source_schema
-                            .type_registry
-                            .iter()
-                            .filter(|(_, td)| !td.is_builtin)
-                            .map(|(name, td)| (name.clone(), td.clone()))
-                            .collect()
-                    });
+                mirror_symbols(&program.connection, &output_conn);
+                let source_custom_types =
+                    capture_custom_types(&program.connection, source_db_id);
 
                 let config = VacuumTargetBuildConfig {
                     source_conn: program.connection.clone(),

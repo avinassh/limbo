@@ -2616,6 +2616,23 @@ impl Pager {
         Ok(IOResult::Done(wal.begin_write_tx()?))
     }
 
+    /// Acquire exclusive WAL access for VACUUM. Replaces the normal
+    /// `begin_read_tx` + `begin_write_tx` sequence — VACUUM needs exclusive
+    /// locks rather than a shared reader upgraded to a writer.
+    ///
+    /// Caller must already hold the checkpoint lock.
+    pub fn begin_exclusive_tx(&self) -> Result<IOResult<()>> {
+        return_if_io!(self.maybe_allocate_page1());
+        let Some(wal) = self.wal.as_ref() else {
+            return Ok(IOResult::Done(()));
+        };
+        wal.begin_exclusive_tx()?;
+        // Fresh exclusive snapshot — clear any stale page cache.
+        self.clear_page_cache(false);
+        self.set_schema_cookie(None);
+        Ok(IOResult::Done(()))
+    }
+
     /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
     /// if update_transaction_state set to false, then [Connection::transaction_state] left unchanged
     /// if update_transaction_state set to true, then [Connection::transaction_state] reset to [TransactionState::None] in case when method completes without error
