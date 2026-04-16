@@ -504,6 +504,15 @@ pub trait Wal: Debug + Send + Sync {
         sync_type: FileSyncType,
     ) -> Result<IOResult<()>>;
 
+    /// Try to acquire the checkpoint serialization lock. Returns `Busy` if
+    /// another checkpointer or VACUUM already holds it. Used by plain VACUUM
+    /// to fail fast if a concurrent checkpoint would block later.
+    fn try_begin_checkpoint_lock(&self) -> Result<()>;
+
+    /// Release the checkpoint serialization lock acquired by
+    /// `try_begin_checkpoint_lock`.
+    fn release_checkpoint_lock(&self);
+
     #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -1820,6 +1829,21 @@ impl Wal for WalFile {
     fn abort_checkpoint(&self) {
         let _ = self.checkpoint_guard.write().take();
         self.reset_internal_states();
+    }
+
+    fn try_begin_checkpoint_lock(&self) -> Result<()> {
+        self.with_shared(|shared| {
+            if !shared.checkpoint_lock.write() {
+                return Err(LimboError::Busy);
+            }
+            Ok(())
+        })
+    }
+
+    fn release_checkpoint_lock(&self) {
+        self.with_shared(|shared| {
+            shared.checkpoint_lock.unlock();
+        });
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

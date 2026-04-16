@@ -1014,6 +1014,8 @@ pub(crate) fn build_copy_sql(
 /// when the error occurred.
 #[derive(Default)]
 pub(crate) struct VacuumInPlaceCleanupState {
+    /// WAL checkpoint serialization lock is held.
+    pub checkpoint_lock_held: bool,
     /// Source pager read transaction was started.
     pub source_read_tx_open: bool,
     /// Source pager write transaction was acquired and `auto_commit`/`tx_state`
@@ -1179,11 +1181,15 @@ pub(crate) fn vacuum_in_place_step(
                     ));
                 }
                 // 7. Reject non-WAL pagers.
-                if source_pager.wal.is_none() {
-                    return Err(LimboError::InternalError(
-                        "VACUUM requires a WAL-mode database".to_string(),
-                    ));
-                }
+                let wal = source_pager.wal.as_ref().ok_or_else(|| {
+                    LimboError::InternalError("VACUUM requires a WAL-mode database".to_string())
+                })?;
+                // 8. Acquire the checkpoint serialization lock early. This
+                // ensures a post-commit TRUNCATE checkpoint won't fail due
+                // to a concurrent checkpointer. If the lock is unavailable
+                // we fail fast before doing any expensive work.
+                wal.try_begin_checkpoint_lock()?;
+                cleanup_state.checkpoint_lock_held = true;
                 *phase = VacuumInPlacePhase::BeginSourceTx;
                 continue;
             }
@@ -1649,6 +1655,12 @@ pub(crate) fn vacuum_in_place_step(
                 cleanup_state.source_write_tx_open = false;
                 cleanup_state.source_read_tx_open = false;
 
+                // Release the checkpoint serialization lock now that commit
+                // is done. Future checkpoint support will run here, before
+                // releasing this lock.
+                wal.release_checkpoint_lock();
+                cleanup_state.checkpoint_lock_held = false;
+
                 // Restore connection bookkeeping immediately. The commit is
                 // durable so there is nothing to roll back; restoring here
                 // means the connection is never left poisoned even if the
@@ -1715,7 +1727,15 @@ pub(crate) fn vacuum_in_place_cleanup(
 ) {
     use std::sync::atomic::Ordering;
 
-    // Nothing acquired — nothing to undo.
+    // Release the checkpoint lock if we acquired it.
+    if cleanup_state.checkpoint_lock_held {
+        let pager = connection.get_pager_from_database_index(&db);
+        if let Some(wal) = pager.wal.as_ref() {
+            wal.release_checkpoint_lock();
+        }
+    }
+
+    // Nothing else acquired — nothing to undo.
     if !cleanup_state.source_read_tx_open && !cleanup_state.source_write_tx_open {
         return;
     }
