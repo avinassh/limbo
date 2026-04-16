@@ -1676,8 +1676,8 @@ pub enum Insn {
         dest_path: String,
     },
 
-    /// Plain VACUUM - compact the database in place via temp-build + direct-WAL copy-back.
-    /// The opcode owns the source transaction lifecycle directly (no generic Transaction preamble).
+    /// In-place VACUUM - compact the database via target build + direct-WAL copy-back.
+    /// The opcode owns the source transaction lifecycle directly.
     Vacuum {
         /// Database index to vacuum (0 = main)
         db: usize,

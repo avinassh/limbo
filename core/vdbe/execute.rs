@@ -14105,9 +14105,9 @@ where
         })
 }
 
-/// Stages for the VACUUM INTO opcode wrapper.
+/// Phases for the VACUUM INTO opcode wrapper.
 #[derive(Default)]
-pub(crate) enum VacuumIntoOpStage {
+pub(crate) enum VacuumIntoOpPhase {
     /// Initial state - validate preconditions and create output database.
     #[default]
     Init,
@@ -14120,7 +14120,7 @@ pub(crate) enum VacuumIntoOpStage {
 /// Context for the VACUUM INTO opcode wrapper.
 #[derive(Default)]
 pub(crate) struct VacuumIntoOpContext {
-    stage: VacuumIntoOpStage,
+    phase: VacuumIntoOpPhase,
     /// Database index for the source schema.
     source_db_id: usize,
     /// Escaped schema name for safe SQL interpolation.
@@ -14264,10 +14264,10 @@ fn op_vacuum_into_inner(
     let source_db_id = vacuum_state.source_db_id;
 
     loop {
-        let current_stage = std::mem::take(&mut vacuum_state.stage);
+        let current_phase = std::mem::take(&mut vacuum_state.phase);
 
-        match current_stage {
-            VacuumIntoOpStage::Init => {
+        match current_phase {
+            VacuumIntoOpPhase::Init => {
                 // Check if we're in a transaction
                 // as vacuum cannot be run inside a transaction
                 if !program.connection.auto_commit.load(Ordering::SeqCst) {
@@ -14412,11 +14412,11 @@ fn op_vacuum_into_inner(
                 vacuum_state.target_build_config = Some(config);
                 vacuum_state.target_build_context =
                     Some(VacuumTargetBuildContext::new(output_conn));
-                vacuum_state.stage = VacuumIntoOpStage::Build;
+                vacuum_state.phase = VacuumIntoOpPhase::Build;
                 continue;
             }
 
-            VacuumIntoOpStage::Build => {
+            VacuumIntoOpPhase::Build => {
                 let config = vacuum_state
                     .target_build_config
                     .as_ref()
@@ -14428,17 +14428,17 @@ fn op_vacuum_into_inner(
 
                 match vacuum_target_build_step(config, target_build_context)? {
                     crate::IOResult::Done(()) => {
-                        vacuum_state.stage = VacuumIntoOpStage::Done;
+                        vacuum_state.phase = VacuumIntoOpPhase::Done;
                         continue;
                     }
                     crate::IOResult::IO(io) => {
-                        vacuum_state.stage = VacuumIntoOpStage::Build;
+                        vacuum_state.phase = VacuumIntoOpPhase::Build;
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
                 }
             }
 
-            VacuumIntoOpStage::Done => {
+            VacuumIntoOpPhase::Done => {
                 // Commit the source transaction started in Init.
                 program.connection.execute("COMMIT")?;
                 state.auto_txn_cleanup = TxnCleanup::None;
@@ -14458,9 +14458,9 @@ fn op_vacuum_into_inner(
 pub(crate) struct VacuumInPlaceOpContext {
     /// Database index being vacuumed.
     db: usize,
-    /// Current stage for the in-place VACUUM operation.
-    stage: crate::vdbe::vacuum::VacuumInPlaceStage,
-    /// Independent cleanup flags that survive `std::mem::take` on `stage`.
+    /// Current phase for the in-place VACUUM operation.
+    phase: crate::vdbe::vacuum::VacuumInPlacePhase,
+    /// Independent cleanup flags that survive `std::mem::take` on `phase`.
     cleanup_state: crate::vdbe::vacuum::VacuumInPlaceCleanupState,
 }
 
@@ -14477,7 +14477,7 @@ pub fn op_vacuum(
     if state.op_vacuum_in_place.is_none() {
         state.op_vacuum_in_place = Some(Box::new(VacuumInPlaceOpContext {
             db: *db,
-            stage: crate::vdbe::vacuum::VacuumInPlaceStage::Preflight,
+            phase: crate::vdbe::vacuum::VacuumInPlacePhase::Preflight,
             cleanup_state: crate::vdbe::vacuum::VacuumInPlaceCleanupState::default(),
         }));
     }
@@ -14487,7 +14487,7 @@ pub fn op_vacuum(
     match crate::vdbe::vacuum::vacuum_in_place_step(
         &program.connection,
         vacuum_state.db,
-        &mut vacuum_state.stage,
+        &mut vacuum_state.phase,
         &mut vacuum_state.cleanup_state,
     ) {
         Ok(InsnFunctionStepResult::Step) => {
@@ -14521,7 +14521,7 @@ fn cleanup_op_vacuum_in_place(
     crate::vdbe::vacuum::vacuum_in_place_cleanup(
         connection,
         vacuum_state.db,
-        vacuum_state.stage,
+        vacuum_state.phase,
         &vacuum_state.cleanup_state,
     );
     Ok(())

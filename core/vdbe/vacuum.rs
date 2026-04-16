@@ -310,9 +310,9 @@ pub(crate) struct VacuumTargetBuildConfig {
 /// Context for the vacuum target build. Holds the target connection and all
 /// intermediate state needed across async yields.
 pub(crate) struct VacuumTargetBuildContext {
-    /// Target connection - lives here, not in each stage variant.
+    /// Target connection - lives here, not in each phase variant.
     pub target_conn: Arc<Connection>,
-    stage: VacuumTargetBuildStage,
+    phase: VacuumTargetBuildPhase,
     /// Typed schema entries collected from sqlite_schema, ordered by rowid.
     schema_entries: Vec<SchemaEntry>,
     /// Storage-backed tables to CREATE (excludes sqlite_sequence).
@@ -329,7 +329,7 @@ impl VacuumTargetBuildContext {
     pub fn new(target_conn: Arc<Connection>) -> Self {
         Self {
             target_conn,
-            stage: VacuumTargetBuildStage::Init,
+            phase: VacuumTargetBuildPhase::Init,
             schema_entries: Vec::new(),
             tables_to_create: Vec::new(),
             tables_to_copy: Vec::new(),
@@ -339,13 +339,13 @@ impl VacuumTargetBuildContext {
     }
 
     pub(crate) fn cleanup_after_error(&mut self) {
-        self.stage = VacuumTargetBuildStage::Done;
+        self.phase = VacuumTargetBuildPhase::Done;
     }
 }
 
-/// Stages for the vacuum target build state machine.
+/// Phases for the vacuum target build state machine.
 #[derive(Default)]
-pub(crate) enum VacuumTargetBuildStage {
+pub(crate) enum VacuumTargetBuildPhase {
     /// Mirror symbols/types, set perf flags, begin target tx, prepare schema query.
     #[default]
     Init,
@@ -416,10 +416,10 @@ pub(crate) fn vacuum_target_build_step(
     state: &mut VacuumTargetBuildContext,
 ) -> Result<crate::IOResult<()>> {
     loop {
-        let current_stage = std::mem::take(&mut state.stage);
+        let current_phase = std::mem::take(&mut state.phase);
 
-        match current_stage {
-            VacuumTargetBuildStage::Init => {
+        match current_phase {
+            VacuumTargetBuildPhase::Init => {
                 // Mirror source custom type definitions into the target schema
                 // so that STRICT tables with custom type columns can resolve
                 // those types during CREATE TABLE replay.
@@ -458,20 +458,20 @@ pub(crate) fn vacuum_target_build_step(
                 );
                 let schema_stmt = config.source_conn.prepare_internal(schema_sql.as_str())?;
 
-                state.stage = VacuumTargetBuildStage::CollectSchemaRows {
+                state.phase = VacuumTargetBuildPhase::CollectSchemaRows {
                     schema_stmt: Box::new(schema_stmt),
                 };
                 continue;
             }
 
-            VacuumTargetBuildStage::CollectSchemaRows { mut schema_stmt } => {
+            VacuumTargetBuildPhase::CollectSchemaRows { mut schema_stmt } => {
                 match schema_stmt.step()? {
                     crate::StepResult::Row => {
                         let row = schema_stmt
                             .row()
                             .expect("StepResult::Row but row() returned None");
                         state.schema_entries.push(SchemaEntry::from_row(row)?);
-                        state.stage = VacuumTargetBuildStage::CollectSchemaRows { schema_stmt };
+                        state.phase = VacuumTargetBuildPhase::CollectSchemaRows { schema_stmt };
                         continue;
                     }
                     crate::StepResult::Done => {
@@ -500,14 +500,14 @@ pub(crate) fn vacuum_target_build_step(
                             .collect();
                         state.post_data_entries = post_data;
 
-                        state.stage = VacuumTargetBuildStage::PrepareCreateTable { idx: 0 };
+                        state.phase = VacuumTargetBuildPhase::PrepareCreateTable { idx: 0 };
                         continue;
                     }
                     crate::StepResult::IO => {
                         let io = schema_stmt
                             .take_io_completions()
                             .expect("StepResult::IO returned but no completions available");
-                        state.stage = VacuumTargetBuildStage::CollectSchemaRows { schema_stmt };
+                        state.phase = VacuumTargetBuildPhase::CollectSchemaRows { schema_stmt };
                         return Ok(crate::IOResult::IO(io));
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
@@ -518,11 +518,11 @@ pub(crate) fn vacuum_target_build_step(
 
             // Phase 1: Create storage-backed tables (rootpage != 0, type=table),
             // excluding sqlite_sequence (auto-created by AUTOINCREMENT tables).
-            VacuumTargetBuildStage::PrepareCreateTable { idx } => {
+            VacuumTargetBuildPhase::PrepareCreateTable { idx } => {
                 let entries_len = state.tables_to_create.len();
                 if idx >= entries_len {
                     // Done creating tables, start copying data
-                    state.stage = VacuumTargetBuildStage::StartCopyTable { table_idx: 0 };
+                    state.phase = VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 };
                     continue;
                 }
 
@@ -546,14 +546,14 @@ pub(crate) fn vacuum_target_build_step(
                     state.target_conn.end_nested();
                 }
                 let target_stmt = target_stmt?;
-                state.stage = VacuumTargetBuildStage::StepCreateTable {
+                state.phase = VacuumTargetBuildPhase::StepCreateTable {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
                 };
                 continue;
             }
 
-            VacuumTargetBuildStage::StepCreateTable {
+            VacuumTargetBuildPhase::StepCreateTable {
                 mut target_schema_stmt,
                 idx,
             } => match target_schema_stmt.step()? {
@@ -561,14 +561,14 @@ pub(crate) fn vacuum_target_build_step(
                     unreachable!("CREATE TABLE statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
-                    state.stage = VacuumTargetBuildStage::PrepareCreateTable { idx: idx + 1 };
+                    state.phase = VacuumTargetBuildPhase::PrepareCreateTable { idx: idx + 1 };
                     continue;
                 }
                 crate::StepResult::IO => {
                     let io = target_schema_stmt
                         .take_io_completions()
                         .expect("StepResult::IO returned but no completions available");
-                    state.stage = VacuumTargetBuildStage::StepCreateTable {
+                    state.phase = VacuumTargetBuildPhase::StepCreateTable {
                         target_schema_stmt,
                         idx,
                     };
@@ -583,11 +583,11 @@ pub(crate) fn vacuum_target_build_step(
             // Column lists are derived from BTreeTable.columns in the schema,
             // not PRAGMA table_info, because table_info omits generated columns
             // while SELECT * includes them - causing a column count mismatch.
-            VacuumTargetBuildStage::StartCopyTable { table_idx } => {
+            VacuumTargetBuildPhase::StartCopyTable { table_idx } => {
                 let tables_len = state.tables_to_copy.len();
                 if table_idx >= tables_len {
                     // Done copying all tables, proceed to deferred indexes.
-                    state.stage = VacuumTargetBuildStage::PrepareCreateIndex { idx: 0 };
+                    state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 };
                     continue;
                 }
 
@@ -609,7 +609,7 @@ pub(crate) fn vacuum_target_build_step(
                         .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
                         .is_some();
                     if !target_has_sequence {
-                        state.stage = VacuumTargetBuildStage::StartCopyTable {
+                        state.phase = VacuumTargetBuildPhase::StartCopyTable {
                             table_idx: table_idx + 1,
                         };
                         continue;
@@ -654,7 +654,7 @@ pub(crate) fn vacuum_target_build_step(
                 }
                 let target_insert_stmt = target_insert_stmt?;
 
-                state.stage = VacuumTargetBuildStage::CopyRows {
+                state.phase = VacuumTargetBuildPhase::CopyRows {
                     select_stmt: Box::new(select_stmt),
                     target_insert_stmt: Box::new(target_insert_stmt),
                     table_idx,
@@ -662,7 +662,7 @@ pub(crate) fn vacuum_target_build_step(
                 continue;
             }
 
-            VacuumTargetBuildStage::CopyRows {
+            VacuumTargetBuildPhase::CopyRows {
                 mut select_stmt,
                 mut target_insert_stmt,
                 table_idx,
@@ -680,7 +680,7 @@ pub(crate) fn vacuum_target_build_step(
                         target_insert_stmt.bind_at(index, value);
                     }
 
-                    state.stage = VacuumTargetBuildStage::StepTargetInsert {
+                    state.phase = VacuumTargetBuildPhase::StepTargetInsert {
                         select_stmt,
                         target_insert_stmt,
                         table_idx,
@@ -689,7 +689,7 @@ pub(crate) fn vacuum_target_build_step(
                 }
                 crate::StepResult::Done => {
                     // Move to next table
-                    state.stage = VacuumTargetBuildStage::StartCopyTable {
+                    state.phase = VacuumTargetBuildPhase::StartCopyTable {
                         table_idx: table_idx + 1,
                     };
                     continue;
@@ -698,7 +698,7 @@ pub(crate) fn vacuum_target_build_step(
                     let io = select_stmt
                         .take_io_completions()
                         .expect("StepResult::IO returned but no completions available");
-                    state.stage = VacuumTargetBuildStage::CopyRows {
+                    state.phase = VacuumTargetBuildPhase::CopyRows {
                         select_stmt,
                         target_insert_stmt,
                         table_idx,
@@ -710,7 +710,7 @@ pub(crate) fn vacuum_target_build_step(
                 }
             },
 
-            VacuumTargetBuildStage::StepTargetInsert {
+            VacuumTargetBuildPhase::StepTargetInsert {
                 select_stmt,
                 mut target_insert_stmt,
                 table_idx,
@@ -720,7 +720,7 @@ pub(crate) fn vacuum_target_build_step(
                 }
                 crate::StepResult::Done => {
                     // Go back to get next row from source
-                    state.stage = VacuumTargetBuildStage::CopyRows {
+                    state.phase = VacuumTargetBuildPhase::CopyRows {
                         select_stmt,
                         target_insert_stmt,
                         table_idx,
@@ -731,7 +731,7 @@ pub(crate) fn vacuum_target_build_step(
                     let io = target_insert_stmt
                         .take_io_completions()
                         .expect("StepResult::IO returned but no completions available");
-                    state.stage = VacuumTargetBuildStage::StepTargetInsert {
+                    state.phase = VacuumTargetBuildPhase::StepTargetInsert {
                         select_stmt,
                         target_insert_stmt,
                         table_idx,
@@ -744,11 +744,11 @@ pub(crate) fn vacuum_target_build_step(
             },
 
             // Phase 3: Create user-defined secondary indexes.
-            VacuumTargetBuildStage::PrepareCreateIndex { idx } => {
+            VacuumTargetBuildPhase::PrepareCreateIndex { idx } => {
                 let entries_len = state.indexes_to_create.len();
                 if idx >= entries_len {
                     // Done creating indexes, move to post-data objects
-                    state.stage = VacuumTargetBuildStage::PreparePostData { idx: 0 };
+                    state.phase = VacuumTargetBuildPhase::PreparePostData { idx: 0 };
                     continue;
                 }
 
@@ -758,14 +758,14 @@ pub(crate) fn vacuum_target_build_step(
                 // out when indexes_to_create was built. The remaining CREATE
                 // INDEX statements are user-visible and can use ordinary prepare.
                 let target_stmt = state.target_conn.prepare(&entry.sql)?;
-                state.stage = VacuumTargetBuildStage::StepCreateIndex {
+                state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
                 };
                 continue;
             }
 
-            VacuumTargetBuildStage::StepCreateIndex {
+            VacuumTargetBuildPhase::StepCreateIndex {
                 mut target_schema_stmt,
                 idx,
             } => match target_schema_stmt.step()? {
@@ -773,14 +773,14 @@ pub(crate) fn vacuum_target_build_step(
                     unreachable!("CREATE INDEX statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
-                    state.stage = VacuumTargetBuildStage::PrepareCreateIndex { idx: idx + 1 };
+                    state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: idx + 1 };
                     continue;
                 }
                 crate::StepResult::IO => {
                     let io = target_schema_stmt
                         .take_io_completions()
                         .expect("StepResult::IO returned but no completions available");
-                    state.stage = VacuumTargetBuildStage::StepCreateIndex {
+                    state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                         target_schema_stmt,
                         idx,
                     };
@@ -792,24 +792,24 @@ pub(crate) fn vacuum_target_build_step(
             },
 
             // Phase 4: Create triggers, views, and rootpage=0 schema objects.
-            VacuumTargetBuildStage::PreparePostData { idx } => {
+            VacuumTargetBuildPhase::PreparePostData { idx } => {
                 let entries_len = state.post_data_entries.len();
                 if idx >= entries_len {
-                    state.stage = VacuumTargetBuildStage::FinalizeTargetHeader;
+                    state.phase = VacuumTargetBuildPhase::FinalizeTargetHeader;
                     continue;
                 }
 
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
                 let target_stmt = state.target_conn.prepare(&entry.sql)?;
-                state.stage = VacuumTargetBuildStage::StepPostData {
+                state.phase = VacuumTargetBuildPhase::StepPostData {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
                 };
                 continue;
             }
 
-            VacuumTargetBuildStage::StepPostData {
+            VacuumTargetBuildPhase::StepPostData {
                 mut target_schema_stmt,
                 idx,
             } => match target_schema_stmt.step()? {
@@ -817,14 +817,14 @@ pub(crate) fn vacuum_target_build_step(
                     unreachable!("CREATE statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
-                    state.stage = VacuumTargetBuildStage::PreparePostData { idx: idx + 1 };
+                    state.phase = VacuumTargetBuildPhase::PreparePostData { idx: idx + 1 };
                     continue;
                 }
                 crate::StepResult::IO => {
                     let io = target_schema_stmt
                         .take_io_completions()
                         .expect("StepResult::IO returned but no completions available");
-                    state.stage = VacuumTargetBuildStage::StepPostData {
+                    state.phase = VacuumTargetBuildPhase::StepPostData {
                         target_schema_stmt,
                         idx,
                     };
@@ -835,21 +835,21 @@ pub(crate) fn vacuum_target_build_step(
                 }
             },
 
-            VacuumTargetBuildStage::FinalizeTargetHeader => {
+            VacuumTargetBuildPhase::FinalizeTargetHeader => {
                 match finalize_vacuum_target_header(&state.target_conn, &config.header_meta)? {
                     crate::IOResult::Done(()) => {}
                     crate::IOResult::IO(io) => {
-                        state.stage = VacuumTargetBuildStage::FinalizeTargetHeader;
+                        state.phase = VacuumTargetBuildPhase::FinalizeTargetHeader;
                         return Ok(crate::IOResult::IO(io));
                     }
                 }
 
-                state.stage = VacuumTargetBuildStage::Done;
+                state.phase = VacuumTargetBuildPhase::Done;
                 continue;
             }
 
-            VacuumTargetBuildStage::Done => {
-                // Commit the target transaction started in Init stage.
+            VacuumTargetBuildPhase::Done => {
+                // Commit the target transaction started in Init phase.
                 state.target_conn.execute("COMMIT")?;
                 return Ok(crate::IOResult::Done(()));
             }
@@ -1009,7 +1009,7 @@ pub(crate) fn build_copy_sql(
 
 /// Independent cleanup flags for in-place VACUUM. These track which
 /// resources the opcode has acquired and are **not** cleared by
-/// `std::mem::take` on the stage enum. The cleanup function reads these
+/// `std::mem::take` on the phase enum. The cleanup function reads these
 /// to decide what to roll back regardless of where the state machine was
 /// when the error occurred.
 #[derive(Default)]
@@ -1024,13 +1024,13 @@ pub(crate) struct VacuumInPlaceCleanupState {
     pub wal_commit_published: bool,
 }
 
-/// Stages for the in-place VACUUM state machine.
+/// Phases for the in-place VACUUM state machine.
 ///
 /// The opcode owns the source transaction lifecycle directly: it begins the
 /// read and write transactions on the source pager, builds a temp image via
 /// the shared target-build engine, then copies the compacted target back into the
 /// source WAL using the batched prepare_frames → WriteBatch → commit path.
-pub(crate) enum VacuumInPlaceStage {
+pub(crate) enum VacuumInPlacePhase {
     /// Validate preconditions (auto_commit, active statements, readonly, memory,
     /// MVCC, WAL-backed pager).
     Preflight,
@@ -1098,7 +1098,7 @@ pub(crate) enum VacuumInPlaceStage {
     Done,
 }
 
-impl Default for VacuumInPlaceStage {
+impl Default for VacuumInPlacePhase {
     fn default() -> Self {
         Self::Preflight
     }
@@ -1111,12 +1111,12 @@ const VACUUM_COPY_BATCH_SIZE: u32 = 64;
 /// when the entire operation is complete.
 ///
 /// `cleanup_state` independently tracks which resources the opcode has acquired so
-/// that cleanup can roll back correctly even when `stage` has been taken
+/// that cleanup can roll back correctly even when `phase` has been taken
 /// by `std::mem::take` at the top of the loop.
 pub(crate) fn vacuum_in_place_step(
     connection: &Arc<Connection>,
     db: usize,
-    stage: &mut VacuumInPlaceStage,
+    phase: &mut VacuumInPlacePhase,
     cleanup_state: &mut VacuumInPlaceCleanupState,
 ) -> Result<InsnFunctionStepResult> {
     use crate::io::WriteBatch as IOWriteBatch;
@@ -1129,9 +1129,9 @@ pub(crate) fn vacuum_in_place_step(
     let source_pager = connection.get_pager_from_database_index(&db);
 
     loop {
-        let current = std::mem::take(stage);
+        let current = std::mem::take(phase);
         match current {
-            VacuumInPlaceStage::Preflight => {
+            VacuumInPlacePhase::Preflight => {
                 // 1. Must be in auto-commit mode (no explicit transaction).
                 if !connection.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
@@ -1184,11 +1184,11 @@ pub(crate) fn vacuum_in_place_step(
                         "VACUUM requires a WAL-mode database".to_string(),
                     ));
                 }
-                *stage = VacuumInPlaceStage::BeginSourceTx;
+                *phase = VacuumInPlacePhase::BeginSourceTx;
                 continue;
             }
 
-            VacuumInPlaceStage::BeginSourceTx => {
+            VacuumInPlacePhase::BeginSourceTx => {
                 // The WAL requires a read tx before a write tx. On first
                 // entry we start the read tx; on re-entry after an IO yield
                 // from begin_write_tx the read tx is already held.
@@ -1204,18 +1204,18 @@ pub(crate) fn vacuum_in_place_step(
                             schema_did_change: false,
                         });
                         cleanup_state.source_write_tx_open = true;
-                        *stage = VacuumInPlaceStage::ReadSourceMetadata;
+                        *phase = VacuumInPlacePhase::ReadSourceMetadata;
                         continue;
                     }
                     crate::IOResult::IO(io) => {
                         // Need to yield for IO (e.g. page1 allocation).
-                        *stage = VacuumInPlaceStage::BeginSourceTx;
+                        *phase = VacuumInPlacePhase::BeginSourceTx;
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
                 }
             }
 
-            VacuumInPlaceStage::ReadSourceMetadata => {
+            VacuumInPlacePhase::ReadSourceMetadata => {
                 let source_db = connection.get_source_database(db);
 
                 // Read page size from pager (cached after begin_read_tx).
@@ -1292,7 +1292,7 @@ pub(crate) fn vacuum_in_place_step(
 
                 let target_build_context = VacuumTargetBuildContext::new(temp_db.conn.clone());
 
-                *stage = VacuumInPlaceStage::TargetBuild {
+                *phase = VacuumInPlacePhase::TargetBuild {
                     config: Box::new(config),
                     temp_db: Box::new(temp_db),
                     context: Box::new(target_build_context),
@@ -1300,7 +1300,7 @@ pub(crate) fn vacuum_in_place_step(
                 continue;
             }
 
-            VacuumInPlaceStage::TargetBuild {
+            VacuumInPlacePhase::TargetBuild {
                 config,
                 temp_db,
                 mut context,
@@ -1310,11 +1310,11 @@ pub(crate) fn vacuum_in_place_step(
                         // Temp build complete. Move to read tx on temp.
                         drop(config);
                         drop(context);
-                        *stage = VacuumInPlaceStage::BeginTempReadTx { temp_db };
+                        *phase = VacuumInPlacePhase::BeginTempReadTx { temp_db };
                         continue;
                     }
                     crate::IOResult::IO(io) => {
-                        *stage = VacuumInPlaceStage::TargetBuild {
+                        *phase = VacuumInPlacePhase::TargetBuild {
                             config,
                             temp_db,
                             context,
@@ -1324,7 +1324,7 @@ pub(crate) fn vacuum_in_place_step(
                 }
             }
 
-            VacuumInPlaceStage::BeginTempReadTx { temp_db } => {
+            VacuumInPlacePhase::BeginTempReadTx { temp_db } => {
                 // The shared temp-build engine committed via SQL COMMIT, which
                 // ends the write transaction but leaves the WAL read mark held.
                 // End that read tx first, then start a fresh one so WAL lookups
@@ -1348,7 +1348,7 @@ pub(crate) fn vacuum_in_place_step(
                     cleanup_state.source_read_tx_open = false;
                     connection.auto_commit.store(true, Ordering::SeqCst);
                     connection.set_tx_state(crate::connection::TransactionState::None);
-                    *stage = VacuumInPlaceStage::Done;
+                    *phase = VacuumInPlacePhase::Done;
                     continue;
                 }
 
@@ -1361,7 +1361,7 @@ pub(crate) fn vacuum_in_place_step(
 
                 if let Some(header_write_c) = wal.prepare_wal_start(page_sz)? {
                     // WAL not yet initialized — yield on the header write.
-                    *stage = VacuumInPlaceStage::InitSourceWalHeader {
+                    *phase = VacuumInPlacePhase::InitSourceWalHeader {
                         temp_db,
                         total_pages,
                         completion: header_write_c,
@@ -1374,7 +1374,7 @@ pub(crate) fn vacuum_in_place_step(
                 let temp_pager = temp_db.conn.get_pager();
                 let (page_ref, completion) = temp_pager.read_page_no_cache(1, None, false)?;
 
-                *stage = VacuumInPlaceStage::ReadTempPage {
+                *phase = VacuumInPlacePhase::ReadTempPage {
                     temp_db,
                     total_pages,
                     next_page: 2, // page 1 is being read now
@@ -1386,14 +1386,14 @@ pub(crate) fn vacuum_in_place_step(
                 continue;
             }
 
-            VacuumInPlaceStage::InitSourceWalHeader {
+            VacuumInPlacePhase::InitSourceWalHeader {
                 temp_db,
                 total_pages,
                 completion,
                 fsync_phase,
             } => {
                 if !completion.finished() {
-                    *stage = VacuumInPlaceStage::InitSourceWalHeader {
+                    *phase = VacuumInPlacePhase::InitSourceWalHeader {
                         temp_db,
                         total_pages,
                         completion: completion.clone(),
@@ -1414,7 +1414,7 @@ pub(crate) fn vacuum_in_place_step(
                     // to set WAL `initialized = true`.
                     let wal = source_pager.wal.as_ref().unwrap();
                     let sync_c = wal.prepare_wal_finish(source_pager.get_sync_type())?;
-                    *stage = VacuumInPlaceStage::InitSourceWalHeader {
+                    *phase = VacuumInPlacePhase::InitSourceWalHeader {
                         temp_db,
                         total_pages,
                         completion: sync_c,
@@ -1427,7 +1427,7 @@ pub(crate) fn vacuum_in_place_step(
                 let temp_pager = temp_db.conn.get_pager();
                 let (page_ref, read_c) = temp_pager.read_page_no_cache(1, None, false)?;
 
-                *stage = VacuumInPlaceStage::ReadTempPage {
+                *phase = VacuumInPlacePhase::ReadTempPage {
                     temp_db,
                     total_pages,
                     next_page: 2,
@@ -1439,7 +1439,7 @@ pub(crate) fn vacuum_in_place_step(
                 continue;
             }
 
-            VacuumInPlaceStage::ReadTempPage {
+            VacuumInPlacePhase::ReadTempPage {
                 temp_db,
                 total_pages,
                 next_page,
@@ -1450,7 +1450,7 @@ pub(crate) fn vacuum_in_place_step(
             } => {
                 // Wait for the current read to complete.
                 if !read_completion.finished() {
-                    *stage = VacuumInPlaceStage::ReadTempPage {
+                    *phase = VacuumInPlacePhase::ReadTempPage {
                         temp_db,
                         total_pages,
                         next_page,
@@ -1500,7 +1500,7 @@ pub(crate) fn vacuum_in_place_step(
                     batch.writev(prepared.offset, &prepared.bufs);
                     let completions = batch.submit()?;
 
-                    *stage = VacuumInPlaceStage::WriteWalBatch {
+                    *phase = VacuumInPlacePhase::WriteWalBatch {
                         temp_db,
                         total_pages,
                         next_page,
@@ -1515,7 +1515,7 @@ pub(crate) fn vacuum_in_place_step(
                 let (page_ref, completion) =
                     temp_pager.read_page_no_cache(next_page as i64, None, false)?;
 
-                *stage = VacuumInPlaceStage::ReadTempPage {
+                *phase = VacuumInPlacePhase::ReadTempPage {
                     temp_db,
                     total_pages,
                     next_page: next_page + 1,
@@ -1527,7 +1527,7 @@ pub(crate) fn vacuum_in_place_step(
                 continue;
             }
 
-            VacuumInPlaceStage::WriteWalBatch {
+            VacuumInPlacePhase::WriteWalBatch {
                 temp_db,
                 total_pages,
                 next_page,
@@ -1538,7 +1538,7 @@ pub(crate) fn vacuum_in_place_step(
                 // unfinished completion; re-entry will re-check them all.
                 let pending = completions.iter().find(|c| !c.finished()).cloned();
                 if let Some(pending) = pending {
-                    *stage = VacuumInPlaceStage::WriteWalBatch {
+                    *phase = VacuumInPlacePhase::WriteWalBatch {
                         temp_db,
                         total_pages,
                         next_page,
@@ -1578,7 +1578,7 @@ pub(crate) fn vacuum_in_place_step(
                     let (page_ref, completion) =
                         temp_pager.read_page_no_cache(next_page as i64, None, false)?;
 
-                    *stage = VacuumInPlaceStage::ReadTempPage {
+                    *phase = VacuumInPlacePhase::ReadTempPage {
                         temp_db,
                         total_pages,
                         next_page: next_page + 1,
@@ -1597,7 +1597,7 @@ pub(crate) fn vacuum_in_place_step(
                 let sync_mode = connection.get_sync_mode();
                 if sync_mode == SyncMode::Full {
                     let sync_c = wal.sync(source_pager.get_sync_type())?;
-                    *stage = VacuumInPlaceStage::SyncSourceWal {
+                    *phase = VacuumInPlacePhase::SyncSourceWal {
                         temp_db,
                         sync_completion: sync_c,
                     };
@@ -1605,16 +1605,16 @@ pub(crate) fn vacuum_in_place_step(
                 }
 
                 // No sync needed — proceed directly to publish.
-                *stage = VacuumInPlaceStage::PublishWalCommit { temp_db };
+                *phase = VacuumInPlacePhase::PublishWalCommit { temp_db };
                 continue;
             }
 
-            VacuumInPlaceStage::SyncSourceWal {
+            VacuumInPlacePhase::SyncSourceWal {
                 temp_db,
                 sync_completion,
             } => {
                 if !sync_completion.finished() {
-                    *stage = VacuumInPlaceStage::SyncSourceWal {
+                    *phase = VacuumInPlacePhase::SyncSourceWal {
                         temp_db,
                         sync_completion: sync_completion.clone(),
                     };
@@ -1627,11 +1627,11 @@ pub(crate) fn vacuum_in_place_step(
                         "VACUUM: WAL fsync failed".to_string(),
                     ));
                 }
-                *stage = VacuumInPlaceStage::PublishWalCommit { temp_db };
+                *phase = VacuumInPlacePhase::PublishWalCommit { temp_db };
                 continue;
             }
 
-            VacuumInPlaceStage::PublishWalCommit { temp_db } => {
+            VacuumInPlacePhase::PublishWalCommit { temp_db } => {
                 let wal = source_pager
                     .wal
                     .as_ref()
@@ -1688,11 +1688,11 @@ pub(crate) fn vacuum_in_place_step(
 
                 reload_result?;
 
-                *stage = VacuumInPlaceStage::Done;
+                *phase = VacuumInPlacePhase::Done;
                 return Ok(InsnFunctionStepResult::Step);
             }
 
-            VacuumInPlaceStage::Done => {
+            VacuumInPlacePhase::Done => {
                 return Ok(InsnFunctionStepResult::Step);
             }
         }
@@ -1701,16 +1701,16 @@ pub(crate) fn vacuum_in_place_step(
 
 /// Roll back the source transaction and restore connection state after a
 /// in-place VACUUM failure. Uses `cleanup_state` flags to decide what to undo;
-/// these are independent of the stage enum and survive `std::mem::take`.
+/// these are independent of the phase enum and survive `std::mem::take`.
 ///
-/// `stage` is taken by value so helper statements inside `TargetBuild` are
+/// `phase` is taken by value so helper statements inside `TargetBuild` are
 /// dropped before we attempt `rollback_tx`. This
 /// avoids the nestedness suppression bug where live helper statements keep
 /// `Connection::nestedness > 0`, making `rollback_tx` a no-op.
 pub(crate) fn vacuum_in_place_cleanup(
     connection: &Arc<Connection>,
     db: usize,
-    stage: VacuumInPlaceStage,
+    phase: VacuumInPlacePhase,
     cleanup_state: &VacuumInPlaceCleanupState,
 ) {
     use std::sync::atomic::Ordering;
@@ -1720,10 +1720,10 @@ pub(crate) fn vacuum_in_place_cleanup(
         return;
     }
 
-    // Drop the stage first to release any target-build helper statements.
+    // Drop the phase first to release any target-build helper statements.
     // Their Drop impls decrement Connection::nestedness, which must happen
     // before rollback_tx (which is a no-op while nested).
-    drop(stage);
+    drop(phase);
 
     if cleanup_state.wal_commit_published {
         // The compacted image was already durably committed. We must not
