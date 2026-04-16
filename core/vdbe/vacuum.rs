@@ -192,16 +192,16 @@ impl VacuumPage1Meta {
 ///
 /// The temp directory is dropped after the connection and database handles so
 /// host files can be closed before the directory cleanup runs.
-#[allow(dead_code)]
 pub(crate) struct VacuumTempDb {
     pub conn: Arc<Connection>,
-    pub db: Arc<Database>,
-    pub path: String,
+    _db: Arc<Database>,
+    #[cfg(test)]
+    path: String,
     #[cfg(not(target_family = "wasm"))]
     _temp_dir: tempfile::TempDir,
 }
 
-#[allow(dead_code)]
+#[cfg(not(target_family = "wasm"))]
 fn vacuum_temp_db_encryption(
     source_conn: &Arc<Connection>,
 ) -> Result<(Option<EncryptionOpts>, Option<crate::EncryptionKey>)> {
@@ -221,7 +221,6 @@ fn vacuum_temp_db_encryption(
 }
 
 #[cfg(not(target_family = "wasm"))]
-#[allow(dead_code)]
 pub(crate) fn open_vacuum_temp_db(
     source_conn: &Arc<Connection>,
     source_db: &Arc<Database>,
@@ -234,6 +233,8 @@ pub(crate) fn open_vacuum_temp_db(
         .to_str()
         .ok_or_else(|| LimboError::InternalError("vacuum temp path is not valid UTF-8".into()))?
         .to_string();
+    #[cfg(test)]
+    let test_path = path.clone();
 
     let (encryption_opts, encryption_key) = vacuum_temp_db_encryption(source_conn)?;
     let db = Database::open_file_with_flags(
@@ -250,14 +251,14 @@ pub(crate) fn open_vacuum_temp_db(
 
     Ok(VacuumTempDb {
         conn,
-        db,
-        path,
+        _db: db,
+        #[cfg(test)]
+        path: test_path,
         _temp_dir: temp_dir,
     })
 }
 
 #[cfg(target_family = "wasm")]
-#[allow(dead_code)]
 pub(crate) fn open_vacuum_temp_db(
     _source_conn: &Arc<Connection>,
     _source_db: &Arc<Database>,
@@ -1847,7 +1848,7 @@ mod tests {
 
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
 
-        assert!(Arc::ptr_eq(&temp.db.io, &source_db.io));
+        assert!(Arc::ptr_eq(&temp._db.io, &source_db.io));
         assert_ne!(temp.path, source_db.path);
         assert!(temp.conn.is_wal_auto_checkpoint_disabled());
         assert_eq!(temp.conn.get_page_size().get(), 4096);
@@ -1882,7 +1883,7 @@ mod tests {
 
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, reserved_space)?;
 
-        assert!(temp.db.experimental_encryption_enabled());
+        assert!(temp._db.experimental_encryption_enabled());
         assert_eq!(
             temp.conn.get_encryption_cipher_mode(),
             source_conn.get_encryption_cipher_mode()

@@ -1769,10 +1769,6 @@ impl Connection {
         self.db.experimental_custom_types_enabled()
     }
 
-    pub fn experimental_encryption_enabled(&self) -> bool {
-        self.db.experimental_encryption_enabled()
-    }
-
     pub fn experimental_attach_enabled(&self) -> bool {
         self.db.experimental_attach_enabled()
     }

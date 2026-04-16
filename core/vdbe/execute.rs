@@ -14126,8 +14126,7 @@ pub(crate) struct VacuumIntoOpContext {
     /// Escaped schema name for safe SQL interpolation.
     escaped_schema_name: String,
     /// Keep output database alive while vacuum is in progress.
-    #[allow(dead_code)]
-    output_db: Option<Arc<crate::Database>>,
+    _output_db: Option<Arc<crate::Database>>,
     /// Configuration for the shared vacuum target build state machine.
     target_build_config: Option<crate::vdbe::vacuum::VacuumTargetBuildConfig>,
     /// Context for the shared vacuum target build state machine.
@@ -14206,7 +14205,7 @@ fn cleanup_op_vacuum_into(connection: &Arc<Connection>, state: &mut ProgramState
     }
 
     vacuum_state.target_build_context = None;
-    vacuum_state.output_db = None;
+    vacuum_state._output_db = None;
 
     if state.auto_txn_cleanup == TxnCleanup::RollbackTxn {
         match connection.execute("ROLLBACK") {
@@ -14408,7 +14407,7 @@ fn op_vacuum_into_inner(
                     source_mvcc_enabled: source_db.mvcc_enabled(),
                 };
 
-                vacuum_state.output_db = Some(output_db);
+                vacuum_state._output_db = Some(output_db);
                 vacuum_state.target_build_config = Some(config);
                 vacuum_state.target_build_context =
                     Some(VacuumTargetBuildContext::new(output_conn));

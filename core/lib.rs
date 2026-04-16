@@ -1720,7 +1720,7 @@ impl Database {
         self.opts.enable_custom_types
     }
 
-    pub fn experimental_encryption_enabled(&self) -> bool {
+    pub(crate) fn experimental_encryption_enabled(&self) -> bool {
         self.opts.enable_encryption
     }
 
