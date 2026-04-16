@@ -158,9 +158,9 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_generated_columns(source_db.experimental_generated_columns_enabled())
 }
 
-/// Page-1 metadata that the target build must finalize before commit.
+/// Database header metadata that the target build must finalize before commit.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct VacuumPage1Meta {
+pub(crate) struct VacuumDbHeaderMeta {
     schema_cookie: u32,
     default_page_cache_size: CacheSize,
     text_encoding: TextEncoding,
@@ -168,7 +168,7 @@ pub(crate) struct VacuumPage1Meta {
     application_id: i32,
 }
 
-impl VacuumPage1Meta {
+impl VacuumDbHeaderMeta {
     pub(crate) fn from_source_header(source: &DatabaseHeader) -> Self {
         Self {
             schema_cookie: source.schema_cookie.get().wrapping_add(1),
@@ -272,7 +272,7 @@ pub(crate) fn open_vacuum_temp_db(
 
 fn finalize_vacuum_target_header(
     target_conn: &Arc<Connection>,
-    header_meta: &VacuumPage1Meta,
+    header_meta: &VacuumDbHeaderMeta,
 ) -> Result<crate::IOResult<()>> {
     if let Some(mv_store) = target_conn.mv_store_for_db(crate::MAIN_DB_ID) {
         let tx_id = target_conn.get_mv_tx_id_for_db(crate::MAIN_DB_ID);
@@ -300,8 +300,8 @@ pub(crate) struct VacuumTargetBuildConfig {
     pub escaped_schema_name: String,
     /// Database index for schema lookups on the source connection.
     pub source_db_id: usize,
-    /// Page-1 metadata to write before committing the target database.
-    pub header_meta: VacuumPage1Meta,
+    /// Database header metadata to write before committing the target database.
+    pub header_meta: VacuumDbHeaderMeta,
     /// Pre-captured source custom type definitions for STRICT table replay.
     pub source_custom_types: Vec<(String, Arc<TypeDef>)>,
     /// Whether the source database has MVCC enabled.
@@ -311,8 +311,7 @@ pub(crate) struct VacuumTargetBuildConfig {
 /// Context for the vacuum target build. Holds the target connection and all
 /// intermediate state needed across async yields.
 pub(crate) struct VacuumTargetBuildContext {
-    /// Target connection - lives here, not in each phase variant.
-    pub target_conn: Arc<Connection>,
+    target_conn: Arc<Connection>,
     phase: VacuumTargetBuildPhase,
     /// Typed schema entries collected from sqlite_schema, ordered by rowid.
     schema_entries: Vec<SchemaEntry>,
@@ -387,7 +386,7 @@ pub(crate) enum VacuumTargetBuildPhase {
         target_schema_stmt: Box<crate::Statement>,
         idx: usize,
     },
-    /// Finalize page-1 metadata before committing the target database.
+    /// Finalize database header metadata before committing the target database.
     FinalizeTargetHeader,
     /// Operation complete
     Done,
@@ -411,7 +410,7 @@ pub(crate) enum VacuumTargetBuildPhase {
 /// 6. Creates triggers, views, and rootpage = 0 objects last (after data copy).
 ///    Custom index methods (FTS, vector) recreate and backfill their backing
 ///    indexes from the copied table data in this phase.
-/// 7. Finalizes target page-1 metadata, then commits the target transaction.
+/// 7. Finalizes target database header metadata, then commits the target transaction.
 pub(crate) fn vacuum_target_build_step(
     config: &VacuumTargetBuildConfig,
     state: &mut VacuumTargetBuildContext,
@@ -1041,7 +1040,7 @@ pub(crate) enum VacuumInPlacePhase {
     /// this is a two-phase state: first attempt acquires read + tries write,
     /// re-entry after IO yield retries only the write (read is already held).
     BeginSourceTx,
-    /// Read source page-1 header metadata for the target-build config.
+    /// Read source database header metadata for the target-build config.
     ReadSourceMetadata,
     /// Create temp DB and run the shared target-build engine.
     TargetBuild {
@@ -1228,17 +1227,17 @@ pub(crate) fn vacuum_in_place_step(
                 // Read reserved bytes and header metadata in a single
                 // with_header call to avoid redundant page-1 access.
                 let io = &*source_pager.io;
-                let (reserved_space, header_meta): (u8, VacuumPage1Meta) =
+                let (reserved_space, header_meta): (u8, VacuumDbHeaderMeta) =
                     match connection.get_reserved_bytes() {
                         Some(val) => {
                             let dh = io.block(|| {
-                                source_pager.with_header(VacuumPage1Meta::from_source_header)
+                                source_pager.with_header(VacuumDbHeaderMeta::from_source_header)
                             })?;
                             (val, dh)
                         }
                         None => io.block(|| {
                             source_pager.with_header(|h| {
-                                (h.reserved_space, VacuumPage1Meta::from_source_header(h))
+                                (h.reserved_space, VacuumDbHeaderMeta::from_source_header(h))
                             })
                         })?,
                     };
@@ -1754,7 +1753,7 @@ mod tests {
     use crate::util::IOExt;
 
     #[test]
-    fn vacuum_page1_meta_bumps_schema_cookie_and_preserves_sqlite_metadata() {
+    fn vacuum_db_header_meta_bumps_schema_cookie_and_preserves_sqlite_metadata() {
         let mut source = DatabaseHeader::default();
         source.schema_cookie = u32::MAX.into();
         source.default_page_cache_size = CacheSize::new(123);
@@ -1762,13 +1761,13 @@ mod tests {
         source.user_version = 7.into();
         source.application_id = 12.into();
 
-        let VacuumPage1Meta {
+        let VacuumDbHeaderMeta {
             schema_cookie,
             default_page_cache_size,
             text_encoding,
             user_version,
             application_id,
-        } = VacuumPage1Meta::from_source_header(&source);
+        } = VacuumDbHeaderMeta::from_source_header(&source);
 
         assert_eq!(schema_cookie, 0);
         assert_eq!(default_page_cache_size, CacheSize::new(123));
@@ -1779,7 +1778,7 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn vacuum_page1_meta_updates_target_header() -> Result<()> {
+    fn vacuum_db_header_meta_updates_target_header() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
         let source_dir = tempfile::tempdir().unwrap();
         let source_path = source_dir.path().join("source.db");
@@ -1800,7 +1799,7 @@ mod tests {
         source_header.text_encoding = TextEncoding::Utf8;
         source_header.user_version = 17.into();
         source_header.application_id = 29.into();
-        let header_meta = VacuumPage1Meta::from_source_header(&source_header);
+        let header_meta = VacuumDbHeaderMeta::from_source_header(&source_header);
 
         temp.conn.execute("BEGIN")?;
         match finalize_vacuum_target_header(&temp.conn, &header_meta)? {

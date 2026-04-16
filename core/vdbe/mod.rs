@@ -2054,7 +2054,7 @@ impl Program {
 
         let mut abort_error: Option<LimboError> = None;
 
-        // VACUUM state can own internal helper statements whose drop path
+        // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
         // releases nested guards. Clean it before checking whether this program
         // is itself nested; otherwise abort could skip top-level cleanup.
         if let Err(err) = execute::cleanup_vacuum_state(&self.connection, state) {

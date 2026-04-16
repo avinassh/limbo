@@ -14117,7 +14117,7 @@ pub(crate) enum VacuumIntoOpPhase {
     Done,
 }
 
-/// Context for the VACUUM INTO opcode wrapper.
+/// Holds the state for the VACUUM INTO opcode operation.
 #[derive(Default)]
 pub(crate) struct VacuumIntoOpContext {
     phase: VacuumIntoOpPhase,
@@ -14146,7 +14146,7 @@ pub(crate) struct VacuumIntoOpContext {
 ///    internal storage-backed tables
 /// 5. Creates user-defined secondary indexes after data copy for performance
 ///    (backing-btree indexes for custom index methods are excluded here)
-/// 6. Finalizes output page-1 metadata
+/// 6. Finalizes output database header metadata
 /// 7. Creates triggers, views, and rootpage = 0 objects last (after data copy).
 ///    Custom index methods (FTS, vector) recreate and backfill their backing
 ///    indexes from the copied table data in this phase.
@@ -14230,7 +14230,7 @@ fn op_vacuum_into_inner(
     insn: &Insn,
 ) -> Result<InsnFunctionStepResult> {
     use crate::vdbe::vacuum::{
-        vacuum_target_build_step, vacuum_target_opts_from_source, VacuumPage1Meta,
+        vacuum_target_build_step, vacuum_target_opts_from_source, VacuumDbHeaderMeta,
         VacuumTargetBuildConfig, VacuumTargetBuildContext,
     };
 
@@ -14311,15 +14311,16 @@ fn op_vacuum_into_inner(
                 let source_pager = program
                     .connection
                     .get_pager_from_database_index(&source_db_id);
-                let header_meta =
-                    if let Some(mv_store) = program.connection.mv_store_for_db(source_db_id) {
-                        let tx_id = program.connection.get_mv_tx_id_for_db(source_db_id);
-                        mv_store.with_header(VacuumPage1Meta::from_source_header, tx_id.as_ref())?
-                    } else {
-                        source_pager.io.block(|| {
-                            source_pager.with_header(VacuumPage1Meta::from_source_header)
-                        })?
-                    };
+                let header_meta = if let Some(mv_store) =
+                    program.connection.mv_store_for_db(source_db_id)
+                {
+                    let tx_id = program.connection.get_mv_tx_id_for_db(source_db_id);
+                    mv_store.with_header(VacuumDbHeaderMeta::from_source_header, tx_id.as_ref())?
+                } else {
+                    source_pager.io.block(|| {
+                        source_pager.with_header(VacuumDbHeaderMeta::from_source_header)
+                    })?
+                };
 
                 let reserved_space: u8 = if !is_attached_db(source_db_id) {
                     // For main or temp db prefer cached value to avoid blocking I/O
