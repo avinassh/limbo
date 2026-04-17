@@ -3638,7 +3638,7 @@ pub mod test {
             Arc::new(crate::Page::new(5)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool.clone())
+            .read_frames_batch(1, &target_pages, buffer_pool)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -3668,7 +3668,7 @@ pub mod test {
             Arc::new(crate::Page::new(13)),
         ];
         let c = wal
-            .read_frames_batch(2, &target_pages, buffer_pool.clone())
+            .read_frames_batch(2, &target_pages, buffer_pool)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -3699,7 +3699,7 @@ pub mod test {
             Arc::new(crate::Page::new(9)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool.clone())
+            .read_frames_batch(1, &target_pages, buffer_pool)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -3730,7 +3730,7 @@ pub mod test {
             Arc::new(crate::Page::new(22)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool.clone())
+            .read_frames_batch(1, &target_pages, buffer_pool)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -3768,7 +3768,7 @@ pub mod test {
             Arc::new(crate::Page::new(99)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool.clone())
+            .read_frames_batch(1, &target_pages, buffer_pool)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 

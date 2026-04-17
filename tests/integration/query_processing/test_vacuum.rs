@@ -313,7 +313,7 @@ impl File for QueuedFile {
         let inner = self.inner.clone();
         let c = completion.clone();
         self.enqueue(QueuedIoOpKind::Pread, completion, move || {
-            let _ = inner.pread(pos, c)?;
+            drop(inner.pread(pos, c)?);
             Ok(())
         })
     }
@@ -327,7 +327,7 @@ impl File for QueuedFile {
         let inner = self.inner.clone();
         let c = completion.clone();
         self.enqueue(QueuedIoOpKind::Pwrite, completion, move || {
-            let _ = inner.pwrite(pos, buffer, c)?;
+            drop(inner.pwrite(pos, buffer, c)?);
             Ok(())
         })
     }
@@ -340,7 +340,7 @@ impl File for QueuedFile {
         let inner = self.inner.clone();
         let c = completion.clone();
         self.enqueue(QueuedIoOpKind::Sync, completion, move || {
-            let _ = inner.sync(c, sync_type)?;
+            drop(inner.sync(c, sync_type)?);
             Ok(())
         })
     }
@@ -354,7 +354,7 @@ impl File for QueuedFile {
         let inner = self.inner.clone();
         let c = completion.clone();
         self.enqueue(QueuedIoOpKind::Pwritev, completion, move || {
-            let _ = inner.pwritev(pos, buffers, c)?;
+            drop(inner.pwritev(pos, buffers, c)?);
             Ok(())
         })
     }
@@ -367,7 +367,7 @@ impl File for QueuedFile {
         let inner = self.inner.clone();
         let c = completion.clone();
         self.enqueue(QueuedIoOpKind::Truncate, completion, move || {
-            let _ = inner.truncate(len, c)?;
+            drop(inner.truncate(len, c)?);
             Ok(())
         })
     }
@@ -4259,13 +4259,10 @@ fn test_plain_vacuum_active_reader_blocks_fold_contract() -> anyhow::Result<()> 
 
     let result = writer.execute("VACUUM");
     let vacuum_succeeded = result.is_ok();
-    match result {
-        Ok(()) => {
-            assert_eq!(scalar_i64(&writer, "SELECT COUNT(*) FROM t"), 20);
-            assert_eq!(run_integrity_check(&writer), "ok");
-            assert_plain_vacuum_folded_into_db_file(&tmp_db, &writer);
-        }
-        Err(_) => {}
+    if let Ok(()) = result {
+        assert_eq!(scalar_i64(&writer, "SELECT COUNT(*) FROM t"), 20);
+        assert_eq!(run_integrity_check(&writer), "ok");
+        assert_plain_vacuum_folded_into_db_file(&tmp_db, &writer);
     }
 
     if let Err(err) = reader.execute("ROLLBACK") {
