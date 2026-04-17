@@ -445,10 +445,11 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
 /// Test VACUUM INTO error cases: plain VACUUM, existing file, within
 /// transaction, and query_only mode.
-#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER)")?;
     conn.execute("INSERT INTO t VALUES (1)")?;
 
     let dest_dir = TempDir::new()?;

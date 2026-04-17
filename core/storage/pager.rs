@@ -2626,8 +2626,7 @@ impl Pager {
     pub fn begin_exclusive_tx(&self) -> Result<IOResult<()>> {
         if !self.db_initialized() {
             return Err(LimboError::InternalError(
-                "VACUUM requires an initialized database (page 1 must already be allocated)"
-                    .into(),
+                "VACUUM requires an initialized database (page 1 must already be allocated)".into(),
             ));
         }
         let wal = self
@@ -4869,10 +4868,6 @@ impl Pager {
 
     pub fn set_reserved_space_bytes(&self, value: u8) {
         self.set_reserved_space(value);
-        #[cfg(feature = "checksum")]
-        if value != crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES {
-            self.reset_checksum_context();
-        }
     }
 
     /// Encryption is an opt-in feature. If the flag is passed, then enable the encryption on
