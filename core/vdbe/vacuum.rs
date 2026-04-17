@@ -1139,8 +1139,8 @@ pub(crate) enum VacuumInPlacePhase {
     PublishWalCommit { temp_db: Box<VacuumTempDb> },
     /// TRUNCATE checkpoint: copy WAL frames back into the DB file and truncate
     /// the WAL to zero. The pager's internal state machine handles the multi-step
-    /// IO (backfill → sync DB → truncate WAL). Non-fatal if it fails — data is
-    /// already durable in the WAL.
+    /// IO (backfill → sync DB → truncate WAL). Plain VACUUM requires this fold
+    /// to complete before reporting success.
     Checkpoint,
     /// Reload the schema from the freshly committed (and possibly checkpointed) DB.
     SchemaReload,
@@ -1156,6 +1156,22 @@ impl Default for VacuumInPlacePhase {
 
 /// The batch size for copy-back: how many temp pages to read per batch.
 const VACUUM_COPY_BATCH_SIZE: u32 = 64;
+
+fn vacuum_copy_batch_end(start_page: u32, total_pages: u32) -> u32 {
+    (start_page + VACUUM_COPY_BATCH_SIZE).min(total_pages + 1)
+}
+
+#[cfg(test)]
+fn vacuum_copy_batch_ranges(total_pages: u32) -> Vec<(u32, u32)> {
+    let mut ranges = Vec::new();
+    let mut start = 1;
+    while start <= total_pages {
+        let end = vacuum_copy_batch_end(start, total_pages);
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
 
 /// Coalesce `(page_ref, frame_id)` pairs into contiguous-frame-id runs.
 ///
@@ -1206,9 +1222,10 @@ fn start_temp_batch_reads(
         "empty vacuum read batch",
         { "batch_start": batch_start, "batch_end": batch_end }
     );
-    let wal = temp_pager.wal.as_ref().ok_or_else(|| {
-        LimboError::InternalError("VACUUM requires a temp WAL pager".into())
-    })?;
+    let wal = temp_pager
+        .wal
+        .as_ref()
+        .ok_or_else(|| LimboError::InternalError("VACUUM requires a temp WAL pager".into()))?;
 
     let len = (batch_end - batch_start) as usize;
     let mut logical_pages: Vec<crate::storage::pager::PageRef> = Vec::with_capacity(len);
@@ -1229,16 +1246,40 @@ fn start_temp_batch_reads(
 
     let mut group = CompletionGroup::new(|_| {});
     for (start_frame, run_pages) in &runs {
-        let c = wal.read_frames_batch(
-            *start_frame,
-            run_pages,
-            temp_pager.buffer_pool.clone(),
-        )?;
+        let c = wal.read_frames_batch(*start_frame, run_pages, temp_pager.buffer_pool.clone())?;
         group.add(&c);
     }
     let combined = group.build();
 
     Ok((logical_pages, combined))
+}
+
+fn reload_schema_after_vacuum_commit(
+    connection: &Arc<Connection>,
+    db: usize,
+    source_pager: &crate::storage::pager::Pager,
+) -> Result<()> {
+    // Schema reload under a self-contained read guard. If this fails the
+    // cleared schema cookie will trigger a re-read on the next operation.
+    source_pager.begin_read_tx()?;
+    connection.set_tx_state(crate::connection::TransactionState::Read);
+
+    let reload_result = connection.reparse_schema();
+
+    if reload_result.is_ok() {
+        // Publish the freshly parsed schema to the shared Database so other
+        // connections see the new cookie and table defs.
+        let schema = connection.schema.read().clone();
+        let source_db = connection.get_source_database(db);
+        source_db.update_schema_if_newer(schema);
+    }
+
+    // Always end the schema-reload read tx and restore state, whether the
+    // reload succeeded or failed.
+    source_pager.end_read_tx();
+    connection.set_tx_state(crate::connection::TransactionState::None);
+
+    reload_result
 }
 
 /// Step the in-place VACUUM state machine once. Returns `IO` to yield or `Step`
@@ -1472,7 +1513,7 @@ pub(crate) fn vacuum_in_place_step(
 
                 // WAL already initialized — kick off the first read batch.
                 let temp_pager = temp_db.conn.get_pager();
-                let batch_end = (1 + VACUUM_COPY_BATCH_SIZE).min(total_pages + 1);
+                let batch_end = vacuum_copy_batch_end(1, total_pages);
                 let (batch_pages, read_completion) =
                     start_temp_batch_reads(&temp_pager, 1, batch_end)?;
 
@@ -1526,7 +1567,7 @@ pub(crate) fn vacuum_in_place_step(
 
                 // WAL header fully initialized. Kick off the first read batch.
                 let temp_pager = temp_db.conn.get_pager();
-                let batch_end = (1 + VACUUM_COPY_BATCH_SIZE).min(total_pages + 1);
+                let batch_end = vacuum_copy_batch_end(1, total_pages);
                 let (batch_pages, read_completion) =
                     start_temp_batch_reads(&temp_pager, 1, batch_end)?;
 
@@ -1650,8 +1691,7 @@ pub(crate) fn vacuum_in_place_step(
                 if next_page <= total_pages {
                     // Kick off the next read batch in parallel.
                     let temp_pager = temp_db.conn.get_pager();
-                    let batch_end =
-                        (next_page + VACUUM_COPY_BATCH_SIZE).min(total_pages + 1);
+                    let batch_end = vacuum_copy_batch_end(next_page, total_pages);
                     let (batch_pages, read_completion) =
                         start_temp_batch_reads(&temp_pager, next_page, batch_end)?;
 
@@ -1752,8 +1792,6 @@ pub(crate) fn vacuum_in_place_step(
             VacuumInPlacePhase::Checkpoint => {
                 // TRUNCATE checkpoint: copy WAL frames into the DB file,
                 // sync the DB, then truncate the WAL to zero bytes.
-                // Non-fatal if it fails — data is already durable in the WAL
-                // and will be checkpointed by the next auto-checkpoint.
                 let sync_mode = connection.get_sync_mode();
                 match source_pager.checkpoint(
                     crate::storage::wal::CheckpointMode::Truncate {
@@ -1762,7 +1800,10 @@ pub(crate) fn vacuum_in_place_step(
                     sync_mode,
                     true,
                 ) {
-                    Ok(crate::IOResult::Done(_)) => {
+                    Ok(crate::IOResult::Done(result)) => {
+                        if !result.should_truncate() {
+                            return Err(LimboError::Busy);
+                        }
                         *phase = VacuumInPlacePhase::SchemaReload;
                         continue;
                     }
@@ -1771,36 +1812,21 @@ pub(crate) fn vacuum_in_place_step(
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
                     Err(err) => {
-                        tracing::info!("VACUUM post-commit checkpoint failed (non-fatal): {err}");
-                        *phase = VacuumInPlacePhase::SchemaReload;
-                        continue;
+                        tracing::info!("VACUUM post-commit checkpoint failed: {err}");
+                        if let Err(reload_err) =
+                            reload_schema_after_vacuum_commit(connection, db, &source_pager)
+                        {
+                            tracing::info!(
+                                "VACUUM schema reload after checkpoint failure also failed: {reload_err}"
+                            );
+                        }
+                        return Err(err);
                     }
                 }
             }
 
             VacuumInPlacePhase::SchemaReload => {
-                // Schema reload under a self-contained read guard. If this
-                // fails the connection is still usable — the cleared schema
-                // cookie will trigger a re-read on the next operation.
-                source_pager.begin_read_tx()?;
-                connection.set_tx_state(crate::connection::TransactionState::Read);
-
-                let reload_result = connection.reparse_schema();
-
-                if reload_result.is_ok() {
-                    // Publish the freshly parsed schema to the shared Database
-                    // so other connections see the new cookie and table defs.
-                    let schema = connection.schema.read().clone();
-                    let source_db = connection.get_source_database(db);
-                    source_db.update_schema_if_newer(schema);
-                }
-
-                // Always end the schema-reload read tx and restore state,
-                // whether the reload succeeded or failed.
-                source_pager.end_read_tx();
-                connection.set_tx_state(crate::connection::TransactionState::None);
-
-                reload_result?;
+                reload_schema_after_vacuum_commit(connection, db, &source_pager)?;
 
                 *phase = VacuumInPlacePhase::Done;
                 return Ok(InsnFunctionStepResult::Step);
@@ -1957,6 +1983,49 @@ mod tests {
         for (_, pages) in &runs {
             assert_eq!(pages.len(), 1);
         }
+    }
+
+    #[test]
+    fn coalesce_frame_runs_keeps_run_pages_in_physical_frame_order() {
+        let runs = coalesce_frame_runs(vec![
+            (page_ref(1), 12),
+            (page_ref(2), 10),
+            (page_ref(3), 11),
+            (page_ref(4), 13),
+        ]);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].0, 10);
+        assert_eq!(
+            runs[0].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            vec![2, 3, 1, 4]
+        );
+    }
+
+    #[test]
+    fn vacuum_copy_batch_ranges_cover_boundary_page_counts() {
+        let size = VACUUM_COPY_BATCH_SIZE;
+        assert!(vacuum_copy_batch_ranges(0).is_empty());
+        assert_eq!(vacuum_copy_batch_ranges(1), vec![(1, 2)]);
+        assert_eq!(vacuum_copy_batch_ranges(2), vec![(1, 3)]);
+        assert_eq!(vacuum_copy_batch_ranges(size - 1), vec![(1, size)]);
+        assert_eq!(vacuum_copy_batch_ranges(size), vec![(1, size + 1)]);
+        assert_eq!(
+            vacuum_copy_batch_ranges(size + 1),
+            vec![(1, size + 1), (size + 1, size + 2)]
+        );
+        assert_eq!(
+            vacuum_copy_batch_ranges(size * 2),
+            vec![(1, size + 1), (size + 1, size * 2 + 1)]
+        );
+        assert_eq!(
+            vacuum_copy_batch_ranges(size * 2 + 1),
+            vec![
+                (1, size + 1),
+                (size + 1, size * 2 + 1),
+                (size * 2 + 1, size * 2 + 2),
+            ]
+        );
     }
 
     #[test]

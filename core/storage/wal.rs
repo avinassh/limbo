@@ -1567,7 +1567,10 @@ impl Wal for WalFile {
         pages: &[PageRef],
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Completion> {
-        turso_assert!(!pages.is_empty(), "read_frames_batch requires at least one page");
+        turso_assert!(
+            !pages.is_empty(),
+            "read_frames_batch requires at least one page"
+        );
         let page_size = self.page_size() as usize;
         turso_assert!(page_size > 0, "WAL page size must be initialized");
         let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
@@ -1619,15 +1622,25 @@ impl Wal for WalFile {
                     &raw[frame_start..frame_start + frame_size],
                 );
                 let expected_page_id = page.get().id;
-                turso_assert!(
-                    header.page_number as usize == expected_page_id,
-                    "WAL batch frame page_no mismatch",
-                    {
-                        "frame_id": start_frame + i as u64,
-                        "expected": expected_page_id,
-                        "got": header.page_number
+                if header.page_number as usize != expected_page_id {
+                    mark_unlikely();
+                    tracing::error!(
+                        frame_id = start_frame + i as u64,
+                        expected = expected_page_id,
+                        got = header.page_number,
+                        "WAL batch frame page_no mismatch"
+                    );
+                    page.clear_locked();
+                    page.clear_wal_tag();
+                    if first_err.is_none() {
+                        first_err = Some(CompletionError::WalFramePageMismatch {
+                            frame_id: start_frame + i as u64,
+                            expected: expected_page_id,
+                            actual: header.page_number,
+                        });
                     }
-                );
+                    continue;
+                }
 
                 let body_slice = page_buf.as_mut_slice();
                 body_slice.copy_from_slice(page_body);
@@ -3354,19 +3367,21 @@ impl WalFileShared {
 
 #[cfg(test)]
 pub mod test {
-    use super::{ReadGuardKind, WalConnectionState, WalFile, WalSnapshot};
+    use super::{ReadGuardKind, Wal, WalConnectionState, WalFile, WalSnapshot};
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
     use crate::{
+        io::FileSyncType,
         storage::{
             buffer_pool::BufferPool,
-            sqlite3_ondisk::{self, WAL_HEADER_SIZE},
+            pager::{allocate_new_page, PageRef},
+            sqlite3_ondisk::{self, PageSize, WAL_HEADER_SIZE},
             wal::READMARK_NOT_USED,
         },
         types::IOResult,
         util::IOExt,
-        CheckpointMode, CheckpointResult, Completion, Connection, Database, LimboError, PlatformIO,
-        WalFileShared, IO,
+        CheckpointMode, CheckpointResult, Completion, CompletionError, Connection, Database,
+        LimboError, MemoryIO, OpenFlags, PlatformIO, WalFileShared, IO,
     };
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -3518,6 +3533,246 @@ pub mod test {
         let shared = WalFileShared::new_noop();
         let wal = WalFile::new(io, shared.clone(), ((0, 0), 0), buffer_pool);
         (shared, wal)
+    }
+
+    fn make_initialized_memory_wal(page_size: u32) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size as usize)
+            .unwrap();
+        let file = io
+            .open_file("direct-batch-read.db-wal", OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let wal = WalFile::new(io.clone(), shared, ((0, 0), 0), buffer_pool.clone());
+        let page_size = PageSize::new(page_size).unwrap();
+
+        if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
+            io.wait_for_completion(c).unwrap();
+        }
+        let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        (io, buffer_pool, wal)
+    }
+
+    fn page_with_pattern(page_id: i64, seed: u8, buffer_pool: &Arc<BufferPool>) -> PageRef {
+        let page = allocate_new_page(page_id, buffer_pool);
+        for (idx, byte) in page.get_contents().as_ptr().iter_mut().enumerate() {
+            *byte = seed.wrapping_add(idx as u8).wrapping_add(page_id as u8);
+        }
+        page
+    }
+
+    fn append_test_pages(
+        io: &Arc<dyn IO>,
+        wal: &WalFile,
+        page_size: u32,
+        pages: &[PageRef],
+    ) -> Vec<Vec<u8>> {
+        let prepared = wal
+            .prepare_frames(pages, PageSize::new(page_size).unwrap(), Some(99), None)
+            .unwrap();
+        let expected = pages
+            .iter()
+            .map(|page| page.get_contents().as_ptr().to_vec())
+            .collect::<Vec<_>>();
+
+        let file = wal.wal_file().unwrap();
+        let c = file
+            .pwritev(
+                prepared.offset,
+                prepared.bufs.clone(),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        wal.commit_prepared_frames(&[prepared]);
+        wal.finish_append_frames_commit().unwrap();
+        expected
+    }
+
+    fn wait_for_completion_error(io: &Arc<dyn IO>, completion: Completion) -> CompletionError {
+        match io.wait_for_completion(completion) {
+            Err(LimboError::CompletionError(err)) => err,
+            other => panic!("expected completion error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_reads_contiguous_wal_frames_directly() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(2, 0x10, &buffer_pool),
+            page_with_pattern(3, 0x20, &buffer_pool),
+            page_with_pattern(4, 0x30, &buffer_pool),
+            page_with_pattern(5, 0x40, &buffer_pool),
+        ];
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(2)),
+            Arc::new(crate::Page::new(3)),
+            Arc::new(crate::Page::new(4)),
+            Arc::new(crate::Page::new(5)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool.clone())
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
+            assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
+            assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
+            assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_can_start_from_middle_frame() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(10, 0x01, &buffer_pool),
+            page_with_pattern(11, 0x02, &buffer_pool),
+            page_with_pattern(12, 0x03, &buffer_pool),
+            page_with_pattern(13, 0x04, &buffer_pool),
+        ];
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(11)),
+            Arc::new(crate::Page::new(12)),
+            Arc::new(crate::Page::new(13)),
+        ];
+        let c = wal
+            .read_frames_batch(2, &target_pages, buffer_pool.clone())
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
+            assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
+            assert_eq!(page.wal_tag_pair(), ((idx + 2) as u64, 0));
+            assert_eq!(page.get_contents().as_ptr(), expected[idx + 1].as_slice());
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_follows_physical_frame_order_not_page_id_order() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(7, 0x71, &buffer_pool),
+            page_with_pattern(2, 0x22, &buffer_pool),
+            page_with_pattern(5, 0x55, &buffer_pool),
+            page_with_pattern(9, 0x99, &buffer_pool),
+        ];
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(7)),
+            Arc::new(crate::Page::new(2)),
+            Arc::new(crate::Page::new(5)),
+            Arc::new(crate::Page::new(9)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool.clone())
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert_eq!(
+                page.get_contents().as_ptr(),
+                expected[idx].as_slice(),
+                "frame-order read should preserve page {} contents",
+                page.get().id
+            );
+            assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_short_read_errors_and_clears_page_locks() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(20, 0x20, &buffer_pool),
+            page_with_pattern(21, 0x21, &buffer_pool),
+        ];
+        append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(20)),
+            Arc::new(crate::Page::new(21)),
+            Arc::new(crate::Page::new(22)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool.clone())
+            .unwrap();
+        let err = wait_for_completion_error(&io, c);
+
+        assert!(
+            matches!(err, CompletionError::ShortReadWalFrame { .. }),
+            "unexpected error: {err:?}"
+        );
+        for page in &target_pages {
+            assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
+            assert!(
+                !page.is_loaded(),
+                "page {} should not be loaded",
+                page.get().id
+            );
+            assert!(
+                !page.has_wal_tag(),
+                "page {} should not be tagged",
+                page.get().id
+            );
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_page_number_mismatch_returns_error_not_panic() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(30, 0x30, &buffer_pool),
+            page_with_pattern(31, 0x31, &buffer_pool),
+        ];
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(30)),
+            Arc::new(crate::Page::new(99)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool.clone())
+            .unwrap();
+        let err = wait_for_completion_error(&io, c);
+
+        assert!(
+            matches!(
+                err,
+                CompletionError::WalFramePageMismatch {
+                    frame_id: 2,
+                    expected: 99,
+                    actual: 31
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert!(target_pages[0].is_loaded());
+        assert_eq!(
+            target_pages[0].get_contents().as_ptr(),
+            expected[0].as_slice()
+        );
+        assert!(!target_pages[0].is_locked());
+        assert!(!target_pages[1].is_loaded());
+        assert!(!target_pages[1].is_locked());
+        assert!(!target_pages[1].has_wal_tag());
     }
 
     fn set_shared_snapshot(shared: &Arc<RwLock<WalFileShared>>, snapshot: WalSnapshot) {
