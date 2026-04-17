@@ -2626,10 +2626,6 @@ impl Connection {
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
         let pager = self.pager.load();
         pager.set_reserved_space_bytes(reserved_bytes);
-        #[cfg(feature = "checksum")]
-        if reserved_bytes != crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES {
-            pager.reset_checksum_context();
-        }
         Ok(())
     }
 

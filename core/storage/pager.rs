@@ -4861,6 +4861,10 @@ impl Pager {
 
     pub fn set_reserved_space_bytes(&self, value: u8) {
         self.set_reserved_space(value);
+        #[cfg(feature = "checksum")]
+        if value != crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES {
+            self.reset_checksum_context();
+        }
     }
 
     /// Encryption is an opt-in feature. If the flag is passed, then enable the encryption on

@@ -68,7 +68,6 @@ use crate::{
     schema::Trigger,
     stats::refresh_analyze_stats,
     storage::{
-        checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
         encryption::{AtomicCipherMode, SQLITE_HEADER, TURSO_HEADER_PREFIX},
         journal_mode,
         pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut},
@@ -1558,16 +1557,10 @@ impl Database {
                 Some(cipher.metadata_size() as u8)
             } else {
                 // For non-encrypted databases, don't set reserved_bytes here.
-                // This allows checksums to be enabled by default (disable_checksums will be false).
+                // This allows checksums to be enabled by default.
                 None
             }
         });
-        let disable_checksums = if let Some(reserved_bytes) = reserved_bytes {
-            // if the required reserved bytes for checksums is not present, disable checksums
-            reserved_bytes != CHECKSUM_REQUIRED_RESERVED_BYTES
-        } else {
-            false
-        };
         // Check if WAL is enabled
         let shared_wal = self.shared_wal.read();
 
@@ -1601,9 +1594,6 @@ impl Database {
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);
-        }
-        if disable_checksums {
-            pager.reset_checksum_context();
         }
 
         Ok(pager)
