@@ -426,11 +426,18 @@ pub trait Wal: Debug + Send + Sync {
     /// For each `i`, `pages[i]` receives the decoded page body of frame
     /// `start_frame + i`. Each page is locked on entry and finished (or
     /// cleared on error) inside the completion callback.
+    ///
+    /// If `scratch_buf` is `Some`, it is used as the pread destination (must
+    /// have length exactly `(page_size + WAL_FRAME_HEADER_SIZE) * pages.len()`).
+    /// Otherwise a fresh temporary buffer is allocated. VACUUM passes a
+    /// pre-allocated buffer to amortize the ~batch-size allocation across
+    /// batches.
     fn read_frames_batch(
         &self,
         start_frame: u64,
         pages: &[PageRef],
         buffer_pool: Arc<BufferPool>,
+        scratch_buf: Option<Arc<Buffer>>,
     ) -> Result<Completion>;
 
     /// Read a raw frame (header included) from the WAL.
@@ -1566,6 +1573,7 @@ impl Wal for WalFile {
         start_frame: u64,
         pages: &[PageRef],
         buffer_pool: Arc<BufferPool>,
+        scratch_buf: Option<Arc<Buffer>>,
     ) -> Result<Completion> {
         turso_assert!(
             !pages.is_empty(),
@@ -1577,6 +1585,13 @@ impl Wal for WalFile {
         let count = pages.len();
         let total = frame_size * count;
         let offset = self.frame_offset(start_frame);
+        if let Some(buf) = &scratch_buf {
+            turso_assert!(
+                buf.len() == total,
+                "read_frames_batch scratch_buf size must match expected pread length",
+                { "buf_len": buf.len(), "expected": total }
+            );
+        }
 
         // Lock each target page and pre-allocate its destination buffer so the
         // completion callback only parses headers, decrypts/verifies, and copies.
@@ -1599,7 +1614,7 @@ impl Wal for WalFile {
         let epoch = self.with_shared(|shared| shared.epoch.load(Ordering::Acquire));
         let enc_or_csum = self.io_ctx.read().encryption_or_checksum().clone();
 
-        let raw_buf = Arc::new(Buffer::new_temporary(total));
+        let raw_buf = scratch_buf.unwrap_or_else(|| Arc::new(Buffer::new_temporary(total)));
 
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
@@ -2059,29 +2074,7 @@ impl Wal for WalFile {
                 .is_ok(),
             "begin_exclusive_tx: write_lock_held already set"
         );
-
-        // Try to restart the log (same as begin_write_tx).
-        let result = self.try_restart_log_before_write();
-        if let Err(LimboError::Busy) | Ok(()) = &result {
-            return Ok(());
-        }
-
-        // Restart failed with a non-Busy error — release locks.
-        self.with_shared(|shared| {
-            shared.write_lock.unlock();
-        });
-        turso_assert!(
-            self.write_lock_held
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "begin_exclusive_tx: write_lock_held not set during rollback"
-        );
-        // Leave read_locks[0] + checkpoint_lock held — caller owns those
-        // via cleanup_state and will release them.
-        // Actually, on error we should release read_locks[0] too.
-        self.end_read_tx();
-
-        Err(result.expect_err("Ok case handled above"))
+        Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -3638,7 +3631,7 @@ pub mod test {
             Arc::new(crate::Page::new(5)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool)
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -3668,7 +3661,7 @@ pub mod test {
             Arc::new(crate::Page::new(13)),
         ];
         let c = wal
-            .read_frames_batch(2, &target_pages, buffer_pool)
+            .read_frames_batch(2, &target_pages, buffer_pool, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -3699,7 +3692,7 @@ pub mod test {
             Arc::new(crate::Page::new(9)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool)
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -3730,7 +3723,7 @@ pub mod test {
             Arc::new(crate::Page::new(22)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool)
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -3768,7 +3761,7 @@ pub mod test {
             Arc::new(crate::Page::new(99)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool)
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 

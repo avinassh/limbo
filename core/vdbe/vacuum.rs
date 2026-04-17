@@ -1065,6 +1065,12 @@ pub(crate) struct VacuumInPlaceCleanupState {
     /// WAL commit was published via `finish_append_frames_commit`. Once true
     /// the compacted image is durable and rollback must not be attempted.
     pub wal_commit_published: bool,
+    /// Scratch buffer for `Wal::read_frames_batch`, sized to one full copy
+    /// batch. Allocated lazily on first use and reused across every batch to
+    /// avoid a ~(page_size + 24) × `VACUUM_COPY_BATCH_SIZE` allocation per
+    /// batch. Only runs whose total size matches this buffer's length can
+    /// reuse it (which is the common, max-sized run case).
+    pub read_scratch_buf: Option<Arc<crate::io::Buffer>>,
 }
 
 /// Phases for the in-place VACUUM state machine.
@@ -1240,9 +1246,11 @@ fn start_temp_batch_reads(
     temp_pager: &crate::storage::pager::Pager,
     batch_start: u32,
     batch_end: u32,
+    scratch_buf: &mut Option<Arc<crate::io::Buffer>>,
 ) -> Result<(Vec<crate::storage::pager::PageRef>, crate::io::Completion)> {
     use crate::io::CompletionGroup;
     use crate::storage::pager::Page;
+    use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 
     turso_assert!(
         batch_start < batch_end,
@@ -1281,9 +1289,34 @@ fn start_temp_batch_reads(
 
     let runs = coalesce_frame_runs(pairs);
 
+    // Lazy-init the scratch buffer at max-batch size. It is reused by any run
+    // whose read length matches exactly (the common case where target-build
+    // wrote a contiguous chunk of at least `VACUUM_COPY_BATCH_SIZE` pages).
+    let frame_size = temp_pager.get_page_size_unchecked().get() as usize + WAL_FRAME_HEADER_SIZE;
+    let scratch_total = frame_size * VACUUM_COPY_BATCH_SIZE as usize;
+    if scratch_buf
+        .as_ref()
+        .is_none_or(|b| b.len() != scratch_total)
+    {
+        *scratch_buf = Some(Arc::new(crate::io::Buffer::new_temporary(scratch_total)));
+    }
+
     let mut group = CompletionGroup::new(|_| {});
+    let mut scratch_claimed = false;
     for (start_frame, run_pages) in &runs {
-        let c = wal.read_frames_batch(*start_frame, run_pages, temp_pager.buffer_pool.clone())?;
+        let run_total = frame_size * run_pages.len();
+        let run_scratch = if !scratch_claimed && run_total == scratch_total {
+            scratch_claimed = true;
+            scratch_buf.clone()
+        } else {
+            None
+        };
+        let c = wal.read_frames_batch(
+            *start_frame,
+            run_pages,
+            temp_pager.buffer_pool.clone(),
+            run_scratch,
+        )?;
         group.add(&c);
     }
     let combined = group.build();
@@ -1570,8 +1603,12 @@ pub(crate) fn vacuum_in_place_step(
                 // WAL already initialized — kick off the first read batch.
                 let temp_pager = temp_db.conn.get_pager();
                 let batch_end = vacuum_copy_batch_end(1, total_pages);
-                let (batch_pages, read_completion) =
-                    start_temp_batch_reads(&temp_pager, 1, batch_end)?;
+                let (batch_pages, read_completion) = start_temp_batch_reads(
+                    &temp_pager,
+                    1,
+                    batch_end,
+                    &mut cleanup_state.read_scratch_buf,
+                )?;
 
                 *phase = VacuumInPlacePhase::ReadTempBatch {
                     temp_db,
@@ -1628,8 +1665,12 @@ pub(crate) fn vacuum_in_place_step(
                 // WAL header fully initialized. Kick off the first read batch.
                 let temp_pager = temp_db.conn.get_pager();
                 let batch_end = vacuum_copy_batch_end(1, total_pages);
-                let (batch_pages, read_completion) =
-                    start_temp_batch_reads(&temp_pager, 1, batch_end)?;
+                let (batch_pages, read_completion) = start_temp_batch_reads(
+                    &temp_pager,
+                    1,
+                    batch_end,
+                    &mut cleanup_state.read_scratch_buf,
+                )?;
 
                 *phase = VacuumInPlacePhase::ReadTempBatch {
                     temp_db,
@@ -1802,8 +1843,12 @@ pub(crate) fn vacuum_in_place_step(
                     // Kick off the next read batch in parallel.
                     let temp_pager = temp_db.conn.get_pager();
                     let batch_end = vacuum_copy_batch_end(next_page, total_pages);
-                    let (batch_pages, read_completion) =
-                        start_temp_batch_reads(&temp_pager, next_page, batch_end)?;
+                    let (batch_pages, read_completion) = start_temp_batch_reads(
+                        &temp_pager,
+                        next_page,
+                        batch_end,
+                        &mut cleanup_state.read_scratch_buf,
+                    )?;
 
                     *phase = VacuumInPlacePhase::ReadTempBatch {
                         temp_db,
