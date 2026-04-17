@@ -2620,12 +2620,20 @@ impl Pager {
     /// `begin_read_tx` + `begin_write_tx` sequence — VACUUM needs exclusive
     /// locks rather than a shared reader upgraded to a writer.
     ///
-    /// Caller must already hold the checkpoint lock.
+    /// Caller must already hold the checkpoint lock. VACUUM runs on an
+    /// existing database, so page 1 must already be allocated and a WAL
+    /// must be present.
     pub fn begin_exclusive_tx(&self) -> Result<IOResult<()>> {
-        return_if_io!(self.maybe_allocate_page1());
-        let Some(wal) = self.wal.as_ref() else {
-            return Ok(IOResult::Done(()));
-        };
+        if !self.db_initialized() {
+            return Err(LimboError::InternalError(
+                "VACUUM requires an initialized database (page 1 must already be allocated)"
+                    .into(),
+            ));
+        }
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL mode".into()))?;
         wal.begin_exclusive_tx()?;
         // Fresh exclusive snapshot — clear any stale page cache.
         self.clear_page_cache(false);
