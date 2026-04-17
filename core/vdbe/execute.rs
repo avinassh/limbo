@@ -14362,8 +14362,7 @@ fn op_vacuum_into_inner(
                 output_conn.set_reserved_bytes(reserved_space)?;
 
                 mirror_symbols(&program.connection, &output_conn);
-                let source_custom_types =
-                    capture_custom_types(&program.connection, source_db_id);
+                let source_custom_types = capture_custom_types(&program.connection, source_db_id);
 
                 let config = VacuumTargetBuildConfig {
                     source_conn: program.connection.clone(),

@@ -3546,9 +3546,7 @@ fn test_plain_vacuum_reduces_page_count(tmp_db: TempDatabase) -> anyhow::Result<
 
     // VACUUM includes a TRUNCATE checkpoint, so the WAL should be empty.
     let wal_path = format!("{}-wal", tmp_db.path.display());
-    let wal_size = std::fs::metadata(&wal_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
     assert_eq!(wal_size, 0, "WAL should be truncated to zero after VACUUM");
 
     // Data integrity: the 10 remaining rows should be intact.

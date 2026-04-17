@@ -422,6 +422,17 @@ pub trait Wal: Debug + Send + Sync {
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Completion>;
 
+    /// Read a contiguous run of WAL frames with a single `pread`.
+    /// For each `i`, `pages[i]` receives the decoded page body of frame
+    /// `start_frame + i`. Each page is locked on entry and finished (or
+    /// cleared on error) inside the completion callback.
+    fn read_frames_batch(
+        &self,
+        start_frame: u64,
+        pages: &[PageRef],
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Completion>;
+
     /// Read a raw frame (header included) from the WAL.
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion>;
 
@@ -1550,6 +1561,132 @@ impl Wal for WalFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    fn read_frames_batch(
+        &self,
+        start_frame: u64,
+        pages: &[PageRef],
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Completion> {
+        turso_assert!(!pages.is_empty(), "read_frames_batch requires at least one page");
+        let page_size = self.page_size() as usize;
+        turso_assert!(page_size > 0, "WAL page size must be initialized");
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+        let count = pages.len();
+        let total = frame_size * count;
+        let offset = self.frame_offset(start_frame);
+
+        // Lock each target page and pre-allocate its destination buffer so the
+        // completion callback only parses headers, decrypts/verifies, and copies.
+        let mut slots: Vec<(PageRef, Arc<Buffer>)> = Vec::with_capacity(count);
+        for page in pages.iter() {
+            page.set_locked();
+            slots.push((page.clone(), Arc::new(buffer_pool.get_page())));
+        }
+
+        let epoch = self.with_shared(|shared| shared.epoch.load(Ordering::Acquire));
+        let enc_or_csum = self.io_ctx.read().encryption_or_checksum().clone();
+
+        let raw_buf = Arc::new(Buffer::new_temporary(total));
+
+        let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            let Ok((buf, bytes_read)) = res else {
+                tracing::debug!(err = ?res.unwrap_err());
+                for (page, _) in &slots {
+                    page.clear_locked();
+                    page.clear_wal_tag();
+                }
+                return None;
+            };
+            if bytes_read != total as i32 {
+                tracing::debug!(
+                    "short read on WAL batch at offset {offset}: expected {total} bytes, got {bytes_read}"
+                );
+                for (page, _) in &slots {
+                    page.clear_locked();
+                    page.clear_wal_tag();
+                }
+                return Some(CompletionError::ShortReadWalFrame {
+                    offset,
+                    expected: total,
+                    actual: bytes_read as usize,
+                });
+            }
+            let raw = buf.as_slice();
+            let mut first_err: Option<CompletionError> = None;
+            for (i, (page, page_buf)) in slots.iter().enumerate() {
+                let frame_start = i * frame_size;
+                let (header, page_body) = sqlite3_ondisk::parse_wal_frame_header(
+                    &raw[frame_start..frame_start + frame_size],
+                );
+                let expected_page_id = page.get().id;
+                turso_assert!(
+                    header.page_number as usize == expected_page_id,
+                    "WAL batch frame page_no mismatch",
+                    {
+                        "frame_id": start_frame + i as u64,
+                        "expected": expected_page_id,
+                        "got": header.page_number
+                    }
+                );
+
+                let body_slice = page_buf.as_mut_slice();
+                body_slice.copy_from_slice(page_body);
+
+                match &enc_or_csum {
+                    EncryptionOrChecksum::Encryption(ctx) => {
+                        match ctx.decrypt_page(body_slice, expected_page_id) {
+                            Ok(decrypted) => body_slice.copy_from_slice(&decrypted),
+                            Err(e) => {
+                                mark_unlikely();
+                                tracing::error!(
+                                    "Failed to decrypt WAL batch frame for page_idx={expected_page_id}: {e}"
+                                );
+                                page.clear_locked();
+                                page.clear_wal_tag();
+                                if first_err.is_none() {
+                                    first_err = Some(CompletionError::DecryptionError {
+                                        page_idx: expected_page_id,
+                                    });
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    EncryptionOrChecksum::Checksum(ctx) => {
+                        if let Err(e) = ctx.verify_checksum(body_slice, expected_page_id) {
+                            mark_unlikely();
+                            tracing::error!(
+                                "Failed to verify checksum for page_id={expected_page_id}: {e}"
+                            );
+                            page.clear_locked();
+                            page.clear_wal_tag();
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                            continue;
+                        }
+                    }
+                    EncryptionOrChecksum::None => {}
+                }
+
+                finish_read_page(expected_page_id, page_buf.clone(), page.clone());
+                page.set_wal_tag(start_frame + i as u64, epoch);
+            }
+            first_err
+        });
+
+        let c = Completion::new_read(raw_buf, complete);
+        let file = self.with_shared(|shared| {
+            turso_assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
+            shared.file.as_ref().unwrap().clone()
+        });
+        file.pread(offset, c)
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
     // todo(sivukhin): change API to accept Buffer or some other owned type
     // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
@@ -1887,10 +2024,7 @@ impl Wal for WalFile {
 
         // Install connection state with a fresh snapshot.
         let snapshot = self.with_shared(Self::load_shared_snapshot);
-        self.install_connection_state(WalConnectionState::new(
-            snapshot,
-            ReadGuardKind::DbFile,
-        ));
+        self.install_connection_state(WalConnectionState::new(snapshot, ReadGuardKind::DbFile));
         turso_assert!(
             self.write_lock_held
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

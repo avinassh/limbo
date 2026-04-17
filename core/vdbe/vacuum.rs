@@ -1102,23 +1102,24 @@ pub(crate) enum VacuumInPlacePhase {
         /// the fsync from `prepare_wal_finish`.
         fsync_phase: bool,
     },
-    /// Read a single temp page for the current batch.
-    ReadTempPage {
+    /// Read a batch of temp pages in parallel using multi-inflight
+    /// `Wal::read_frames_batch` calls, one per contiguous frame-id run.
+    /// The state waits on a single `CompletionGroup` completion that
+    /// covers every run in the batch.
+    ReadTempBatch {
         temp_db: Box<VacuumTempDb>,
         total_pages: u32,
-        /// Next page number to read (1-based). The page at `next_page - 1` is
-        /// the one we just issued a read for and are awaiting.
+        /// First page id NOT included in this batch (i.e., the page id
+        /// where the next batch will start, 1-based).
         next_page: u32,
         /// Boxed to shrink the enum — PreparedFrames contains Vecs and is ~80+
         /// bytes unboxed. Only created once per batch, so boxing adds no
         /// allocation overhead in the hot path.
         prev_prepared: Option<Box<crate::storage::wal::PreparedFrames>>,
-        /// Accumulated pages for the current batch.
+        /// Pages for this batch, pre-allocated in logical page-id order.
         batch_pages: Vec<crate::storage::pager::PageRef>,
-        /// Completion for the in-flight read.
+        /// Aggregate completion for every run issued for this batch.
         read_completion: crate::io::Completion,
-        /// The PageRef being read.
-        reading_page: crate::storage::pager::PageRef,
     },
     /// Write a prepared batch to the WAL file.
     WriteWalBatch {
@@ -1155,6 +1156,90 @@ impl Default for VacuumInPlacePhase {
 
 /// The batch size for copy-back: how many temp pages to read per batch.
 const VACUUM_COPY_BATCH_SIZE: u32 = 64;
+
+/// Coalesce `(page_ref, frame_id)` pairs into contiguous-frame-id runs.
+///
+/// Plain `VACUUM` relies on the temp-WAL-only invariant: every temp page
+/// lives in the temp WAL (auto-checkpoint is disabled on the temp
+/// connection), so for each logical page id we get a single frame id via
+/// `find_frame`. Because target-build appends frames in phase order
+/// (schema → rows → indexes → post-data), `find_frame(1), find_frame(2),
+/// …` on the temp WAL returns a non-monotonic frame-id sequence. Sorting
+/// by `frame_id` before splitting into runs lets a single `pread` over a
+/// contiguous range serve many logical pages at once.
+fn coalesce_frame_runs(
+    mut pairs: Vec<(crate::storage::pager::PageRef, u64)>,
+) -> Vec<(u64, Vec<crate::storage::pager::PageRef>)> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    pairs.sort_by_key(|(_, f)| *f);
+    let mut runs: Vec<(u64, Vec<crate::storage::pager::PageRef>)> = Vec::new();
+    for (page, frame_id) in pairs {
+        if let Some((run_start, run_pages)) = runs.last_mut() {
+            let next_expected = *run_start + run_pages.len() as u64;
+            if frame_id == next_expected {
+                run_pages.push(page);
+                continue;
+            }
+        }
+        runs.push((frame_id, vec![page]));
+    }
+    runs
+}
+
+/// Start multi-inflight reads for one copy-back batch spanning logical
+/// pages `[batch_start, batch_end)`. Every page must be resident in the
+/// temp WAL (temp-WAL-only invariant). Returns the pre-allocated
+/// per-page `PageRef`s in logical page-id order plus the aggregate
+/// completion covering every run.
+fn start_temp_batch_reads(
+    temp_pager: &crate::storage::pager::Pager,
+    batch_start: u32,
+    batch_end: u32,
+) -> Result<(Vec<crate::storage::pager::PageRef>, crate::io::Completion)> {
+    use crate::io::CompletionGroup;
+    use crate::storage::pager::Page;
+
+    turso_assert!(
+        batch_start < batch_end,
+        "empty vacuum read batch",
+        { "batch_start": batch_start, "batch_end": batch_end }
+    );
+    let wal = temp_pager.wal.as_ref().ok_or_else(|| {
+        LimboError::InternalError("VACUUM requires a temp WAL pager".into())
+    })?;
+
+    let len = (batch_end - batch_start) as usize;
+    let mut logical_pages: Vec<crate::storage::pager::PageRef> = Vec::with_capacity(len);
+    let mut pairs: Vec<(crate::storage::pager::PageRef, u64)> = Vec::with_capacity(len);
+
+    for page_id in batch_start..batch_end {
+        let page: crate::storage::pager::PageRef = Arc::new(Page::new(page_id as i64));
+        let frame_id = wal.find_frame(page_id as u64, None)?.ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "VACUUM: temp page {page_id} not found in temp WAL (temp-WAL-only invariant violated)"
+            ))
+        })?;
+        logical_pages.push(page.clone());
+        pairs.push((page, frame_id));
+    }
+
+    let runs = coalesce_frame_runs(pairs);
+
+    let mut group = CompletionGroup::new(|_| {});
+    for (start_frame, run_pages) in &runs {
+        let c = wal.read_frames_batch(
+            *start_frame,
+            run_pages,
+            temp_pager.buffer_pool.clone(),
+        )?;
+        group.add(&c);
+    }
+    let combined = group.build();
+
+    Ok((logical_pages, combined))
+}
 
 /// Step the in-place VACUUM state machine once. Returns `IO` to yield or `Step`
 /// when the entire operation is complete.
@@ -1385,18 +1470,19 @@ pub(crate) fn vacuum_in_place_step(
                     continue;
                 }
 
-                // WAL already initialized — go straight to reading temp pages.
+                // WAL already initialized — kick off the first read batch.
                 let temp_pager = temp_db.conn.get_pager();
-                let (page_ref, completion) = temp_pager.read_page_no_cache(1, None, false)?;
+                let batch_end = (1 + VACUUM_COPY_BATCH_SIZE).min(total_pages + 1);
+                let (batch_pages, read_completion) =
+                    start_temp_batch_reads(&temp_pager, 1, batch_end)?;
 
-                *phase = VacuumInPlacePhase::ReadTempPage {
+                *phase = VacuumInPlacePhase::ReadTempBatch {
                     temp_db,
                     total_pages,
-                    next_page: 2, // page 1 is being read now
+                    next_page: batch_end,
                     prev_prepared: None,
-                    batch_pages: Vec::with_capacity(VACUUM_COPY_BATCH_SIZE as usize),
-                    read_completion: completion,
-                    reading_page: page_ref,
+                    batch_pages,
+                    read_completion,
                 };
                 continue;
             }
@@ -1438,41 +1524,40 @@ pub(crate) fn vacuum_in_place_step(
                     continue;
                 }
 
-                // WAL header fully initialized. Start reading temp pages.
+                // WAL header fully initialized. Kick off the first read batch.
                 let temp_pager = temp_db.conn.get_pager();
-                let (page_ref, read_c) = temp_pager.read_page_no_cache(1, None, false)?;
+                let batch_end = (1 + VACUUM_COPY_BATCH_SIZE).min(total_pages + 1);
+                let (batch_pages, read_completion) =
+                    start_temp_batch_reads(&temp_pager, 1, batch_end)?;
 
-                *phase = VacuumInPlacePhase::ReadTempPage {
+                *phase = VacuumInPlacePhase::ReadTempBatch {
                     temp_db,
                     total_pages,
-                    next_page: 2,
+                    next_page: batch_end,
                     prev_prepared: None,
-                    batch_pages: Vec::with_capacity(VACUUM_COPY_BATCH_SIZE as usize),
-                    read_completion: read_c,
-                    reading_page: page_ref,
+                    batch_pages,
+                    read_completion,
                 };
                 continue;
             }
 
-            VacuumInPlacePhase::ReadTempPage {
+            VacuumInPlacePhase::ReadTempBatch {
                 temp_db,
                 total_pages,
                 next_page,
                 prev_prepared,
-                mut batch_pages,
+                batch_pages,
                 read_completion,
-                reading_page,
             } => {
-                // Wait for the current read to complete.
+                // Wait for every run in this batch to finish.
                 if !read_completion.finished() {
-                    *phase = VacuumInPlacePhase::ReadTempPage {
+                    *phase = VacuumInPlacePhase::ReadTempBatch {
                         temp_db,
                         total_pages,
                         next_page,
                         prev_prepared,
                         batch_pages,
                         read_completion: read_completion.clone(),
-                        reading_page,
                     };
                     return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
                         read_completion,
@@ -1480,64 +1565,39 @@ pub(crate) fn vacuum_in_place_step(
                 }
                 if !read_completion.succeeded() {
                     return Err(LimboError::InternalError(
-                        "VACUUM: temp page read failed".to_string(),
+                        "VACUUM: temp batch read failed".to_string(),
                     ));
                 }
 
-                // Accumulate the completed page.
-                batch_pages.push(reading_page);
-
-                // If batch is full or we've read all pages, prepare WAL frames.
-                let batch_full = batch_pages.len() >= VACUUM_COPY_BATCH_SIZE as usize;
+                // All pages in this batch are loaded. Prepare WAL frames.
                 let all_read = next_page > total_pages;
+                let wal = source_pager
+                    .wal
+                    .as_ref()
+                    .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
+                let page_sz = source_pager.get_page_size_unchecked();
 
-                if batch_full || all_read {
-                    // Prepare WAL frames from this batch. WAL header was already
-                    // initialized in InitSourceWalHeader before reading started.
-                    let wal = source_pager
-                        .wal
-                        .as_ref()
-                        .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
-                    let page_sz = source_pager.get_page_size_unchecked();
+                let db_size_on_commit = if all_read { Some(total_pages) } else { None };
 
-                    let db_size_on_commit = if all_read { Some(total_pages) } else { None };
+                let prepared = wal.prepare_frames(
+                    &batch_pages,
+                    page_sz,
+                    db_size_on_commit,
+                    prev_prepared.as_deref(),
+                )?;
 
-                    let prepared = wal.prepare_frames(
-                        &batch_pages,
-                        page_sz,
-                        db_size_on_commit,
-                        prev_prepared.as_deref(),
-                    )?;
+                // Submit writes via WriteBatch.
+                let wal_file = wal.wal_file()?;
+                let mut batch = IOWriteBatch::new(wal_file);
+                batch.writev(prepared.offset, &prepared.bufs);
+                let completions = batch.submit()?;
 
-                    // Submit writes via WriteBatch.
-                    let wal_file = wal.wal_file()?;
-                    let mut batch = IOWriteBatch::new(wal_file);
-                    batch.writev(prepared.offset, &prepared.bufs);
-                    let completions = batch.submit()?;
-
-                    *phase = VacuumInPlacePhase::WriteWalBatch {
-                        temp_db,
-                        total_pages,
-                        next_page,
-                        prev_prepared: Some(Box::new(prepared)),
-                        completions,
-                    };
-                    continue;
-                }
-
-                // Batch not full, more pages to read. Issue next read.
-                let temp_pager = temp_db.conn.get_pager();
-                let (page_ref, completion) =
-                    temp_pager.read_page_no_cache(next_page as i64, None, false)?;
-
-                *phase = VacuumInPlacePhase::ReadTempPage {
+                *phase = VacuumInPlacePhase::WriteWalBatch {
                     temp_db,
                     total_pages,
-                    next_page: next_page + 1,
-                    prev_prepared,
-                    batch_pages,
-                    read_completion: completion,
-                    reading_page: page_ref,
+                    next_page,
+                    prev_prepared: Some(Box::new(prepared)),
+                    completions,
                 };
                 continue;
             }
@@ -1588,19 +1648,20 @@ pub(crate) fn vacuum_in_place_step(
 
                 // More pages to copy?
                 if next_page <= total_pages {
-                    // Start reading the next page.
+                    // Kick off the next read batch in parallel.
                     let temp_pager = temp_db.conn.get_pager();
-                    let (page_ref, completion) =
-                        temp_pager.read_page_no_cache(next_page as i64, None, false)?;
+                    let batch_end =
+                        (next_page + VACUUM_COPY_BATCH_SIZE).min(total_pages + 1);
+                    let (batch_pages, read_completion) =
+                        start_temp_batch_reads(&temp_pager, next_page, batch_end)?;
 
-                    *phase = VacuumInPlacePhase::ReadTempPage {
+                    *phase = VacuumInPlacePhase::ReadTempBatch {
                         temp_db,
                         total_pages,
-                        next_page: next_page + 1,
+                        next_page: batch_end,
                         prev_prepared,
-                        batch_pages: Vec::with_capacity(VACUUM_COPY_BATCH_SIZE as usize),
-                        read_completion: completion,
-                        reading_page: page_ref,
+                        batch_pages,
+                        read_completion,
                     };
                     continue;
                 }
@@ -1811,7 +1872,92 @@ pub(crate) fn vacuum_in_place_cleanup(
 mod tests {
     use super::*;
     use crate::storage::encryption::{CipherMode, EncryptionKey};
+    use crate::storage::pager::Page;
     use crate::util::IOExt;
+
+    fn page_ref(id: i64) -> crate::storage::pager::PageRef {
+        Arc::new(Page::new(id))
+    }
+
+    #[test]
+    fn coalesce_frame_runs_empty_returns_empty() {
+        let runs = coalesce_frame_runs(Vec::new());
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn coalesce_frame_runs_single_page_is_one_run_of_one() {
+        let runs = coalesce_frame_runs(vec![(page_ref(1), 42)]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].0, 42);
+        assert_eq!(runs[0].1.len(), 1);
+        assert_eq!(runs[0].1[0].get().id, 1);
+    }
+
+    #[test]
+    fn coalesce_frame_runs_sorts_by_frame_id_then_coalesces_contiguous() {
+        // Target-build writes frames out of page-id order. The input is
+        // sorted by page id (1,2,3,4), but the frame ids interleave with a
+        // gap at frame 3, producing two runs once sorted by frame id.
+        let pairs = vec![
+            (page_ref(1), 10),
+            (page_ref(2), 11),
+            (page_ref(3), 12),
+            (page_ref(4), 14),
+        ];
+        let runs = coalesce_frame_runs(pairs);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].0, 10);
+        assert_eq!(runs[0].1.len(), 3);
+        assert_eq!(
+            runs[0].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(runs[1].0, 14);
+        assert_eq!(runs[1].1.len(), 1);
+        assert_eq!(runs[1].1[0].get().id, 4);
+    }
+
+    #[test]
+    fn coalesce_frame_runs_handles_non_monotonic_page_to_frame_map() {
+        // Realistic target-build shape: pages 1..=6 but frames assigned by
+        // phase order (schema page goes last, indexes interleave). The
+        // coalescer must still produce runs of length > 1 for contiguous
+        // frame ranges rather than falling back to length-1 runs.
+        let pairs = vec![
+            (page_ref(1), 10), // schema written last (gap between 6 and 10)
+            (page_ref(2), 1),  // data pages written first
+            (page_ref(3), 2),
+            (page_ref(4), 3),
+            (page_ref(5), 5), // index pages later
+            (page_ref(6), 6),
+        ];
+        let runs = coalesce_frame_runs(pairs);
+        // After sort by frame id: frames 1,2,3 contiguous; 5,6 contiguous;
+        // 10 isolated.
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].0, 1);
+        assert_eq!(runs[0].1.len(), 3);
+        assert_eq!(runs[1].0, 5);
+        assert_eq!(runs[1].1.len(), 2);
+        assert_eq!(runs[2].0, 10);
+        assert_eq!(runs[2].1.len(), 1);
+
+        // Average run length should be non-trivial (>1).
+        let total: usize = runs.iter().map(|(_, pages)| pages.len()).sum();
+        let avg = total as f64 / runs.len() as f64;
+        assert!(avg > 1.0, "expected average run length > 1, got {avg}");
+    }
+
+    #[test]
+    fn coalesce_frame_runs_all_scattered_is_singleton_runs() {
+        let pairs = vec![(page_ref(1), 10), (page_ref(2), 20), (page_ref(3), 30)];
+        let runs = coalesce_frame_runs(pairs);
+        assert_eq!(runs.len(), 3);
+        for (_, pages) in &runs {
+            assert_eq!(pages.len(), 1);
+        }
+    }
 
     #[test]
     fn vacuum_db_header_meta_bumps_schema_cookie_and_preserves_sqlite_metadata() {
