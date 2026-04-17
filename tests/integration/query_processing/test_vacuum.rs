@@ -3555,3 +3555,113 @@ fn test_plain_vacuum_reduces_page_count(tmp_db: TempDatabase) -> anyhow::Result<
     assert_eq!(run_integrity_check(&conn), "ok");
     Ok(())
 }
+
+/// Plain VACUUM on a workload with several tables and indexes, large enough
+/// to span multiple copy-back batches and exercise a non-monotonic
+/// page→frame map in the temp WAL. This is the path that drives
+/// `coalesce_frame_runs` to build more than one run per batch.
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_multi_table_multi_batch() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("CREATE TABLE c(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("CREATE INDEX idx_a_v ON a(v)")?;
+    conn.execute("CREATE INDEX idx_b_v ON b(v)")?;
+    conn.execute("CREATE INDEX idx_c_v ON c(v)")?;
+
+    // Enough rows to push total_pages past VACUUM_COPY_BATCH_SIZE (64) so the
+    // batch path is hit more than once, and to grow each table's b-tree
+    // across several pages so target-build interleaves table/index frames.
+    for i in 0..800 {
+        conn.execute(format!(
+            "INSERT INTO a VALUES({i}, '{}')",
+            "a".repeat(200)
+        ))?;
+        conn.execute(format!(
+            "INSERT INTO b VALUES({i}, '{}')",
+            "b".repeat(200)
+        ))?;
+        conn.execute(format!(
+            "INSERT INTO c VALUES({i}, '{}')",
+            "c".repeat(200)
+        ))?;
+    }
+    // Delete half of each table so the pre-VACUUM image has freelist holes.
+    conn.execute("DELETE FROM a WHERE id % 2 = 0")?;
+    conn.execute("DELETE FROM b WHERE id % 2 = 0")?;
+    conn.execute("DELETE FROM c WHERE id % 2 = 0")?;
+
+    let pre_pages: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
+    assert!(
+        pre_pages[0].0 > 64,
+        "workload should span multiple copy-back batches, got page_count={}",
+        pre_pages[0].0
+    );
+
+    conn.execute("VACUUM")?;
+
+    // Row counts preserved.
+    let counts: Vec<(i64,)> = conn
+        .exec_rows("SELECT (SELECT COUNT(*) FROM a) + (SELECT COUNT(*) FROM b) + (SELECT COUNT(*) FROM c)");
+    assert_eq!(counts[0].0, 1200);
+
+    // Index-covered reads still work.
+    let via_idx_a: Vec<(i64,)> = conn.exec_rows("SELECT id FROM a WHERE v = 'aaaaaaaa' ORDER BY id");
+    assert_eq!(via_idx_a.len(), 0); // sanity: no row matches short value
+    let via_idx_b: Vec<(i64,)> =
+        conn.exec_rows("SELECT COUNT(*) FROM b WHERE v LIKE 'b%'");
+    assert_eq!(via_idx_b[0].0, 400);
+
+    // Spot-check specific rows round-trip.
+    let a_one: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM a WHERE id = 1");
+    assert_eq!(a_one.len(), 1);
+    assert_eq!(a_one[0], (1, "a".repeat(200)));
+    let c_last: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM c WHERE id = 799");
+    assert_eq!(c_last.len(), 1);
+    assert_eq!(c_last[0], (799, "c".repeat(200)));
+
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+/// Plain VACUUM on an encrypted source database. Exercises the per-frame
+/// decrypt branch inside `Wal::read_frames_batch`: encryption is
+/// propagated to the temp pager (see `vacuum_temp_db_encryption`), so the
+/// batch read path decrypts each frame before feeding it into the source
+/// WAL write batch.
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_encrypted() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327'",
+    )?;
+    conn.execute("PRAGMA cipher = 'aegis256'")?;
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    for i in 0..150 {
+        conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", "z".repeat(80)))?;
+    }
+    conn.execute("DELETE FROM t WHERE id >= 30")?;
+
+    conn.execute("VACUUM")?;
+
+    // Data round-trips through encrypted temp WAL → encrypted source WAL.
+    let count: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(count[0].0, 30);
+    let first: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t WHERE id = 0");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0], (0, "z".repeat(80)));
+    let last: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t WHERE id = 29");
+    assert_eq!(last.len(), 1);
+    assert_eq!(last[0], (29, "z".repeat(80)));
+
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
