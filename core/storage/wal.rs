@@ -1582,6 +1582,16 @@ impl Wal for WalFile {
         // completion callback only parses headers, decrypts/verifies, and copies.
         let mut slots: Vec<(PageRef, Arc<Buffer>)> = Vec::with_capacity(count);
         for page in pages.iter() {
+            turso_assert!(
+                page.get().id > 0,
+                "read_frames_batch target page id must be 1-based",
+                { "page_id": page.get().id }
+            );
+            turso_assert!(
+                !page.is_locked(),
+                "read_frames_batch target page must not already be locked",
+                { "page_id": page.get().id }
+            );
             page.set_locked();
             slots.push((page.clone(), Arc::new(buffer_pool.get_page())));
         }
@@ -1643,6 +1653,11 @@ impl Wal for WalFile {
                 }
 
                 let body_slice = page_buf.as_mut_slice();
+                turso_assert!(
+                    body_slice.len() == page_size,
+                    "read_frames_batch buffer size must match WAL page size",
+                    { "buffer_len": body_slice.len(), "page_size": page_size }
+                );
                 body_slice.copy_from_slice(page_body);
 
                 match &enc_or_csum {
@@ -2193,6 +2208,10 @@ impl Wal for WalFile {
         db_size_on_commit: Option<u32>,
         prev: Option<&PreparedFrames>,
     ) -> Result<PreparedFrames> {
+        turso_assert!(
+            !pages.is_empty(),
+            "prepare_frames requires at least one page"
+        );
         turso_assert!(
             pages.len() <= IOV_MAX,
             "supported up to IOV_MAX pages at once"

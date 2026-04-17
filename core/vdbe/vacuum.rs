@@ -1158,7 +1158,24 @@ impl Default for VacuumInPlacePhase {
 const VACUUM_COPY_BATCH_SIZE: u32 = 64;
 
 fn vacuum_copy_batch_end(start_page: u32, total_pages: u32) -> u32 {
-    (start_page + VACUUM_COPY_BATCH_SIZE).min(total_pages + 1)
+    turso_assert!(
+        start_page > 0,
+        "vacuum copy batch start page must be 1-based",
+        { "start_page": start_page, "total_pages": total_pages }
+    );
+    turso_assert!(
+        start_page <= total_pages,
+        "vacuum copy batch start must be inside database image",
+        { "start_page": start_page, "total_pages": total_pages }
+    );
+    turso_assert!(
+        total_pages < u32::MAX,
+        "vacuum copy batch requires a representable exclusive end page",
+        { "total_pages": total_pages }
+    );
+    start_page
+        .saturating_add(VACUUM_COPY_BATCH_SIZE)
+        .min(total_pages + 1)
 }
 
 #[cfg(test)]
@@ -1191,7 +1208,17 @@ fn coalesce_frame_runs(
     }
     pairs.sort_by_key(|(_, f)| *f);
     let mut runs: Vec<(u64, Vec<crate::storage::pager::PageRef>)> = Vec::new();
+    let mut prev_frame_id = None;
     for (page, frame_id) in pairs {
+        turso_assert!(frame_id > 0, "WAL frame ids must be 1-based");
+        if let Some(prev) = prev_frame_id {
+            turso_assert!(
+                frame_id > prev,
+                "VACUUM temp WAL frame ids must be unique",
+                { "previous_frame_id": prev, "frame_id": frame_id }
+            );
+        }
+        prev_frame_id = Some(frame_id);
         if let Some((run_start, run_pages)) = runs.last_mut() {
             let next_expected = *run_start + run_pages.len() as u64;
             if frame_id == next_expected {
@@ -1221,6 +1248,16 @@ fn start_temp_batch_reads(
         batch_start < batch_end,
         "empty vacuum read batch",
         { "batch_start": batch_start, "batch_end": batch_end }
+    );
+    turso_assert!(
+        batch_start > 0,
+        "vacuum read batch start page must be 1-based",
+        { "batch_start": batch_start, "batch_end": batch_end }
+    );
+    turso_assert!(
+        batch_end - batch_start <= VACUUM_COPY_BATCH_SIZE,
+        "vacuum read batch exceeds configured copy batch size",
+        { "batch_start": batch_start, "batch_end": batch_end, "batch_size": VACUUM_COPY_BATCH_SIZE }
     );
     let wal = temp_pager
         .wal
@@ -1259,6 +1296,13 @@ fn reload_schema_after_vacuum_commit(
     db: usize,
     source_pager: &crate::storage::pager::Pager,
 ) -> Result<()> {
+    turso_assert!(
+        connection
+            .auto_commit
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "VACUUM schema reload must run after restoring auto-commit"
+    );
+
     // Schema reload under a self-contained read guard. If this fails the
     // cleared schema cookie will trigger a re-read on the next operation.
     source_pager.begin_read_tx()?;
@@ -1390,6 +1434,18 @@ pub(crate) fn vacuum_in_place_step(
             }
 
             VacuumInPlacePhase::ReadSourceMetadata => {
+                turso_assert!(
+                    cleanup_state.checkpoint_lock_held,
+                    "VACUUM source metadata phase requires checkpoint lock"
+                );
+                turso_assert!(
+                    cleanup_state.source_read_tx_open,
+                    "VACUUM source metadata phase requires source read tx"
+                );
+                turso_assert!(
+                    cleanup_state.source_write_tx_open,
+                    "VACUUM source metadata phase requires source write tx"
+                );
                 let source_db = connection.get_source_database(db);
 
                 // Read page size from pager (cached after begin_read_tx).
@@ -1534,6 +1590,10 @@ pub(crate) fn vacuum_in_place_step(
                 completion,
                 fsync_phase,
             } => {
+                turso_assert!(
+                    total_pages > 0,
+                    "VACUUM source WAL header initialization requires pages to copy"
+                );
                 if !completion.finished() {
                     *phase = VacuumInPlacePhase::InitSourceWalHeader {
                         temp_db,
@@ -1590,6 +1650,26 @@ pub(crate) fn vacuum_in_place_step(
                 batch_pages,
                 read_completion,
             } => {
+                turso_assert!(
+                    total_pages < u32::MAX,
+                    "VACUUM read batch requires a representable exclusive end page",
+                    { "total_pages": total_pages }
+                );
+                let database_end = total_pages + 1;
+                turso_assert!(
+                    !batch_pages.is_empty(),
+                    "VACUUM read batch must contain pages"
+                );
+                turso_assert!(
+                    batch_pages.len() as u32 <= VACUUM_COPY_BATCH_SIZE,
+                    "VACUUM read batch exceeds configured copy batch size",
+                    { "batch_pages": batch_pages.len(), "batch_size": VACUUM_COPY_BATCH_SIZE }
+                );
+                turso_assert!(
+                    next_page > 1 && next_page <= database_end,
+                    "VACUUM read batch next page is outside database image",
+                    { "next_page": next_page, "total_pages": total_pages }
+                );
                 // Wait for every run in this batch to finish.
                 if !read_completion.finished() {
                     *phase = VacuumInPlacePhase::ReadTempBatch {
@@ -1611,6 +1691,18 @@ pub(crate) fn vacuum_in_place_step(
                 }
 
                 // All pages in this batch are loaded. Prepare WAL frames.
+                for page in &batch_pages {
+                    turso_assert!(
+                        page.is_loaded(),
+                        "VACUUM read batch page must be loaded before WAL prepare",
+                        { "page_id": page.get().id }
+                    );
+                    turso_assert!(
+                        !page.is_locked(),
+                        "VACUUM read batch page lock leaked before WAL prepare",
+                        { "page_id": page.get().id }
+                    );
+                }
                 let all_read = next_page > total_pages;
                 let wal = source_pager
                     .wal
@@ -1650,6 +1742,25 @@ pub(crate) fn vacuum_in_place_step(
                 prev_prepared,
                 completions,
             } => {
+                turso_assert!(
+                    total_pages < u32::MAX,
+                    "VACUUM WAL write batch requires a representable exclusive end page",
+                    { "total_pages": total_pages }
+                );
+                let database_end = total_pages + 1;
+                turso_assert!(
+                    prev_prepared.is_some(),
+                    "VACUUM WAL write batch requires prepared frames"
+                );
+                turso_assert!(
+                    !completions.is_empty(),
+                    "VACUUM WAL write batch requires write completions"
+                );
+                turso_assert!(
+                    next_page > 1 && next_page <= database_end,
+                    "VACUUM WAL write batch next page is outside database image",
+                    { "next_page": next_page, "total_pages": total_pages }
+                );
                 // Wait for all writes in this batch. We yield on the first
                 // unfinished completion; re-entry will re-check them all.
                 let pending = completions.iter().find(|c| !c.finished()).cloned();
@@ -1683,9 +1794,8 @@ pub(crate) fn vacuum_in_place_step(
                 // cache and have no dirty state to clear. The source page cache
                 // is invalidated wholesale via clear_page_cache() in Publish.
                 let wal = source_pager.wal.as_ref().unwrap();
-                if let Some(ref prepared) = prev_prepared {
-                    wal.commit_prepared_frames(std::slice::from_ref(prepared.as_ref()));
-                }
+                let prepared = prev_prepared.as_ref().unwrap();
+                wal.commit_prepared_frames(std::slice::from_ref(prepared.as_ref()));
 
                 // More pages to copy?
                 if next_page <= total_pages {
@@ -1748,6 +1858,18 @@ pub(crate) fn vacuum_in_place_step(
             }
 
             VacuumInPlacePhase::PublishWalCommit { temp_db } => {
+                turso_assert!(
+                    cleanup_state.checkpoint_lock_held,
+                    "VACUUM publish phase requires checkpoint lock"
+                );
+                turso_assert!(
+                    cleanup_state.source_read_tx_open,
+                    "VACUUM publish phase requires source read tx"
+                );
+                turso_assert!(
+                    cleanup_state.source_write_tx_open,
+                    "VACUUM publish phase requires source write tx"
+                );
                 let wal = source_pager
                     .wal
                     .as_ref()
@@ -1854,6 +1976,11 @@ pub(crate) fn vacuum_in_place_cleanup(
     cleanup_state: &VacuumInPlaceCleanupState,
 ) {
     use std::sync::atomic::Ordering;
+
+    turso_assert!(
+        !cleanup_state.source_write_tx_open || cleanup_state.source_read_tx_open,
+        "VACUUM cleanup cannot have source write tx without source read tx"
+    );
 
     // Release the checkpoint lock if we acquired it.
     if cleanup_state.checkpoint_lock_held {

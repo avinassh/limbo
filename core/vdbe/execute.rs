@@ -14184,6 +14184,11 @@ pub(crate) fn cleanup_vacuum_state(
     connection: &Arc<Connection>,
     state: &mut ProgramState,
 ) -> Result<()> {
+    turso_assert!(
+        !(state.op_vacuum_into.is_some() && state.op_vacuum_in_place.is_some()),
+        "VACUUM INTO and in-place VACUUM state cannot both be active"
+    );
+
     if state.op_vacuum_into.is_some() {
         cleanup_op_vacuum_into(connection, state)
     } else if state.op_vacuum_in_place.is_some() {
