@@ -46,7 +46,12 @@ impl IOContext {
     }
 
     pub fn reset_checksum(&mut self) {
-        self.encryption_or_checksum = EncryptionOrChecksum::None;
+        if matches!(
+            self.encryption_or_checksum,
+            EncryptionOrChecksum::Checksum(_)
+        ) {
+            self.encryption_or_checksum = EncryptionOrChecksum::None;
+        }
     }
 }
 
