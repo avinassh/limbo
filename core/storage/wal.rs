@@ -2236,12 +2236,24 @@ impl Wal for WalFile {
             // Exclusive lock on read_locks[0] protects the DB-file snapshot
             // installed on this VACUUM connection.
             if !shared.read_locks[0].write() {
-                return Err(LimboError::Busy);
+                turso_assert!(
+                    false,
+                    "begin_exclusive_tx: read_locks[0] held after VACUUM lock acquired"
+                );
+                return Err(LimboError::InternalError(
+                    "begin_exclusive_tx: read_locks[0] held after VACUUM lock acquired".into(),
+                ));
             }
             // Write lock — blocks all writers.
             if !shared.write_lock.write() {
                 shared.read_locks[0].unlock();
-                return Err(LimboError::Busy);
+                turso_assert!(
+                    false,
+                    "begin_exclusive_tx: write lock held after VACUUM lock acquired"
+                );
+                return Err(LimboError::InternalError(
+                    "begin_exclusive_tx: write lock held after VACUUM lock acquired".into(),
+                ));
             }
             Ok(())
         })?;
