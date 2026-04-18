@@ -1061,6 +1061,11 @@ pub(crate) struct VacuumInPlaceCleanupState {
     pub checkpoint_locks_handed_off: bool,
     /// WAL VACUUM lock is held exclusively.
     pub vacuum_lock_held: bool,
+    /// MVCC stop-the-world gate is held by this VACUUM.
+    pub mvcc_vacuum_gate: Option<Arc<crate::MvStore>>,
+    /// Source connection is temporarily reading the checkpointed B-tree image
+    /// directly, bypassing the MVCC overlay.
+    pub source_demoted_for_mvcc_vacuum: bool,
     /// Source pager read transaction was started.
     pub source_read_tx_open: bool,
     /// Source pager write transaction was acquired and `auto_commit`/`tx_state`
@@ -1364,6 +1369,31 @@ fn reload_schema_after_vacuum_commit(
     reload_result
 }
 
+fn release_mvcc_vacuum_gate(
+    connection: &Arc<Connection>,
+    cleanup_state: &mut VacuumInPlaceCleanupState,
+) {
+    if cleanup_state.source_demoted_for_mvcc_vacuum {
+        connection.promote_to_regular_connection();
+        cleanup_state.source_demoted_for_mvcc_vacuum = false;
+    }
+    if let Some(mv_store) = cleanup_state.mvcc_vacuum_gate.take() {
+        mv_store.release_vacuum_gate();
+    }
+}
+
+fn cleanup_mvcc_vacuum_gate(
+    connection: &Arc<Connection>,
+    cleanup_state: &VacuumInPlaceCleanupState,
+) {
+    if cleanup_state.source_demoted_for_mvcc_vacuum && connection.is_mvcc_bootstrap_connection() {
+        connection.promote_to_regular_connection();
+    }
+    if let Some(mv_store) = cleanup_state.mvcc_vacuum_gate.as_ref() {
+        mv_store.release_vacuum_gate();
+    }
+}
+
 /// Step the in-place VACUUM state machine once. Returns `IO` to yield or `Step`
 /// when the entire operation is complete.
 ///
@@ -1405,13 +1435,9 @@ pub(crate) fn vacuum_in_place_step(
                 if connection.is_readonly(db) {
                     return Err(LimboError::ReadOnly);
                 }
-                // 4. Reject MVCC mode.
+                // 4. Resolve source database mode.
                 let source_db = connection.get_source_database(db);
-                if source_db.mvcc_enabled() {
-                    return Err(LimboError::InternalError(
-                        "VACUUM is not supported in MVCC mode yet".to_string(),
-                    ));
-                }
+                let source_mvcc_enabled = source_db.mvcc_enabled();
                 // 5. Reject in-memory databases. Use the same memory-like
                 // path classification as attach/open (connection.rs:2216).
                 {
@@ -1439,7 +1465,33 @@ pub(crate) fn vacuum_in_place_step(
                 let wal = source_pager.wal.as_ref().ok_or_else(|| {
                     LimboError::InternalError("VACUUM requires a WAL-mode database".to_string())
                 })?;
-                // 8. Acquire the checkpoint serialization lock early. This
+                // 8. In MVCC mode, hold the existing MVCC stop-the-world
+                // gate for the full VACUUM. Callers are expected to run MVCC
+                // checkpoint before VACUUM; this gate only enforces that no
+                // active or new MVCC transactions overlap the physical copy.
+                if source_mvcc_enabled {
+                    let mv_store = source_db.get_mv_store().as_ref().cloned().ok_or_else(|| {
+                        LimboError::InternalError(
+                            "MVCC database missing MV store during VACUUM".to_string(),
+                        )
+                    })?;
+                    mv_store.try_begin_vacuum_gate()?;
+                    cleanup_state.mvcc_vacuum_gate = Some(mv_store);
+                    if connection.get_mv_tx_id_for_db(db).is_some() {
+                        release_mvcc_vacuum_gate(connection, cleanup_state);
+                        turso_assert!(
+                            false,
+                            "VACUUM must not hold an MVCC transaction after acquiring gate"
+                        );
+                        return Err(LimboError::InternalError(
+                            "VACUUM acquired MVCC gate while this connection has an MVCC transaction"
+                                .to_string(),
+                        ));
+                    }
+                    connection.demote_to_mvcc_connection();
+                    cleanup_state.source_demoted_for_mvcc_vacuum = true;
+                }
+                // 9. Acquire the checkpoint serialization lock early. This
                 // ensures a post-commit TRUNCATE checkpoint won't fail due
                 // to a concurrent checkpointer. If the lock is unavailable
                 // we fail fast before doing any expensive work.
@@ -1523,7 +1575,7 @@ pub(crate) fn vacuum_in_place_step(
                     source_db_id: db,
                     header_meta,
                     source_custom_types,
-                    source_mvcc_enabled: false, // Rejected MVCC above
+                    source_mvcc_enabled: source_db.mvcc_enabled(),
                 };
 
                 let target_build_context = VacuumTargetBuildContext::new(temp_db.conn.clone());
@@ -1596,6 +1648,7 @@ pub(crate) fn vacuum_in_place_step(
                     }
                     connection.auto_commit.store(true, Ordering::SeqCst);
                     connection.set_tx_state(crate::connection::TransactionState::None);
+                    release_mvcc_vacuum_gate(connection, cleanup_state);
                     *phase = VacuumInPlacePhase::Done;
                     continue;
                 }
@@ -2032,6 +2085,7 @@ pub(crate) fn vacuum_in_place_step(
 
             VacuumInPlacePhase::SchemaReload => {
                 reload_schema_after_vacuum_commit(connection, db, &source_pager)?;
+                release_mvcc_vacuum_gate(connection, cleanup_state);
 
                 *phase = VacuumInPlacePhase::Done;
                 return Ok(InsnFunctionStepResult::Step);
@@ -2090,6 +2144,7 @@ pub(crate) fn vacuum_in_place_cleanup(
                 wal.release_vacuum_lock();
             }
         }
+        cleanup_mvcc_vacuum_gate(connection, cleanup_state);
         return;
     }
 
@@ -2117,6 +2172,7 @@ pub(crate) fn vacuum_in_place_cleanup(
                 wal.release_vacuum_lock();
             }
         }
+        cleanup_mvcc_vacuum_gate(connection, cleanup_state);
         return; // auto_commit and tx_state were never modified.
     }
 
@@ -2129,6 +2185,7 @@ pub(crate) fn vacuum_in_place_cleanup(
 
     connection.auto_commit.store(true, Ordering::SeqCst);
     connection.set_tx_state(crate::connection::TransactionState::None);
+    cleanup_mvcc_vacuum_gate(connection, cleanup_state);
 }
 
 #[cfg(test)]

@@ -2359,6 +2359,34 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Acquire MVCC's stop-the-world gate for VACUUM.
+    ///
+    /// This is the same lock used by MVCC checkpointing. All MVCC transactions
+    /// hold it in read mode for their whole lifetime, so acquiring it in write
+    /// mode proves there are no active MVCC transactions and prevents new ones
+    /// from starting until VACUUM releases it.
+    pub(crate) fn try_begin_vacuum_gate(&self) -> Result<()> {
+        if !self.blocking_checkpoint_lock.write() {
+            return Err(LimboError::Busy);
+        }
+        if !self.txs.is_empty() {
+            self.blocking_checkpoint_lock.unlock();
+            turso_assert!(
+                false,
+                "MVCC vacuum gate acquired while transactions are still active"
+            );
+            return Err(LimboError::InternalError(
+                "MVCC vacuum gate acquired while transactions are still active".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Release the MVCC stop-the-world gate acquired by `try_begin_vacuum_gate`.
+    pub(crate) fn release_vacuum_gate(&self) {
+        self.blocking_checkpoint_lock.unlock();
+    }
+
     /// Creates the `__turso_internal_mvcc_meta` table and seeds it with
     /// `persistent_tx_ts_max` (initialized to 0). This table stores the durable replay
     /// boundary: on recovery, only logical-log frames with `commit_ts > persistent_tx_ts_max`

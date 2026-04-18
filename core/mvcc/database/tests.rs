@@ -75,6 +75,61 @@ impl MvccTestDb {
     }
 }
 
+#[test]
+fn mvcc_active_read_tx_blocks_vacuum_gate() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let tx_id = db.mvcc_store.begin_tx(pager).unwrap();
+
+    assert!(matches!(
+        db.mvcc_store.try_begin_vacuum_gate(),
+        Err(LimboError::Busy)
+    ));
+
+    db.mvcc_store.remove_tx(tx_id);
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+    db.mvcc_store.release_vacuum_gate();
+}
+
+#[test]
+fn mvcc_active_write_tx_blocks_vacuum_gate() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let tx_id = db
+        .mvcc_store
+        .begin_exclusive_tx(pager.clone(), None)
+        .unwrap();
+
+    assert!(matches!(
+        db.mvcc_store.try_begin_vacuum_gate(),
+        Err(LimboError::Busy)
+    ));
+
+    db.mvcc_store
+        .rollback_tx(tx_id, pager, &db.conn, crate::MAIN_DB_ID);
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+    db.mvcc_store.release_vacuum_gate();
+}
+
+#[test]
+fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+
+    assert!(matches!(
+        db.mvcc_store.begin_tx(pager.clone()),
+        Err(LimboError::Busy)
+    ));
+    assert!(matches!(
+        db.mvcc_store.begin_exclusive_tx(pager, None),
+        Err(LimboError::Busy)
+    ));
+
+    db.mvcc_store.release_vacuum_gate();
+}
+
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
