@@ -345,8 +345,10 @@ pub(crate) struct VacuumTargetBuildConfig {
     pub header_meta: VacuumDbHeaderMeta,
     /// Pre-captured source custom type definitions for STRICT table replay.
     pub source_custom_types: Vec<(String, Arc<TypeDef>)>,
-    /// Whether the source database has MVCC enabled.
-    pub source_mvcc_enabled: bool,
+    /// Whether the target database should be placed in MVCC journal mode.
+    pub target_mvcc_enabled: bool,
+    /// Whether to copy the source MVCC metadata table into the target image.
+    pub copy_mvcc_metadata_table: bool,
 }
 
 /// Context for the vacuum target build. Holds the target connection and all
@@ -472,9 +474,12 @@ pub(crate) fn vacuum_target_build_step(
                     });
                 }
 
-                // Enable MVCC on the target if source has it enabled.
+                // Enable MVCC on the target when building a user-visible
+                // MVCC destination. In-place VACUUM keeps its internal temp
+                // target in WAL mode because copy-back reads physical WAL
+                // frames from it.
                 // Must be done before any schema operations to ensure the log file is created
-                if config.source_mvcc_enabled {
+                if config.target_mvcc_enabled {
                     state.target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
                 }
 
@@ -489,14 +494,23 @@ pub(crate) fn vacuum_target_build_step(
                 state.target_conn.execute("BEGIN")?;
 
                 // Query sqlite_schema with rootpage, ordered by rowid.
-                // Exclude the MVCC metadata table - it is an internal artifact.
+                // VACUUM INTO recreates MVCC metadata in the destination; in-place
+                // VACUUM preserves the source metadata table in the physical image.
                 let escaped_schema_name = &config.escaped_schema_name;
-                let schema_sql = format!(
-                    "SELECT type, name, tbl_name, rootpage, sql \
-                     FROM \"{escaped_schema_name}\".sqlite_schema \
-                     WHERE sql IS NOT NULL AND name <> '{}' ORDER BY rowid",
-                    crate::mvcc::database::MVCC_META_TABLE_NAME
-                );
+                let schema_sql = if config.copy_mvcc_metadata_table {
+                    format!(
+                        "SELECT type, name, tbl_name, rootpage, sql \
+                         FROM \"{escaped_schema_name}\".sqlite_schema \
+                         WHERE sql IS NOT NULL ORDER BY rowid"
+                    )
+                } else {
+                    format!(
+                        "SELECT type, name, tbl_name, rootpage, sql \
+                         FROM \"{escaped_schema_name}\".sqlite_schema \
+                         WHERE sql IS NOT NULL AND name <> '{}' ORDER BY rowid",
+                        crate::mvcc::database::MVCC_META_TABLE_NAME
+                    )
+                };
                 let schema_stmt = config.source_conn.prepare_internal(schema_sql.as_str())?;
 
                 state.phase = VacuumTargetBuildPhase::CollectSchemaRows {
@@ -1359,6 +1373,14 @@ fn reload_schema_after_vacuum_commit(
         let schema = connection.schema.read().clone();
         let source_db = connection.get_source_database(db);
         source_db.update_schema_if_newer(schema);
+        if source_db.mvcc_enabled() {
+            let mv_store = source_db.get_mv_store().as_ref().cloned().ok_or_else(|| {
+                LimboError::InternalError(
+                    "MVCC database missing MV store after VACUUM schema reload".to_string(),
+                )
+            })?;
+            mv_store.reset_after_vacuum(connection)?;
+        }
     }
 
     // Always end the schema-reload read tx and restore state, whether the
@@ -1575,7 +1597,8 @@ pub(crate) fn vacuum_in_place_step(
                     source_db_id: db,
                     header_meta,
                     source_custom_types,
-                    source_mvcc_enabled: source_db.mvcc_enabled(),
+                    target_mvcc_enabled: false,
+                    copy_mvcc_metadata_table: source_db.mvcc_enabled(),
                 };
 
                 let target_build_context = VacuumTargetBuildContext::new(temp_db.conn.clone());

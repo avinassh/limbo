@@ -14375,7 +14375,8 @@ fn op_vacuum_into_inner(
                     source_db_id,
                     header_meta,
                     source_custom_types,
-                    source_mvcc_enabled: source_db.mvcc_enabled(),
+                    target_mvcc_enabled: source_db.mvcc_enabled(),
+                    copy_mvcc_metadata_table: false,
                 };
 
                 vacuum_state._output_db = Some(output_db);

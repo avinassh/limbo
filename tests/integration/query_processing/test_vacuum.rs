@@ -10,8 +10,8 @@ use std::{
 use tempfile::TempDir;
 use turso_core::{
     io::{FileId, FileSyncType},
-    Buffer, Clock, Completion, Connection, Database, File, MonotonicInstant, OpenFlags, StepResult,
-    Value, WallClockInstant, IO,
+    Buffer, Clock, Completion, Connection, Database, File, LimboError, MonotonicInstant, OpenFlags,
+    StepResult, Value, WallClockInstant, IO,
 };
 
 /// Helper to run integrity_check and return the result string
@@ -47,6 +47,12 @@ fn scalar_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
 fn wal_file_size(tmp_db: &TempDatabase) -> u64 {
     let wal_path = format!("{}-wal", tmp_db.path.display());
     std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn mvcc_log_file_size(tmp_db: &TempDatabase) -> u64 {
+    std::fs::metadata(tmp_db.path.with_extension("db-log"))
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 fn assert_plain_vacuum_folded_into_db_file(tmp_db: &TempDatabase, conn: &Arc<Connection>) {
@@ -4301,6 +4307,190 @@ fn test_plain_vacuum_active_reader_blocks_fold_contract() -> anyhow::Result<()> 
     assert_eq!(scalar_i64(&final_writer, "SELECT COUNT(*) FROM t"), 20);
     assert_eq!(run_integrity_check(&final_writer), "ok");
     assert_plain_vacuum_folded_into_db_file(&tmp_db, &final_writer);
+    Ok(())
+}
+
+fn populate_mvcc_vacuum_workload(conn: &Arc<Connection>) -> anyhow::Result<Vec<(i64, String)>> {
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, tag TEXT NOT NULL, payload TEXT)")?;
+    conn.execute("CREATE INDEX idx_t_tag ON t(tag)")?;
+
+    for id in 0..200 {
+        conn.execute(format!(
+            "INSERT INTO t VALUES({id}, 'tag-{}', '{}')",
+            id % 5,
+            "x".repeat(300)
+        ))?;
+    }
+    conn.execute("DELETE FROM t WHERE id % 3 = 0")?;
+    conn.execute(format!(
+        "UPDATE t SET tag = 'hot', payload = '{}' WHERE id % 10 = 1",
+        "y".repeat(350)
+    ))?;
+
+    Ok((0..200)
+        .filter(|id| id % 3 != 0)
+        .map(|id| {
+            let tag = if id % 10 == 1 {
+                "hot".to_string()
+            } else {
+                format!("tag-{}", id % 5)
+            };
+            (id, tag)
+        })
+        .collect())
+}
+
+fn assert_mvcc_vacuum_workload(
+    conn: &Arc<Connection>,
+    expected_rows: &[(i64, String)],
+) -> anyhow::Result<()> {
+    assert_eq!(run_integrity_check(conn), "ok");
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, tag FROM t ORDER BY id");
+    assert_eq!(rows, expected_rows);
+
+    let indexed_hot: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE tag = 'hot' ORDER BY id");
+    let table_scan_hot: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM t NOT INDEXED WHERE tag = 'hot' ORDER BY id");
+    assert_eq!(indexed_hot, table_scan_hot);
+
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_plain_vacuum_requires_checkpointed_image() -> anyhow::Result<()> {
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_requires_checkpointed_image.db");
+    let conn = tmp_db.connect_limbo();
+
+    let expected_rows = populate_mvcc_vacuum_workload(&conn)?;
+
+    let result = conn.execute("VACUUM");
+    assert!(
+        result.is_err(),
+        "MVCC VACUUM must not copy a stale B-tree image while logical changes are uncheckpointed"
+    );
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(
+        mvcc_log_file_size(&tmp_db),
+        0,
+        "MVCC log should be empty before plain VACUUM starts"
+    );
+
+    conn.execute("VACUUM")?;
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_plain_vacuum_after_checkpoint_preserves_mvcc_state() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc(
+        "test_mvcc_plain_vacuum_after_checkpoint_preserves_mvcc_state.db",
+    );
+    let conn = tmp_db.connect_limbo();
+    let mut expected_rows = populate_mvcc_vacuum_workload(&conn)?;
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(
+        mvcc_log_file_size(&tmp_db),
+        0,
+        "MVCC log should be empty before plain VACUUM starts"
+    );
+
+    conn.execute("VACUUM")?;
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    conn.execute("INSERT INTO t VALUES(1000, 'after-vacuum', 'z')")?;
+    conn.execute("UPDATE t SET tag = 'after-update' WHERE id = 1")?;
+    conn.execute("DELETE FROM t WHERE id = 2")?;
+
+    expected_rows.retain(|(id, _)| *id != 2);
+    if let Some((_, tag)) = expected_rows.iter_mut().find(|(id, _)| *id == 1) {
+        *tag = "after-update".to_string();
+    }
+    expected_rows.push((1000, "after-vacuum".to_string()));
+    expected_rows.sort_by_key(|(id, _)| *id);
+
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+    assert!(
+        mvcc_log_file_size(&tmp_db) > 0,
+        "post-VACUUM MVCC writes should use the logical log"
+    );
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(
+        mvcc_log_file_size(&tmp_db),
+        0,
+        "checkpoint after post-VACUUM writes should truncate the MVCC log"
+    );
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let reopened = TempDatabase::new_with_existent(&path);
+    let reopened_conn = reopened.connect_limbo();
+    assert_mvcc_vacuum_workload(&reopened_conn, &expected_rows)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_plain_vacuum_active_read_tx_returns_busy() -> anyhow::Result<()> {
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_active_read_tx_returns_busy.db");
+    let writer = tmp_db.connect_limbo();
+    let reader = tmp_db.connect_limbo();
+
+    let expected_rows = populate_mvcc_vacuum_workload(&writer)?;
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    reader.execute("BEGIN")?;
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(rows, vec![(expected_rows.len() as i64,)]);
+
+    let result = writer.execute("VACUUM");
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "active MVCC read transaction should make VACUUM return Busy, got {result:?}"
+    );
+
+    reader.execute("ROLLBACK")?;
+    writer.execute("VACUUM")?;
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &writer);
+    assert_mvcc_vacuum_workload(&writer, &expected_rows)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_plain_vacuum_active_write_tx_returns_busy() -> anyhow::Result<()> {
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_active_write_tx_returns_busy.db");
+    let vacuum_conn = tmp_db.connect_limbo();
+    let writer = tmp_db.connect_limbo();
+
+    let expected_rows = populate_mvcc_vacuum_workload(&vacuum_conn)?;
+    vacuum_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    writer.execute("BEGIN IMMEDIATE")?;
+    writer.execute("INSERT INTO t VALUES(1000, 'uncommitted', 'pending')")?;
+
+    let result = vacuum_conn.execute("VACUUM");
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "active MVCC write transaction should make VACUUM return Busy, got {result:?}"
+    );
+
+    writer.execute("ROLLBACK")?;
+    vacuum_conn.execute("VACUUM")?;
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &vacuum_conn);
+    assert_mvcc_vacuum_workload(&vacuum_conn, &expected_rows)?;
+
     Ok(())
 }
 

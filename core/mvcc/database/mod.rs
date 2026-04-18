@@ -2387,6 +2387,50 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.blocking_checkpoint_lock.unlock();
     }
 
+    /// Reset MVCC's physical metadata after in-place VACUUM rewrites the B-tree image.
+    ///
+    /// The caller must hold the MVCC vacuum gate, so no MVCC transaction can observe
+    /// the root-page map while it is being rebuilt.
+    pub(crate) fn reset_after_vacuum(&self, connection: &Arc<Connection>) -> Result<()> {
+        let pager = connection.pager.load();
+        let header = pager.io.block(|| pager.with_header(|header| *header))?;
+        self.global_header.write().replace(header);
+
+        let keys = self
+            .table_id_to_rootpage
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.table_id_to_rootpage.remove(&key);
+        }
+        self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1));
+
+        let schema = connection.schema.read();
+        let root_pages = schema
+            .tables
+            .values()
+            .filter_map(|table| match table.as_ref() {
+                Table::BTree(btree) => Some(btree.root_page),
+                _ => None,
+            })
+            .chain(
+                schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .map(|index| index.root_page),
+            );
+        for root_page in root_pages {
+            if root_page > 0 {
+                let table_id = MVTableId::from(-root_page);
+                self.insert_table_id_to_rootpage(table_id, Some(root_page as u64));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Creates the `__turso_internal_mvcc_meta` table and seeds it with
     /// `persistent_tx_ts_max` (initialized to 0). This table stores the durable replay
     /// boundary: on recovery, only logical-log frames with `commit_ts > persistent_tx_ts_max`
