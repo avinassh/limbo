@@ -545,10 +545,17 @@ pub trait Wal: Debug + Send + Sync {
     /// The caller must already hold the checkpoint lock (via
     /// `try_begin_checkpoint_lock`).
     ///
-    /// On return the connection holds all three locks. Release the WAL locks via
-    /// `end_write_tx` + `end_read_tx`, and release the VACUUM lock with
-    /// `release_vacuum_lock` after the final truncate checkpoint is complete.
+    /// On return the connection holds all three locks. If VACUUM publishes a
+    /// commit, transfer checkpoint/read0/write ownership to the final checkpoint
+    /// via `handoff_exclusive_tx_to_checkpoint`, then release the VACUUM lock
+    /// with `release_vacuum_lock` after that checkpoint is complete.
     fn begin_exclusive_tx(&self) -> Result<()>;
+
+    /// Transfer the checkpoint/read0/write locks acquired by
+    /// `try_begin_checkpoint_lock` + `begin_exclusive_tx` into the checkpoint
+    /// guard. This clears the connection-local read/write markers without
+    /// unlocking those locks; checkpoint finalization owns their release.
+    fn handoff_exclusive_tx_to_checkpoint(&self);
 
     /// Release the exclusive VACUUM lock acquired by `begin_exclusive_tx`.
     fn release_vacuum_lock(&self);
@@ -1028,7 +1035,7 @@ impl Drop for VacuumLockGuard {
     fn drop(&mut self) {
         match self {
             Self::Read { ptr } | Self::Write { ptr } => {
-                ptr.write().vacuum_lock.unlock();
+                ptr.read().vacuum_lock.unlock();
             }
         }
     }
@@ -1129,6 +1136,10 @@ enum TryBeginReadResult {
     Ok(bool),
     /// Transient condition, caller should retry immediately (like SQLite's WAL_RETRY)
     Retry,
+    /// A VACUUM is in progress and is holding the vacuum lock exclusively.
+    /// Retrying will not help until VACUUM releases; caller should surface Busy
+    /// to the client rather than spin.
+    Busy,
 }
 
 impl WalFile {
@@ -1243,8 +1254,8 @@ impl WalFile {
         self.assert_no_vacuum_lock_guard();
 
         let Some(vacuum_lock_guard) = VacuumLockGuard::try_read(self.shared.clone()) else {
-            tracing::debug!("begin_read_tx: unable to acquire vacuum lock, retrying");
-            return TryBeginReadResult::Retry;
+            tracing::debug!("begin_read_tx: VACUUM holds the vacuum lock, returning Busy");
+            return TryBeginReadResult::Busy;
         };
 
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
@@ -1418,6 +1429,7 @@ impl Wal for WalFile {
             tracing::trace!("begin_read_tx: cnt={cnt}");
             match self.try_begin_read_tx() {
                 TryBeginReadResult::Ok(changed) => return Ok(changed),
+                TryBeginReadResult::Busy => return Err(LimboError::Busy),
                 TryBeginReadResult::Retry => {
                     cnt += 1;
                     if cnt > 100 {
@@ -1470,7 +1482,7 @@ impl Wal for WalFile {
         } else {
             turso_assert!(
                 !self.has_vacuum_read_lock_guard(),
-                "vacuum read gate held without a WAL read lock"
+                "vacuum read lock guard held without a WAL read lock"
             );
             tracing::debug!("end_read_tx(slot=no_lock)");
         }
@@ -2197,16 +2209,23 @@ impl Wal for WalFile {
         };
 
         self.with_shared(|shared| {
-            // Existing readers should have drained before the exclusive gate
-            // succeeds. Probe every read-mark slot so any ungated lock user is
-            // caught before VACUUM publishes a new image.
+            // Existing readers should have drained before the exclusive lock
+            // succeeds. Probe every read-mark slot so any unprotected lock user
+            // is caught before VACUUM publishes a new image.
             let mut drained = 0;
             for idx in 0..shared.read_locks.len() {
                 if !shared.read_locks[idx].write() {
                     for release_idx in 0..drained {
                         shared.read_locks[release_idx].unlock();
                     }
-                    return Err(LimboError::Busy);
+                    turso_assert!(
+                        false,
+                        "begin_exclusive_tx: read lock held after VACUUM lock acquired",
+                        { "read_lock_idx": idx }
+                    );
+                    return Err(LimboError::InternalError(
+                        "begin_exclusive_tx: read lock held after VACUUM lock acquired".into(),
+                    ));
                 }
                 drained += 1;
             }
@@ -2249,6 +2268,39 @@ impl Wal for WalFile {
 
     fn release_vacuum_lock(&self) {
         self.release_vacuum_write_lock_guard();
+    }
+
+    fn handoff_exclusive_tx_to_checkpoint(&self) {
+        turso_assert!(
+            self.vacuum_lock_guard
+                .read()
+                .as_ref()
+                .is_some_and(VacuumLockGuard::is_write),
+            "VACUUM checkpoint handoff requires the exclusive VACUUM lock"
+        );
+        turso_assert!(
+            self.max_frame_read_lock_index.load(Ordering::Acquire) == 0,
+            "VACUUM checkpoint handoff requires read_locks[0]"
+        );
+        turso_assert!(
+            self.write_lock_held.load(Ordering::Acquire),
+            "VACUUM checkpoint handoff requires the write lock"
+        );
+
+        {
+            let mut checkpoint_guard = self.checkpoint_guard.write();
+            turso_assert!(
+                checkpoint_guard.is_none(),
+                "VACUUM checkpoint handoff requires an empty checkpoint guard"
+            );
+            *checkpoint_guard = Some(CheckpointLocks::Writer {
+                ptr: self.shared.clone(),
+            });
+        }
+
+        self.write_lock_held.store(false, Ordering::Release);
+        self.max_frame_read_lock_index
+            .store(NO_LOCK_HELD, Ordering::Release);
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -4065,7 +4117,7 @@ pub mod test {
         vacuum_wal.begin_exclusive_tx().unwrap();
 
         assert!(
-            matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Retry),
+            matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
             "VACUUM lock should block new WAL readers before they take a read-mark slot"
         );
 
@@ -4076,7 +4128,7 @@ pub mod test {
 
         assert!(
             matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Ok(_)),
-            "reader should start after VACUUM releases the gate"
+            "reader should start after VACUUM releases the lock"
         );
         reader_wal.end_read_tx();
     }
@@ -4094,7 +4146,7 @@ pub mod test {
 
         assert!(
             matches!(vacuum_wal.begin_exclusive_tx(), Err(LimboError::Busy)),
-            "active reader should prevent VACUUM from acquiring its exclusive gate"
+            "active reader should prevent VACUUM from acquiring its exclusive lock"
         );
 
         reader_wal.end_read_tx();
@@ -4103,6 +4155,48 @@ pub mod test {
         vacuum_wal.end_read_tx();
         vacuum_wal.release_vacuum_lock();
         vacuum_wal.release_checkpoint_lock();
+    }
+
+    #[test]
+    fn test_vacuum_checkpoint_handoff_keeps_locks_until_checkpoint_cleanup() {
+        let (shared, vacuum_wal) = make_test_wal();
+        let contender_wal = make_test_wal_from_shared(shared);
+
+        vacuum_wal.try_begin_checkpoint_lock().unwrap();
+        vacuum_wal.begin_exclusive_tx().unwrap();
+        vacuum_wal.handoff_exclusive_tx_to_checkpoint();
+
+        assert!(!vacuum_wal.holds_write_lock());
+        assert!(!vacuum_wal.holds_read_lock());
+        assert!(
+            matches!(
+                contender_wal.try_begin_checkpoint_lock(),
+                Err(LimboError::Busy)
+            ),
+            "checkpoint lock should remain held by the checkpoint guard"
+        );
+        assert!(
+            matches!(contender_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
+            "VACUUM lock should continue blocking readers during final checkpoint"
+        );
+
+        vacuum_wal.abort_checkpoint();
+        assert!(
+            contender_wal.try_begin_checkpoint_lock().is_ok(),
+            "checkpoint cleanup should release the checkpoint lock"
+        );
+        contender_wal.release_checkpoint_lock();
+        assert!(
+            matches!(contender_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
+            "checkpoint cleanup must not release the VACUUM lock"
+        );
+
+        vacuum_wal.release_vacuum_lock();
+        assert!(matches!(
+            contender_wal.try_begin_read_tx(),
+            TryBeginReadResult::Ok(_)
+        ));
+        contender_wal.end_read_tx();
     }
 
     #[test]

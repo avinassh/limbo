@@ -1057,6 +1057,8 @@ pub(crate) fn build_copy_sql(
 pub(crate) struct VacuumInPlaceCleanupState {
     /// WAL checkpoint serialization lock is held.
     pub checkpoint_lock_held: bool,
+    /// Final VACUUM checkpoint owns checkpoint/read0/write locks.
+    pub checkpoint_locks_handed_off: bool,
     /// WAL VACUUM lock is held exclusively.
     pub vacuum_lock_held: bool,
     /// Source pager read transaction was started.
@@ -1576,14 +1578,19 @@ pub(crate) fn vacuum_in_place_step(
                     // Empty database — nothing to copy back. Clean up the
                     // source write tx and connection state we acquired earlier.
                     drop(temp_db);
+                    let wal = source_pager
+                        .wal
+                        .as_ref()
+                        .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
                     source_pager.end_write_tx();
                     source_pager.end_read_tx();
                     cleanup_state.source_write_tx_open = false;
                     cleanup_state.source_read_tx_open = false;
+                    if cleanup_state.checkpoint_lock_held {
+                        wal.release_checkpoint_lock();
+                        cleanup_state.checkpoint_lock_held = false;
+                    }
                     if cleanup_state.vacuum_lock_held {
-                        let wal = source_pager.wal.as_ref().ok_or_else(|| {
-                            LimboError::InternalError("VACUUM requires WAL".into())
-                        })?;
                         wal.release_vacuum_lock();
                         cleanup_state.vacuum_lock_held = false;
                     }
@@ -1937,16 +1944,11 @@ pub(crate) fn vacuum_in_place_step(
                 wal.finish_append_frames_commit()?;
                 cleanup_state.wal_commit_published = true;
 
-                // Release source write lock and read lock.
-                source_pager.end_write_tx();
-                source_pager.end_read_tx();
+                wal.handoff_exclusive_tx_to_checkpoint();
                 cleanup_state.source_write_tx_open = false;
                 cleanup_state.source_read_tx_open = false;
-
-                // Release the checkpoint serialization lock so the TRUNCATE
-                // checkpoint below can re-acquire it through the normal path.
-                wal.release_checkpoint_lock();
                 cleanup_state.checkpoint_lock_held = false;
+                cleanup_state.checkpoint_locks_handed_off = true;
 
                 // Restore connection bookkeeping immediately. The commit is
                 // durable so there is nothing to roll back; restoring here
@@ -1979,6 +1981,7 @@ pub(crate) fn vacuum_in_place_step(
                     true,
                 ) {
                     Ok(crate::IOResult::Done(result)) => {
+                        cleanup_state.checkpoint_locks_handed_off = false;
                         if !result.should_truncate() {
                             if cleanup_state.vacuum_lock_held {
                                 let wal = source_pager.wal.as_ref().ok_or_else(|| {
@@ -2005,6 +2008,10 @@ pub(crate) fn vacuum_in_place_step(
                     }
                     Err(err) => {
                         tracing::info!("VACUUM post-commit checkpoint failed: {err}");
+                        if cleanup_state.checkpoint_locks_handed_off {
+                            source_pager.cleanup_after_checkpoint_failure();
+                            cleanup_state.checkpoint_locks_handed_off = false;
+                        }
                         if cleanup_state.vacuum_lock_held {
                             if let Some(wal) = source_pager.wal.as_ref() {
                                 wal.release_vacuum_lock();
@@ -2057,6 +2064,10 @@ pub(crate) fn vacuum_in_place_cleanup(
         !cleanup_state.source_write_tx_open || cleanup_state.source_read_tx_open,
         "VACUUM cleanup cannot have source write tx without source read tx"
     );
+    turso_assert!(
+        !(cleanup_state.checkpoint_lock_held && cleanup_state.checkpoint_locks_handed_off),
+        "VACUUM cleanup cannot own raw checkpoint lock and checkpoint handoff"
+    );
 
     // Release the checkpoint lock if we acquired it.
     if cleanup_state.checkpoint_lock_held {
@@ -2064,6 +2075,11 @@ pub(crate) fn vacuum_in_place_cleanup(
         if let Some(wal) = pager.wal.as_ref() {
             wal.release_checkpoint_lock();
         }
+    }
+
+    if cleanup_state.checkpoint_locks_handed_off {
+        let pager = connection.get_pager_from_database_index(&db);
+        pager.cleanup_after_checkpoint_failure();
     }
 
     // Nothing else acquired — nothing to undo.

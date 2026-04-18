@@ -3950,6 +3950,10 @@ impl Pager {
     /// Clean up after a auto-checkpoint failure.
     /// Auto-checkpoint executed outside of the main transaction - so WAL transaction was already finalized
     pub fn cleanup_after_auto_checkpoint_failure(&self) {
+        self.cleanup_after_checkpoint_failure();
+    }
+
+    pub fn cleanup_after_checkpoint_failure(&self) {
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
             wal.abort_checkpoint();
