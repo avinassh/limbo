@@ -1057,6 +1057,8 @@ pub(crate) fn build_copy_sql(
 pub(crate) struct VacuumInPlaceCleanupState {
     /// WAL checkpoint serialization lock is held.
     pub checkpoint_lock_held: bool,
+    /// WAL VACUUM lock is held exclusively.
+    pub vacuum_lock_held: bool,
     /// Source pager read transaction was started.
     pub source_read_tx_open: bool,
     /// Source pager write transaction was acquired and `auto_commit`/`tx_state`
@@ -1084,8 +1086,9 @@ pub(crate) enum VacuumInPlacePhase {
     /// MVCC, WAL-backed pager).
     Preflight,
     /// Acquire exclusive access on the source WAL via `begin_exclusive_tx`:
-    /// checkpoint_lock is already held from Preflight, this acquires
-    /// read_locks[0] exclusively + write_lock in one shot.
+    /// checkpoint_lock is already held from Preflight; this acquires the
+    /// exclusive VACUUM lock, read_locks[0] exclusively, and write_lock in one
+    /// shot.
     BeginSourceTx,
     /// Read source database header metadata for the target-build config.
     ReadSourceMetadata,
@@ -1141,7 +1144,7 @@ pub(crate) enum VacuumInPlacePhase {
         sync_completion: crate::io::Completion,
     },
     /// Publish: commit_prepared_frames + finish_append_frames_commit, release
-    /// locks, drop temp resources.
+    /// source WAL locks, keep the VACUUM lock, and drop temp resources.
     PublishWalCommit { temp_db: Box<VacuumTempDb> },
     /// TRUNCATE checkpoint: copy WAL frames back into the DB file and truncate
     /// the WAL to zero. The pager's internal state machine handles the multi-step
@@ -1446,7 +1449,7 @@ pub(crate) fn vacuum_in_place_step(
 
             VacuumInPlacePhase::BeginSourceTx => {
                 // Acquire exclusive WAL access in one shot:
-                // read_locks[0] exclusively + write_lock + connection snapshot.
+                // vacuum lock + read_locks[0] exclusively + write_lock + connection snapshot.
                 // Checkpoint lock was already acquired in Preflight.
                 match source_pager.begin_exclusive_tx()? {
                     crate::IOResult::Done(()) => {
@@ -1456,6 +1459,7 @@ pub(crate) fn vacuum_in_place_step(
                         });
                         cleanup_state.source_read_tx_open = true;
                         cleanup_state.source_write_tx_open = true;
+                        cleanup_state.vacuum_lock_held = true;
                         *phase = VacuumInPlacePhase::ReadSourceMetadata;
                         continue;
                     }
@@ -1576,6 +1580,13 @@ pub(crate) fn vacuum_in_place_step(
                     source_pager.end_read_tx();
                     cleanup_state.source_write_tx_open = false;
                     cleanup_state.source_read_tx_open = false;
+                    if cleanup_state.vacuum_lock_held {
+                        let wal = source_pager.wal.as_ref().ok_or_else(|| {
+                            LimboError::InternalError("VACUUM requires WAL".into())
+                        })?;
+                        wal.release_vacuum_lock();
+                        cleanup_state.vacuum_lock_held = false;
+                    }
                     connection.auto_commit.store(true, Ordering::SeqCst);
                     connection.set_tx_state(crate::connection::TransactionState::None);
                     *phase = VacuumInPlacePhase::Done;
@@ -1969,7 +1980,21 @@ pub(crate) fn vacuum_in_place_step(
                 ) {
                     Ok(crate::IOResult::Done(result)) => {
                         if !result.should_truncate() {
+                            if cleanup_state.vacuum_lock_held {
+                                let wal = source_pager.wal.as_ref().ok_or_else(|| {
+                                    LimboError::InternalError("VACUUM requires WAL".into())
+                                })?;
+                                wal.release_vacuum_lock();
+                                cleanup_state.vacuum_lock_held = false;
+                            }
                             return Err(LimboError::Busy);
+                        }
+                        if cleanup_state.vacuum_lock_held {
+                            let wal = source_pager.wal.as_ref().ok_or_else(|| {
+                                LimboError::InternalError("VACUUM requires WAL".into())
+                            })?;
+                            wal.release_vacuum_lock();
+                            cleanup_state.vacuum_lock_held = false;
                         }
                         *phase = VacuumInPlacePhase::SchemaReload;
                         continue;
@@ -1980,6 +2005,12 @@ pub(crate) fn vacuum_in_place_step(
                     }
                     Err(err) => {
                         tracing::info!("VACUUM post-commit checkpoint failed: {err}");
+                        if cleanup_state.vacuum_lock_held {
+                            if let Some(wal) = source_pager.wal.as_ref() {
+                                wal.release_vacuum_lock();
+                                cleanup_state.vacuum_lock_held = false;
+                            }
+                        }
                         if let Err(reload_err) =
                             reload_schema_after_vacuum_commit(connection, db, &source_pager)
                         {
@@ -2037,6 +2068,12 @@ pub(crate) fn vacuum_in_place_cleanup(
 
     // Nothing else acquired — nothing to undo.
     if !cleanup_state.source_read_tx_open && !cleanup_state.source_write_tx_open {
+        if cleanup_state.vacuum_lock_held {
+            let pager = connection.get_pager_from_database_index(&db);
+            if let Some(wal) = pager.wal.as_ref() {
+                wal.release_vacuum_lock();
+            }
+        }
         return;
     }
 
@@ -2059,7 +2096,19 @@ pub(crate) fn vacuum_in_place_cleanup(
         // Only read transaction — just release the read lock.
         let pager = connection.get_pager_from_database_index(&db);
         pager.end_read_tx();
+        if cleanup_state.vacuum_lock_held {
+            if let Some(wal) = pager.wal.as_ref() {
+                wal.release_vacuum_lock();
+            }
+        }
         return; // auto_commit and tx_state were never modified.
+    }
+
+    if cleanup_state.vacuum_lock_held {
+        let pager = connection.get_pager_from_database_index(&db);
+        if let Some(wal) = pager.wal.as_ref() {
+            wal.release_vacuum_lock();
+        }
     }
 
     connection.auto_commit.store(true, Ordering::SeqCst);

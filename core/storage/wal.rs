@@ -531,21 +531,27 @@ pub trait Wal: Debug + Send + Sync {
     /// `try_begin_checkpoint_lock`.
     fn release_checkpoint_lock(&self);
 
-    /// Acquire exclusive access for VACUUM: checkpoint_lock + read_locks[0]
-    /// (exclusive) + write_lock, then install a fresh connection snapshot.
+    /// Acquire exclusive access for VACUUM: vacuum_lock (exclusive) +
+    /// read_locks[0] (exclusive) + write_lock, then install a fresh connection
+    /// snapshot.
     ///
     /// This replaces the normal `begin_read_tx` + `begin_write_tx` path for
     /// VACUUM, which needs exclusive access rather than a shared reader
-    /// upgraded to a writer. Holding `read_locks[0]` exclusively blocks new
-    /// readers; holding `write_lock` blocks new writers; holding
-    /// `checkpoint_lock` blocks concurrent checkpointers.
+    /// upgraded to a writer. Holding `vacuum_lock` exclusively blocks new
+    /// readers at entry; holding `read_locks[0]` exclusively protects the
+    /// DB-file snapshot while it is installed; holding `write_lock` blocks
+    /// writers.
     ///
     /// The caller must already hold the checkpoint lock (via
     /// `try_begin_checkpoint_lock`).
     ///
-    /// On return the connection holds all three locks. Release via the normal
-    /// `end_write_tx` + `end_read_tx` + `release_checkpoint_lock` sequence.
+    /// On return the connection holds all three locks. Release the WAL locks via
+    /// `end_write_tx` + `end_read_tx`, and release the VACUUM lock with
+    /// `release_vacuum_lock` after the final truncate checkpoint is complete.
     fn begin_exclusive_tx(&self) -> Result<()>;
+
+    /// Release the exclusive VACUUM lock acquired by `begin_exclusive_tx`.
+    fn release_vacuum_lock(&self);
 
     #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any;
@@ -824,6 +830,7 @@ pub struct WalFile {
 
     syncing: Arc<AtomicBool>,
     write_lock_held: AtomicBool,
+    vacuum_lock_guard: RwLock<Option<VacuumLockGuard>>,
 
     shared: Arc<RwLock<WalFileShared>>,
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
@@ -943,6 +950,12 @@ pub struct WalFileShared {
     /// Slots 1‑4 carry a frame‑number in value and may be shared by many readers. Slot 1 is the
     /// default read lock and is to contain the max_frame in WAL.
     pub read_locks: [TursoRwLock; 5],
+    /// Lock used by in-place VACUUM to keep new read/write transactions out
+    /// while the compacted image is being copied back and folded into the DB.
+    /// Normal WAL readers hold this shared for the lifetime of their read
+    /// transaction. VACUUM holds it exclusively until its final truncate
+    /// checkpoint has completed.
+    pub vacuum_lock: TursoRwLock,
     /// There is only one write allowed in WAL mode. This lock takes care of ensuring there is only
     /// one used.
     pub write_lock: TursoRwLock,
@@ -968,6 +981,56 @@ impl fmt::Debug for WalFileShared {
             .field("last_checksum", &self.last_checksum)
             // Excluding `file`, `read_locks`, and `write_lock`
             .finish()
+    }
+}
+
+#[derive(Debug)]
+enum VacuumLockGuard {
+    Read { ptr: Arc<RwLock<WalFileShared>> },
+    Write { ptr: Arc<RwLock<WalFileShared>> },
+}
+
+impl VacuumLockGuard {
+    fn try_read(ptr: Arc<RwLock<WalFileShared>>) -> Option<Self> {
+        let acquired = {
+            let shared = ptr.read();
+            shared.vacuum_lock.read()
+        };
+        if acquired {
+            Some(Self::Read { ptr })
+        } else {
+            None
+        }
+    }
+
+    fn try_write(ptr: Arc<RwLock<WalFileShared>>) -> Option<Self> {
+        let acquired = {
+            let shared = ptr.read();
+            shared.vacuum_lock.write()
+        };
+        if acquired {
+            Some(Self::Write { ptr })
+        } else {
+            None
+        }
+    }
+
+    const fn is_read(&self) -> bool {
+        matches!(self, Self::Read { .. })
+    }
+
+    const fn is_write(&self) -> bool {
+        matches!(self, Self::Write { .. })
+    }
+}
+
+impl Drop for VacuumLockGuard {
+    fn drop(&mut self) {
+        match self {
+            Self::Read { ptr } | Self::Write { ptr } => {
+                ptr.write().vacuum_lock.unlock();
+            }
+        }
     }
 }
 
@@ -1114,6 +1177,59 @@ impl WalFile {
         snapshot != local_state.snapshot
     }
 
+    fn has_vacuum_read_lock_guard(&self) -> bool {
+        self.vacuum_lock_guard
+            .read()
+            .as_ref()
+            .is_some_and(VacuumLockGuard::is_read)
+    }
+
+    fn install_vacuum_lock_guard(&self, guard: VacuumLockGuard) {
+        let mut slot = self.vacuum_lock_guard.write();
+        turso_assert!(slot.is_none(), "VACUUM lock guard is already installed");
+        *slot = Some(guard);
+    }
+
+    fn release_vacuum_read_lock_guard(&self) {
+        let guard = {
+            let mut slot = self.vacuum_lock_guard.write();
+            turso_assert!(
+                slot.as_ref().is_some_and(VacuumLockGuard::is_read),
+                "VACUUM read lock guard is not held"
+            );
+            slot.take()
+                .expect("VACUUM read lock guard should be present after kind check")
+        };
+        drop(guard);
+    }
+
+    fn release_vacuum_write_lock_guard(&self) {
+        let guard = {
+            let mut slot = self.vacuum_lock_guard.write();
+            turso_assert!(
+                slot.as_ref().is_some_and(VacuumLockGuard::is_write),
+                "VACUUM write lock guard is not held"
+            );
+            slot.take()
+                .expect("VACUUM write lock guard should be present after kind check")
+        };
+        drop(guard);
+    }
+
+    fn release_exclusive_wal_begin_locks(&self) {
+        self.with_shared(|shared| {
+            shared.write_lock.unlock();
+            shared.read_locks[0].unlock();
+        });
+    }
+
+    fn assert_no_vacuum_lock_guard(&self) {
+        turso_assert!(
+            self.vacuum_lock_guard.read().is_none(),
+            "VACUUM lock guard already held"
+        );
+    }
+
     /// Try to begin a read transaction. Returns Retry for transient conditions
     /// that should be retried immediately, Ok for success.
     fn try_begin_read_tx(&self) -> TryBeginReadResult {
@@ -1124,6 +1240,12 @@ impl WalFile {
             "cannot start a new read tx without ending an existing one",
             { "lock_value": self.max_frame_read_lock_index.load(Ordering::Acquire), "expected": NO_LOCK_HELD }
         );
+        self.assert_no_vacuum_lock_guard();
+
+        let Some(vacuum_lock_guard) = VacuumLockGuard::try_read(self.shared.clone()) else {
+            tracing::debug!("begin_read_tx: unable to acquire vacuum lock, retrying");
+            return TryBeginReadResult::Retry;
+        };
 
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
         // to validate these values later.
@@ -1176,6 +1298,7 @@ impl WalFile {
                 self.with_shared(|shared| shared.read_locks[0].unlock());
                 return TryBeginReadResult::Retry;
             }
+            self.install_vacuum_lock_guard(vacuum_lock_guard);
             self.install_connection_state(WalConnectionState::new(
                 shared_snapshot,
                 ReadGuardKind::DbFile,
@@ -1267,6 +1390,7 @@ impl WalFile {
             self.with_shared(|shared| shared.read_locks[best_idx as usize].unlock());
             return TryBeginReadResult::Retry;
         }
+        self.install_vacuum_lock_guard(vacuum_lock_guard);
         self.install_connection_state(WalConnectionState::new(
             shared_snapshot,
             ReadGuardKind::ReadMark(best_idx as usize),
@@ -1331,8 +1455,23 @@ impl Wal for WalFile {
             self.with_shared(|shared| shared.read_locks[slot].unlock());
             self.max_frame_read_lock_index
                 .store(NO_LOCK_HELD, Ordering::Release);
+            if self.has_vacuum_read_lock_guard() {
+                self.release_vacuum_read_lock_guard();
+            } else {
+                turso_assert!(
+                    self.vacuum_lock_guard
+                        .read()
+                        .as_ref()
+                        .is_some_and(VacuumLockGuard::is_write),
+                    "read lock ended without a normal read VACUUM lock or exclusive VACUUM lock"
+                );
+            }
             tracing::debug!("end_read_tx(slot={slot})");
         } else {
+            turso_assert!(
+                !self.has_vacuum_read_lock_guard(),
+                "vacuum read gate held without a WAL read lock"
+            );
             tracing::debug!("end_read_tx(slot=no_lock)");
         }
     }
@@ -2051,13 +2190,36 @@ impl Wal for WalFile {
             !self.holds_write_lock(),
             "begin_exclusive_tx: must not already hold the write lock"
         );
+        self.assert_no_vacuum_lock_guard();
+
+        let Some(vacuum_lock_guard) = VacuumLockGuard::try_write(self.shared.clone()) else {
+            return Err(LimboError::Busy);
+        };
 
         self.with_shared(|shared| {
-            // 1. Exclusive lock on read_locks[0] — blocks all new readers.
+            // Existing readers should have drained before the exclusive gate
+            // succeeds. Probe every read-mark slot so any ungated lock user is
+            // caught before VACUUM publishes a new image.
+            let mut drained = 0;
+            for idx in 0..shared.read_locks.len() {
+                if !shared.read_locks[idx].write() {
+                    for release_idx in 0..drained {
+                        shared.read_locks[release_idx].unlock();
+                    }
+                    return Err(LimboError::Busy);
+                }
+                drained += 1;
+            }
+            for idx in 0..drained {
+                shared.read_locks[idx].unlock();
+            }
+
+            // Exclusive lock on read_locks[0] protects the DB-file snapshot
+            // installed on this VACUUM connection.
             if !shared.read_locks[0].write() {
                 return Err(LimboError::Busy);
             }
-            // 2. Write lock — blocks all writers.
+            // Write lock — blocks all writers.
             if !shared.write_lock.write() {
                 shared.read_locks[0].unlock();
                 return Err(LimboError::Busy);
@@ -2068,13 +2230,25 @@ impl Wal for WalFile {
         // Install connection state with a fresh snapshot.
         let snapshot = self.with_shared(Self::load_shared_snapshot);
         self.install_connection_state(WalConnectionState::new(snapshot, ReadGuardKind::DbFile));
-        turso_assert!(
-            self.write_lock_held
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "begin_exclusive_tx: write_lock_held already set"
-        );
+        if self
+            .write_lock_held
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.max_frame_read_lock_index
+                .store(NO_LOCK_HELD, Ordering::Release);
+            self.release_exclusive_wal_begin_locks();
+            turso_assert!(false, "begin_exclusive_tx: write_lock_held already set");
+            return Err(LimboError::InternalError(
+                "begin_exclusive_tx: write_lock_held already set".into(),
+            ));
+        }
+        self.install_vacuum_lock_guard(vacuum_lock_guard);
         Ok(())
+    }
+
+    fn release_vacuum_lock(&self) {
+        self.release_vacuum_write_lock_guard();
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2504,6 +2678,7 @@ impl WalFile {
             checkpoint_seq: AtomicU32::new(0),
             syncing: Arc::new(AtomicBool::new(false)),
             write_lock_held: AtomicBool::new(false),
+            vacuum_lock_guard: RwLock::new(None),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
@@ -3291,6 +3466,7 @@ impl WalFileShared {
             last_checksum: (0, 0),
             file: None,
             read_locks,
+            vacuum_lock: TursoRwLock::new(),
             write_lock: TursoRwLock::new(),
             checkpoint_lock: TursoRwLock::new(),
             loaded: AtomicBool::new(true),
@@ -3323,6 +3499,7 @@ impl WalFileShared {
             last_checksum: (0, 0),
             file: Some(file),
             read_locks,
+            vacuum_lock: TursoRwLock::new(),
             write_lock: TursoRwLock::new(),
             checkpoint_lock: TursoRwLock::new(),
             loaded: AtomicBool::new(true),
@@ -3379,7 +3556,7 @@ impl WalFileShared {
 
 #[cfg(test)]
 pub mod test {
-    use super::{ReadGuardKind, Wal, WalConnectionState, WalFile, WalSnapshot};
+    use super::{ReadGuardKind, TryBeginReadResult, Wal, WalConnectionState, WalFile, WalSnapshot};
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
     use crate::{
@@ -3545,6 +3722,13 @@ pub mod test {
         let shared = WalFileShared::new_noop();
         let wal = WalFile::new(io, shared.clone(), ((0, 0), 0), buffer_pool);
         (shared, wal)
+    }
+
+    fn make_test_wal_from_shared(shared: Arc<RwLock<WalFileShared>>) -> WalFile {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let snapshot = shared.read().last_checksum_and_max_frame();
+        WalFile::new(io, shared, snapshot, buffer_pool)
     }
 
     fn make_initialized_memory_wal(page_size: u32) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile) {
@@ -3870,6 +4054,55 @@ pub mod test {
             wal.connection_state(),
             WalConnectionState::new(updated, ReadGuardKind::ReadMark(2))
         );
+    }
+
+    #[test]
+    fn test_vacuum_lock_blocks_new_read_transactions_until_release() {
+        let (shared, vacuum_wal) = make_test_wal();
+        let reader_wal = make_test_wal_from_shared(shared);
+
+        vacuum_wal.try_begin_checkpoint_lock().unwrap();
+        vacuum_wal.begin_exclusive_tx().unwrap();
+
+        assert!(
+            matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Retry),
+            "VACUUM lock should block new WAL readers before they take a read-mark slot"
+        );
+
+        vacuum_wal.end_write_tx();
+        vacuum_wal.end_read_tx();
+        vacuum_wal.release_vacuum_lock();
+        vacuum_wal.release_checkpoint_lock();
+
+        assert!(
+            matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Ok(_)),
+            "reader should start after VACUUM releases the gate"
+        );
+        reader_wal.end_read_tx();
+    }
+
+    #[test]
+    fn test_active_reader_blocks_vacuum_exclusive_tx() {
+        let (shared, reader_wal) = make_test_wal();
+        let vacuum_wal = make_test_wal_from_shared(shared);
+
+        assert!(matches!(
+            reader_wal.try_begin_read_tx(),
+            TryBeginReadResult::Ok(_)
+        ));
+        vacuum_wal.try_begin_checkpoint_lock().unwrap();
+
+        assert!(
+            matches!(vacuum_wal.begin_exclusive_tx(), Err(LimboError::Busy)),
+            "active reader should prevent VACUUM from acquiring its exclusive gate"
+        );
+
+        reader_wal.end_read_tx();
+        vacuum_wal.begin_exclusive_tx().unwrap();
+        vacuum_wal.end_write_tx();
+        vacuum_wal.end_read_tx();
+        vacuum_wal.release_vacuum_lock();
+        vacuum_wal.release_checkpoint_lock();
     }
 
     #[test]

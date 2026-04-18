@@ -1439,6 +1439,7 @@ pub fn build_shared_wal(
         last_checksum: (0, 0),
         file: Some(file.clone()),
         read_locks,
+        vacuum_lock: TursoRwLock::new(),
         write_lock: TursoRwLock::new(),
         loaded: AtomicBool::new(false),
         checkpoint_lock: TursoRwLock::new(),

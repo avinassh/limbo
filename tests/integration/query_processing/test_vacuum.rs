@@ -4270,9 +4270,7 @@ fn test_plain_vacuum_checksum_multi_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Active readers are allowed to coexist with VACUUM only if the statement
-/// still satisfies the physical fold contract when it reports success. If the
-/// reader blocks the exclusive/fold path, VACUUM may return an error and the
+/// Active readers must make VACUUM fail before publishing a new WAL image. The
 /// same operation must succeed after the reader releases its snapshot.
 #[cfg_attr(feature = "checksum", ignore)]
 #[test]
@@ -4291,26 +4289,14 @@ fn test_plain_vacuum_active_reader_blocks_fold_contract() -> anyhow::Result<()> 
     assert_eq!(scalar_i64(&reader, "SELECT COUNT(*) FROM t"), 20);
 
     let result = writer.execute("VACUUM");
-    let vacuum_succeeded = result.is_ok();
-    if let Ok(()) = result {
-        assert_eq!(scalar_i64(&writer, "SELECT COUNT(*) FROM t"), 20);
-        assert_eq!(run_integrity_check(&writer), "ok");
-        assert_plain_vacuum_folded_into_db_file(&tmp_db, &writer);
-    }
+    assert!(
+        result.is_err(),
+        "VACUUM must fail while another connection holds a WAL read snapshot"
+    );
 
-    if let Err(err) = reader.execute("ROLLBACK") {
-        assert!(
-            vacuum_succeeded && err.to_string().contains("schema changed"),
-            "unexpected reader rollback error after VACUUM: {err}"
-        );
-    }
-    let final_writer = if vacuum_succeeded {
-        writer.clone()
-    } else {
-        let conn = tmp_db.connect_limbo();
-        conn.execute("VACUUM")?;
-        conn
-    };
+    reader.execute("ROLLBACK")?;
+    let final_writer = tmp_db.connect_limbo();
+    final_writer.execute("VACUUM")?;
 
     assert_eq!(scalar_i64(&final_writer, "SELECT COUNT(*) FROM t"), 20);
     assert_eq!(run_integrity_check(&final_writer), "ok");

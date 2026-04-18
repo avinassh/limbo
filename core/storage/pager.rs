@@ -2617,8 +2617,9 @@ impl Pager {
     }
 
     /// Acquire exclusive WAL access for VACUUM. Replaces the normal
-    /// `begin_read_tx` + `begin_write_tx` sequence — VACUUM needs exclusive
-    /// locks rather than a shared reader upgraded to a writer.
+    /// `begin_read_tx` + `begin_write_tx` sequence because VACUUM needs the
+    /// WAL VACUUM lock plus exclusive source locks rather than a shared reader
+    /// upgraded to a writer.
     ///
     /// Caller must already hold the checkpoint lock. VACUUM runs on an
     /// existing database, so page 1 must already be allocated and a WAL
