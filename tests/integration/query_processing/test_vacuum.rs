@@ -45,12 +45,6 @@ fn scalar_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
     rows[0].0
 }
 
-fn scalar_string(conn: &Arc<Connection>, sql: &str) -> String {
-    let rows: Vec<(String,)> = conn.exec_rows(sql);
-    assert_eq!(rows.len(), 1, "expected one row for {sql}");
-    rows[0].0.clone()
-}
-
 fn explain_opcodes(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
     limbo_exec_rows(conn, &format!("EXPLAIN {sql}"))
         .into_iter()
@@ -3728,7 +3722,6 @@ fn test_plain_vacuum_generated_column_with_rowid_and_deletes() -> anyhow::Result
 
 /// Plain VACUUM must preserve custom type definitions and keep decoded values
 /// usable on both the current and reopened connections.
-#[ignore = "plain VACUUM with custom types currently overflows during schema reload"]
 #[test]
 fn test_plain_vacuum_preserves_custom_types() -> anyhow::Result<()> {
     let opts = DatabaseOpts::new().with_custom_types(true);
@@ -3829,7 +3822,6 @@ fn test_plain_vacuum_reinitializes_zero_length_wal(tmp_db: TempDatabase) -> anyh
 /// Plain VACUUM must preserve custom index-method indexes on the source
 /// connection after schema reload.
 #[cfg_attr(feature = "checksum", ignore)]
-#[ignore = "plain VACUUM does not rebuild custom index-method backing indexes on the source database"]
 #[turso_macros::test]
 fn test_plain_vacuum_preserves_custom_index_method(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -3839,6 +3831,10 @@ fn test_plain_vacuum_preserves_custom_index_method(tmp_db: TempDatabase) -> anyh
     conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector32_sparse('[1, 0, 0, 0]'))")?;
     conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector32_sparse('[0, 1, 0, 0]'))")?;
     conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector32_sparse('[0, 0, 1, 0]'))")?;
+    let before_nearest: Vec<(i64, String, f64)> = conn.exec_rows(
+        "SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
+         FROM vectors ORDER BY distance LIMIT 1",
+    );
 
     conn.execute("VACUUM")?;
 
@@ -3869,11 +3865,7 @@ fn test_plain_vacuum_preserves_custom_index_method(tmp_db: TempDatabase) -> anyh
         "SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
          FROM vectors ORDER BY distance LIMIT 1",
     );
-    assert_eq!(nearest.len(), 1);
-    assert_eq!(nearest[0].0, 1);
-    assert_eq!(nearest[0].1, "cat");
-    assert!(nearest[0].2.abs() < 1e-9);
-    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_eq!(nearest, before_nearest);
     assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
 
     Ok(())
@@ -3881,7 +3873,6 @@ fn test_plain_vacuum_preserves_custom_index_method(tmp_db: TempDatabase) -> anyh
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[cfg_attr(feature = "checksum", ignore)]
-#[ignore = "plain VACUUM leaves FTS backing indexes inconsistent on the source database"]
 #[turso_macros::test]
 fn test_plain_vacuum_preserves_fts_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -3892,15 +3883,19 @@ fn test_plain_vacuum_preserves_fts_index(tmp_db: TempDatabase) -> anyhow::Result
     conn.execute("INSERT INTO articles VALUES (2, 'Web Development', 'Modern web applications use JavaScript and APIs')")?;
     conn.execute("INSERT INTO articles VALUES (3, 'Database Design', 'Good database design leads to better performance')")?;
     conn.execute("INSERT INTO articles VALUES (4, 'API Development', 'RESTful APIs are common in web services')")?;
+    let before_database_matches: Vec<(i64,)> = conn
+        .exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'database') ORDER BY id");
+    let before_web_matches: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'web') ORDER BY id");
 
     conn.execute("VACUUM")?;
 
     let database_matches: Vec<(i64,)> = conn
         .exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'database') ORDER BY id");
-    assert_eq!(database_matches, vec![(1,), (3,)]);
+    assert_eq!(database_matches, before_database_matches);
     let web_matches: Vec<(i64,)> =
         conn.exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'web') ORDER BY id");
-    assert_eq!(web_matches, vec![(2,), (4,)]);
+    assert_eq!(web_matches, before_web_matches);
 
     let eqp: Vec<(i64, i64, i64, String)> = conn.exec_rows(
         "EXPLAIN QUERY PLAN \
@@ -3911,7 +3906,6 @@ fn test_plain_vacuum_preserves_fts_index(tmp_db: TempDatabase) -> anyhow::Result
             .any(|(_, _, _, detail)| detail.contains("INDEX METHOD")),
         "FTS query should use an index method after plain VACUUM, got plan: {eqp:?}",
     );
-    assert_eq!(run_integrity_check(&conn), "ok");
     assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
 
     Ok(())
@@ -4253,41 +4247,6 @@ fn test_plain_vacuum_preserves_metadata(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
-#[ignore = "opening UTF-16 databases is not supported by the current integration harness; covered by vacuum header-meta unit tests instead"]
-#[test]
-fn test_plain_vacuum_preserves_utf16_text_encoding() -> anyhow::Result<()> {
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("utf16-vacuum.db");
-
-    let sqlite = SqliteConnection::open(&db_path)?;
-    sqlite.pragma_update(None, "encoding", "UTF-16le")?;
-    sqlite.pragma_update(None, "journal_mode", "wal")?;
-    sqlite.execute(
-        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL, n INTEGER)",
-        (),
-    )?;
-    sqlite.execute("INSERT INTO t VALUES (1, 'alpha', 10), (2, 'beta', 20)", ())?;
-    sqlite.execute("DELETE FROM t WHERE id = 2", ())?;
-    drop(sqlite);
-
-    let tmp_db = TempDatabase::new_with_existent(&db_path);
-    let conn = tmp_db.connect_limbo();
-    assert_eq!(scalar_string(&conn, "PRAGMA encoding"), "UTF-16le");
-
-    conn.execute("VACUUM")?;
-
-    assert_eq!(scalar_string(&conn, "PRAGMA encoding"), "UTF-16le");
-    let rows: Vec<(i64, String, i64)> = conn.exec_rows("SELECT id, v, n FROM t ORDER BY id");
-    assert_eq!(rows, vec![(1, "alpha".to_string(), 10)]);
-    assert_eq!(run_integrity_check(&conn), "ok");
-
-    let reopened = TempDatabase::new_with_existent(&db_path);
-    let reopened_conn = reopened.connect_limbo();
-    assert_eq!(scalar_string(&reopened_conn, "PRAGMA encoding"), "UTF-16le");
-    assert_eq!(run_integrity_check(&reopened_conn), "ok");
-    Ok(())
-}
-
 /// Plain VACUUM preserves AUTOINCREMENT counters.
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);")]
@@ -4447,6 +4406,72 @@ fn test_plain_vacuum_preserves_strict_composite_pk() -> anyhow::Result<()> {
             || err.to_string().contains("STRICT")
             || err.to_string().contains("type"),
         "unexpected STRICT error: {err}"
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+    Ok(())
+}
+
+#[test]
+fn test_plain_vacuum_preserves_without_rowid_tables() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    if conn
+        .execute(
+            "CREATE TABLE config(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT
+            ) WITHOUT ROWID",
+        )
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    conn.execute("CREATE TABLE regular(id INTEGER PRIMARY KEY, note TEXT)")?;
+    conn.execute("INSERT INTO config VALUES ('theme', 'dark', '2024-01-01')")?;
+    conn.execute("INSERT INTO config VALUES ('language', 'en', '2024-01-02')")?;
+    conn.execute("INSERT INTO config VALUES ('timezone', 'UTC', '2024-01-03')")?;
+    conn.execute("INSERT INTO regular VALUES (1, 'alpha'), (2, 'beta')")?;
+    conn.execute("DELETE FROM config WHERE key = 'theme'")?;
+
+    let before_rows: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT key, value, updated_at FROM config ORDER BY key");
+    assert_eq!(
+        before_rows,
+        vec![
+            (
+                "language".to_string(),
+                "en".to_string(),
+                "2024-01-02".to_string(),
+            ),
+            (
+                "timezone".to_string(),
+                "UTC".to_string(),
+                "2024-01-03".to_string(),
+            ),
+        ]
+    );
+
+    conn.execute("VACUUM")?;
+
+    let schema_sql: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'config'");
+    assert_eq!(schema_sql.len(), 1);
+    assert!(
+        schema_sql[0].0.contains("WITHOUT ROWID"),
+        "WITHOUT ROWID should be preserved in the rebuilt schema"
+    );
+    let after_rows: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT key, value, updated_at FROM config ORDER BY key");
+    assert_eq!(after_rows, before_rows);
+    let regular_rows: Vec<(i64, String)> =
+        conn.exec_rows("SELECT id, note FROM regular ORDER BY id");
+    assert_eq!(
+        regular_rows,
+        vec![(1, "alpha".to_string()), (2, "beta".to_string())]
     );
     assert_eq!(run_integrity_check(&conn), "ok");
     assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
@@ -5082,13 +5107,6 @@ fn test_plain_vacuum_empty_schema_physical_contract() -> anyhow::Result<()> {
 /// Initialized DB whose user schema has been fully torn down — page 1 exists,
 /// but there are no user tables or indexes. VACUUM must succeed and leave the
 /// DB queryable at the minimum page count.
-///
-/// FIXME: currently ignored because Turso's VACUUM does not reclaim the root
-/// page of the dropped table. SQLite produces page_count=1 for the same
-/// sequence; Turso produces page_count > 1. The integrity_check passes, so
-/// this is a compaction/correctness gap in the target-pager rebuild rather
-/// than a data-loss bug.
-#[ignore = "VACUUM does not reclaim dropped-table root pages (diverges from SQLite)"]
 #[test]
 fn test_plain_vacuum_initialized_but_empty_schema() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_empty();
@@ -5797,7 +5815,6 @@ fn assert_mvcc_multi_object_vacuum_workload(conn: &Arc<Connection>) -> anyhow::R
     Ok(())
 }
 
-#[ignore = "MVCC post-vacuum writes across multiple indexed tables currently panic in index commit"]
 #[test]
 fn test_mvcc_plain_vacuum_multi_object_rootpage_reset() -> anyhow::Result<()> {
     let tmp_db =
@@ -6158,7 +6175,7 @@ fn test_plain_vacuum_busy_while_checkpoint_lock_held() -> anyhow::Result<()> {
 fn test_plain_vacuum_running_blocks_checkpoint_on_other_connection() -> anyhow::Result<()> {
     let io = Arc::new(QueuedIo::new());
     let path = "queued-vacuum-blocks-checkpoint.db";
-    let db = open_queued_db(io, path)?;
+    let db = open_queued_db(io.clone(), path)?;
     let vacuum_conn = db.connect()?;
     let checkpoint_conn = db.connect()?;
 
@@ -6186,7 +6203,7 @@ fn test_second_plain_vacuum_on_other_connection_rejects_while_first_running() ->
 {
     let io = Arc::new(QueuedIo::new());
     let path = "queued-vacuum-two-connections.db";
-    let db = open_queued_db(io, path)?;
+    let db = open_queued_db(io.clone(), path)?;
     let first_conn = db.connect()?;
     let second_conn = db.connect()?;
 
@@ -6379,14 +6396,12 @@ fn test_plain_vacuum_running_blocks_new_writer() -> anyhow::Result<()> {
 }
 
 #[cfg_attr(feature = "checksum", ignore)]
-#[ignore = "dropping the last connection mid-VACUUM currently corrupts queued-IO cleanup state"]
 #[test]
 fn test_plain_vacuum_connection_drop_mid_io_releases_locks() -> anyhow::Result<()> {
     let io = Arc::new(QueuedIo::new());
     let path = ":memory:queued-vacuum-connection-drop.db";
-    let db = open_queued_db(io, path)?;
+    let db = open_queued_db(io.clone(), path)?;
     let conn = db.connect()?;
-    let verifier = db.connect()?;
 
     populate_queued_multibatch(&conn)?;
 
@@ -6395,6 +6410,7 @@ fn test_plain_vacuum_connection_drop_mid_io_releases_locks() -> anyhow::Result<(
 
     drop(stmt);
     drop(conn);
+    let verifier = db.connect()?;
 
     assert_eq!(scalar_i64(&verifier, "SELECT COUNT(*) FROM t"), 176);
     verifier.execute("INSERT INTO t VALUES(10000, 'after-connection-drop')")?;

@@ -1711,6 +1711,7 @@ impl Database {
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             named_savepoints: RwLock::new(Vec::new()),
+            schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
         });
         self.n_connections
@@ -1954,18 +1955,6 @@ impl Database {
     #[cfg(not(all(unix, target_pointer_width = "64")))]
     pub(crate) fn shared_wal_coordination(&self) -> Result<Option<()>> {
         Ok(None)
-    }
-
-    #[cfg(all(unix, target_pointer_width = "64"))]
-    pub(crate) fn has_live_shared_wal_peer_process(&self) -> Result<bool> {
-        Ok(self
-            .shared_wal_coordination()?
-            .is_some_and(|authority| !authority.is_last_process_mapping()))
-    }
-
-    #[cfg(not(all(unix, target_pointer_width = "64")))]
-    pub(crate) fn has_live_shared_wal_peer_process(&self) -> Result<bool> {
-        Ok(false)
     }
 
     #[cfg(all(unix, target_pointer_width = "64"))]

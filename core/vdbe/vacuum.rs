@@ -1327,16 +1327,6 @@ fn vacuum_completion_error(
     )
 }
 
-fn vacuum_completion_error(
-    completion: &crate::io::Completion,
-    context: &'static str,
-) -> LimboError {
-    completion.get_error().map_or_else(
-        || LimboError::InternalError(format!("VACUUM: {context} failed")),
-        LimboError::CompletionError,
-    )
-}
-
 /// Coalesce `(page_ref, frame_id)` pairs into contiguous-frame-id runs.
 ///
 /// Plain `VACUUM` relies on the temp-WAL-only invariant: every temp page
@@ -1475,12 +1465,7 @@ fn new_vacuum_read_scratch_buf(
 }
 
 fn replace_shared_schema_after_vacuum(source_db: &Database, schema: Arc<crate::schema::Schema>) {
-    source_db
-        .with_schema_mut(|current| {
-            *current = schema.as_ref().clone();
-            Ok(())
-        })
-        .expect("VACUUM shared schema replacement should be infallible");
+    *source_db.schema.lock() = schema;
 }
 
 fn install_mvcc_state_after_vacuum_commit(
@@ -1651,10 +1636,9 @@ fn vacuum_in_place_step(
                 let wal = source_pager.wal.as_ref().ok_or_else(|| {
                     LimboError::InternalError("VACUUM requires a WAL-mode database".to_string())
                 })?;
-                if source_db.has_live_shared_wal_peer_process()? {
+                if source_db.experimental_multiprocess_wal_enabled() {
                     return Err(LimboError::TxError(
-                        "cannot VACUUM while experimental multiprocess WAL is active in another process"
-                            .to_string(),
+                        "cannot VACUUM experimental multiprocess WAL databases".to_string(),
                     ));
                 }
                 // 7. In MVCC mode, hold the existing MVCC stop-the-world

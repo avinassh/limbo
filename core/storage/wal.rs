@@ -5792,7 +5792,10 @@ pub mod test {
         WalFile::new(io, shared, snapshot, buffer_pool)
     }
 
-    fn make_initialized_memory_wal(page_size: u32) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile) {
+    fn make_initialized_memory_wal_with_io_context(
+        page_size: u32,
+        io_ctx: crate::IOContext,
+    ) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         buffer_pool
@@ -5803,6 +5806,7 @@ pub mod test {
             .unwrap();
         let shared = WalFileShared::new_shared(file).unwrap();
         let wal = WalFile::new(io.clone(), shared, ((0, 0), 0), buffer_pool.clone());
+        wal.set_io_context(io_ctx);
         let page_size = PageSize::new(page_size).unwrap();
 
         if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
@@ -5812,6 +5816,10 @@ pub mod test {
         io.wait_for_completion(c).unwrap();
 
         (io, buffer_pool, wal)
+    }
+
+    fn make_initialized_memory_wal(page_size: u32) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile) {
+        make_initialized_memory_wal_with_io_context(page_size, crate::IOContext::default())
     }
 
     fn page_with_pattern(page_id: i64, seed: u8, buffer_pool: &Arc<BufferPool>) -> PageRef {
@@ -6067,6 +6075,115 @@ pub mod test {
         for (idx, page) in target_pages.iter().enumerate() {
             assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
             assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+        }
+    }
+
+    #[cfg(feature = "checksum")]
+    #[test]
+    fn read_frames_batch_reads_checksum_protected_pages() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(42, 0x42, &buffer_pool),
+            page_with_pattern(43, 0x43, &buffer_pool),
+        ];
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(42)),
+            Arc::new(crate::Page::new(43)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
+            assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+            assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_reads_encrypted_pages() {
+        let page_size = 512;
+        let key = crate::storage::encryption::EncryptionKey::new_128([0x11; 16]);
+        let enc_ctx = crate::storage::encryption::EncryptionContext::new(
+            crate::storage::encryption::CipherMode::Aes128Gcm,
+            &key,
+            page_size as usize,
+        )
+        .unwrap();
+        let mut io_ctx = crate::IOContext::default();
+        io_ctx.set_encryption(enc_ctx);
+        let reserved_bytes = io_ctx.get_reserved_space_bytes() as usize;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal_with_io_context(page_size, io_ctx);
+        let source_pages = vec![
+            page_with_pattern(44, 0x14, &buffer_pool),
+            page_with_pattern(45, 0x15, &buffer_pool),
+        ];
+        for page in &source_pages {
+            let len = page.get_contents().as_ptr().len();
+            page.get_contents().as_ptr()[len - reserved_bytes..].fill(0);
+        }
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(44)),
+            Arc::new(crate::Page::new(45)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
+            assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+            assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_reads_across_multiple_append_batches() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+
+        let first_batch = vec![
+            page_with_pattern(60, 0x60, &buffer_pool),
+            page_with_pattern(61, 0x61, &buffer_pool),
+        ];
+        let first_expected = append_test_pages(&io, &wal, page_size, &first_batch);
+
+        let second_batch = vec![
+            page_with_pattern(70, 0x70, &buffer_pool),
+            page_with_pattern(71, 0x71, &buffer_pool),
+            page_with_pattern(72, 0x72, &buffer_pool),
+        ];
+        let second_expected = append_test_pages(&io, &wal, page_size, &second_batch);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(61)),
+            Arc::new(crate::Page::new(70)),
+            Arc::new(crate::Page::new(71)),
+            Arc::new(crate::Page::new(72)),
+        ];
+        let c = wal
+            .read_frames_batch(2, &target_pages, buffer_pool, None)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let expected = vec![
+            first_expected[1].as_slice(),
+            second_expected[0].as_slice(),
+            second_expected[1].as_slice(),
+            second_expected[2].as_slice(),
+        ];
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
+            assert_eq!(page.get_contents().as_ptr(), expected[idx]);
+            assert_eq!(page.wal_tag_pair(), ((idx + 2) as u64, 0));
         }
     }
 

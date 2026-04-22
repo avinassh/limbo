@@ -934,6 +934,34 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
 }
 
 #[test]
+fn plain_vacuum_rejects_multiprocess_wal_database_without_peer_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vacuum-multiprocess-no-peer.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('parent')")
+        .unwrap();
+
+    let err = conn
+        .execute("VACUUM")
+        .expect_err("VACUUM should reject multiprocess-WAL databases");
+    assert!(
+        matches!(err, LimboError::TxError(ref msg) if msg.contains("cannot VACUUM experimental multiprocess WAL databases")),
+        "expected explicit multiprocess VACUUM rejection, got {err:?}"
+    );
+    assert_eq!(
+        count_test_rows(&conn),
+        1,
+        "rejecting VACUUM on multiprocess-WAL databases must not disturb existing rows"
+    );
+}
+
+#[test]
 fn plain_vacuum_rejects_live_multiprocess_peer_process() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("vacuum-multiprocess-peer.db");
@@ -971,7 +999,7 @@ fn plain_vacuum_rejects_live_multiprocess_peer_process() {
         .execute("VACUUM")
         .expect_err("VACUUM should reject while another multiprocess-WAL process is live");
     assert!(
-        matches!(err, LimboError::TxError(ref msg) if msg.contains("experimental multiprocess WAL")),
+        matches!(err, LimboError::TxError(ref msg) if msg.contains("cannot VACUUM experimental multiprocess WAL databases")),
         "expected explicit multiprocess VACUUM rejection, got {err:?}"
     );
 
