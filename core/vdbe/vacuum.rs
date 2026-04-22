@@ -1085,8 +1085,1286 @@ pub(crate) fn build_copy_sql(
 
     let select_sql =
         format!("SELECT {select_cols} FROM \"{escaped_schema_name}\".\"{escaped_table_name}\"");
+    let insert_prefix = if or_replace {
+        "INSERT OR REPLACE INTO"
+    } else {
+        "INSERT INTO"
+    };
     let insert_sql =
-        format!("INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
+        format!("{insert_prefix} \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
 
     Ok((select_sql, insert_sql))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CheckpointLockCleanup {
+    #[default]
+    None,
+    /// VACUUM owns only the raw checkpoint_lock; cleanup releases it
+    /// directly with `Wal::release_checkpoint_lock`.
+    ReleaseRaw,
+    /// The checkpoint state machine has consumed the raw checkpoint_lock and
+    /// may now own read0/write too, so cleanup must abort checkpoint state.
+    AbortCheckpoint,
+}
+
+struct MvccVacuumGuard {
+    connection: Arc<Connection>,
+    mv_store: Arc<crate::MvStore>,
+    connection_demoted: bool,
+}
+
+impl MvccVacuumGuard {
+    fn acquire(connection: Arc<Connection>, mv_store: Arc<crate::MvStore>) -> Result<Self> {
+        mv_store.try_begin_vacuum_gate()?;
+        Ok(Self {
+            connection,
+            mv_store,
+            connection_demoted: false,
+        })
+    }
+
+    fn demote_connection(&mut self) {
+        turso_assert!(
+            !self.connection_demoted,
+            "MVCC VACUUM connection is already demoted"
+        );
+        self.connection.demote_to_mvcc_connection();
+        self.connection_demoted = true;
+    }
+}
+
+impl Drop for MvccVacuumGuard {
+    fn drop(&mut self) {
+        if self.connection_demoted && self.connection.is_mvcc_bootstrap_connection() {
+            self.connection.promote_to_regular_connection();
+        }
+        self.mv_store.release_vacuum_gate();
+    }
+}
+
+/// Cleanup state for in-place VACUUM. This tracks resources the opcode has
+/// acquired and is **not** cleared by `std::mem::take` on the phase enum.
+/// The cleanup function uses it to decide what to roll back regardless of
+/// where the state machine was when the error occurred.
+#[derive(Default)]
+struct VacuumInPlaceCleanupState {
+    /// Tracks which checkpoint-lock cleanup action is needed.
+    checkpoint_cleanup: CheckpointLockCleanup,
+    /// WAL VACUUM lock is held exclusively.
+    vacuum_lock_held: bool,
+    /// MVCC gate/demotion guard held until VACUUM can return to MVCC reads.
+    mvcc_guard: Option<MvccVacuumGuard>,
+    /// Source pager exclusive transaction was started.
+    source_tx_open: bool,
+    /// WAL commit was published via `finish_append_frames_commit`. Once true
+    /// the compacted image is durable and rollback must not be attempted.
+    wal_commit_published: bool,
+}
+
+/// Phases for the in-place VACUUM state machine.
+///
+/// The opcode owns the source transaction lifecycle directly: it begins the
+/// read and write transactions on the source pager, builds a temp image via
+/// the shared target-build engine, then copies the compacted target back into the
+/// source WAL using the batched prepare_frames → WriteBatch → commit path.
+enum VacuumInPlacePhase {
+    /// Validate preconditions (auto_commit, active statements, readonly, memory,
+    /// MVCC, WAL-backed pager).
+    Preflight,
+    /// Acquire exclusive source access on the source WAL via
+    /// `begin_exclusive_tx`: checkpoint_lock is already held from Preflight;
+    /// this acquires the exclusive VACUUM lock and installs the source snapshot.
+    BeginSourceTx,
+    /// Read source database header metadata for the target-build config.
+    ReadSourceMetadata,
+    /// Create temp DB and run the shared target-build engine.
+    TargetBuild {
+        config: Box<VacuumTargetBuildConfig>,
+        temp_db: Box<VacuumTempDb>,
+        context: Box<VacuumTargetBuildContext>,
+    },
+    /// Open a read transaction on the committed temp pager for copy-back reads.
+    BeginTempReadTx { temp_db: Box<VacuumTempDb> },
+    /// Initialize the source WAL header if needed (one-time before first batch).
+    /// Two IO steps: write the header, then fsync to set `initialized = true`.
+    InitSourceWalHeader {
+        temp_db: Box<VacuumTempDb>,
+        total_pages: u32,
+        /// The completion to wait on: first the header write, then the fsync.
+        completion: crate::io::Completion,
+        /// `false` while waiting for the header write, `true` while waiting for
+        /// the fsync from `prepare_wal_finish`.
+        fsync_phase: bool,
+    },
+    /// Read a batch of temp pages in parallel using multi-inflight
+    /// `Wal::read_frames_batch` calls, one per contiguous frame-id run.
+    /// The state waits on a single `CompletionGroup` completion that
+    /// covers every run in the batch.
+    ReadTempBatch {
+        temp_db: Box<VacuumTempDb>,
+        total_pages: u32,
+        /// First page id NOT included in this batch (i.e., the page id
+        /// where the next batch will start, 1-based).
+        next_page: u32,
+        /// Boxed to shrink the enum — PreparedFrames contains Vecs and is ~80+
+        /// bytes unboxed. Only created once per batch, so boxing adds no
+        /// allocation overhead in the hot path.
+        prev_prepared: Option<Box<crate::storage::wal::PreparedFrames>>,
+        /// Scratch buffer for `Wal::read_frames_batch`, sized to one full copy
+        /// batch and reused across copy-back batches when one frame run exactly
+        /// matches that size.
+        read_scratch_buf: Arc<crate::io::Buffer>,
+        /// Pages for this batch, pre-allocated in logical page-id order.
+        batch_pages: Vec<crate::storage::pager::PageRef>,
+        /// Aggregate completion for every run issued for this batch.
+        read_completion: crate::io::Completion,
+    },
+    /// Write a prepared batch to the WAL file.
+    WriteWalBatch {
+        temp_db: Box<VacuumTempDb>,
+        total_pages: u32,
+        next_page: u32,
+        prev_prepared: Option<Box<crate::storage::wal::PreparedFrames>>,
+        read_scratch_buf: Arc<crate::io::Buffer>,
+        completions: Vec<crate::io::Completion>,
+    },
+    /// Fsync the WAL if sync mode requires it.
+    SyncSourceWal {
+        temp_db: Box<VacuumTempDb>,
+        sync_completion: crate::io::Completion,
+    },
+    /// Publish: commit_prepared_frames + finish_append_frames_commit, release
+    /// source WAL write/source snapshot state, keep the VACUUM lock, and drop
+    /// temp resources.
+    PublishWalCommit { temp_db: Box<VacuumTempDb> },
+    /// TRUNCATE checkpoint: copy WAL frames back into the DB file and truncate
+    /// the WAL to zero. The pager's internal state machine handles the multi-step
+    /// IO (backfill → sync DB → truncate WAL). Plain VACUUM requires this fold
+    /// to complete before reporting success.
+    Checkpoint,
+    /// Reload the schema from the freshly committed (and possibly checkpointed) DB.
+    SchemaReload,
+    /// Clean up after successful commit.
+    Done,
+}
+
+impl Default for VacuumInPlacePhase {
+    fn default() -> Self {
+        Self::Preflight
+    }
+}
+
+/// Holds the context for the in-place VACUUM operation across async yields.
+pub(crate) struct VacuumInPlaceOpContext {
+    /// Database index being vacuumed.
+    db: usize,
+    /// Current phase for the in-place VACUUM operation.
+    phase: VacuumInPlacePhase,
+    /// Independent cleanup flags that survive `std::mem::take` on `phase`.
+    cleanup_state: VacuumInPlaceCleanupState,
+}
+
+impl VacuumInPlaceOpContext {
+    pub(crate) fn new(db: usize) -> Self {
+        Self {
+            db,
+            phase: VacuumInPlacePhase::Preflight,
+            cleanup_state: VacuumInPlaceCleanupState::default(),
+        }
+    }
+
+    pub(crate) fn step(&mut self, connection: &Arc<Connection>) -> Result<InsnFunctionStepResult> {
+        vacuum_in_place_step(
+            connection,
+            self.db,
+            &mut self.phase,
+            &mut self.cleanup_state,
+        )
+    }
+
+    pub(crate) fn cleanup(self, connection: &Arc<Connection>) -> Result<()> {
+        let Self {
+            db,
+            phase,
+            cleanup_state,
+        } = self;
+        vacuum_in_place_cleanup(connection, db, phase, cleanup_state)
+    }
+}
+
+/// The batch size for copy-back: how many temp pages to read per batch.
+const VACUUM_COPY_BATCH_SIZE: u32 = 64;
+
+fn vacuum_copy_batch_end(start_page: u32, total_pages: u32) -> u32 {
+    turso_assert!(
+        start_page > 0,
+        "vacuum copy batch start page must be 1-based",
+        { "start_page": start_page, "total_pages": total_pages }
+    );
+    turso_assert!(
+        start_page <= total_pages,
+        "vacuum copy batch start must be inside database image",
+        { "start_page": start_page, "total_pages": total_pages }
+    );
+    turso_assert!(
+        total_pages < u32::MAX,
+        "vacuum copy batch requires a representable exclusive end page",
+        { "total_pages": total_pages }
+    );
+    start_page
+        .saturating_add(VACUUM_COPY_BATCH_SIZE)
+        .min(total_pages + 1)
+}
+
+fn vacuum_completion_error(
+    completion: &crate::io::Completion,
+    context: &'static str,
+) -> LimboError {
+    completion.get_error().map_or_else(
+        || LimboError::InternalError(format!("VACUUM: {context} failed")),
+        LimboError::CompletionError,
+    )
+}
+
+/// Coalesce `(page_ref, frame_id)` pairs into contiguous-frame-id runs.
+///
+/// Plain `VACUUM` relies on the temp-WAL-only invariant: every temp page
+/// lives in the temp WAL (auto-checkpoint is disabled on the temp
+/// connection), so for each logical page id we get a single frame id via
+/// `find_frame`. Because target-build appends frames in phase order
+/// (schema → rows → indexes → post-data), `find_frame(1), find_frame(2),
+/// …` on the temp WAL returns a non-monotonic frame-id sequence. Sorting
+/// by `frame_id` before splitting into runs lets a single `pread` over a
+/// contiguous range serve many logical pages at once.
+fn coalesce_frame_runs(
+    mut pairs: Vec<(crate::storage::pager::PageRef, u64)>,
+) -> Vec<(u64, Vec<crate::storage::pager::PageRef>)> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    pairs.sort_by_key(|(_, f)| *f);
+    let mut runs: Vec<(u64, Vec<crate::storage::pager::PageRef>)> = Vec::new();
+    let mut prev_frame_id = None;
+    for (page, frame_id) in pairs {
+        turso_assert!(frame_id > 0, "WAL frame ids must be 1-based");
+        if let Some(prev) = prev_frame_id {
+            turso_assert!(
+                frame_id > prev,
+                "VACUUM temp WAL frame ids must be unique",
+                { "previous_frame_id": prev, "frame_id": frame_id }
+            );
+        }
+        prev_frame_id = Some(frame_id);
+        if let Some((run_start, run_pages)) = runs.last_mut() {
+            let next_expected = *run_start + run_pages.len() as u64;
+            if frame_id == next_expected {
+                run_pages.push(page);
+                continue;
+            }
+        }
+        runs.push((frame_id, vec![page]));
+    }
+    runs
+}
+
+/// Start multi-inflight reads for one copy-back batch spanning logical
+/// pages `[batch_start, batch_end)`. Every page must be resident in the
+/// temp WAL (temp-WAL-only invariant). Returns the pre-allocated
+/// per-page `PageRef`s in logical page-id order plus the aggregate
+/// completion covering every run.
+fn start_temp_batch_reads(
+    temp_pager: &crate::storage::pager::Pager,
+    batch_start: u32,
+    batch_end: u32,
+    scratch_buf: &Arc<crate::io::Buffer>,
+) -> Result<(Vec<crate::storage::pager::PageRef>, crate::io::Completion)> {
+    use crate::io::CompletionGroup;
+    use crate::storage::pager::Page;
+    use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
+
+    turso_assert!(
+        batch_start < batch_end,
+        "empty vacuum read batch",
+        { "batch_start": batch_start, "batch_end": batch_end }
+    );
+    turso_assert!(
+        batch_start > 0,
+        "vacuum read batch start page must be 1-based",
+        { "batch_start": batch_start, "batch_end": batch_end }
+    );
+    turso_assert!(
+        batch_end - batch_start <= VACUUM_COPY_BATCH_SIZE,
+        "vacuum read batch exceeds configured copy batch size",
+        { "batch_start": batch_start, "batch_end": batch_end, "batch_size": VACUUM_COPY_BATCH_SIZE }
+    );
+    let wal = temp_pager
+        .wal
+        .as_ref()
+        .ok_or_else(|| LimboError::InternalError("VACUUM requires a temp WAL pager".into()))?;
+
+    let len = (batch_end - batch_start) as usize;
+    let mut logical_pages: Vec<crate::storage::pager::PageRef> = Vec::with_capacity(len);
+    let mut pairs: Vec<(crate::storage::pager::PageRef, u64)> = Vec::with_capacity(len);
+
+    for page_id in batch_start..batch_end {
+        let page: crate::storage::pager::PageRef = Arc::new(Page::new(page_id as i64));
+        let frame_id = wal.find_frame(page_id as u64, None)?.ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "VACUUM: temp page {page_id} not found in temp WAL (temp-WAL-only invariant violated)"
+            ))
+        })?;
+        logical_pages.push(page.clone());
+        pairs.push((page, frame_id));
+    }
+
+    let runs = coalesce_frame_runs(pairs);
+
+    // Reuse the max-batch scratch buffer for one run whose read length matches
+    // exactly (the common case where target-build wrote a contiguous chunk of
+    // at least `VACUUM_COPY_BATCH_SIZE` pages).
+    let frame_size = temp_pager.get_page_size_unchecked().get() as usize + WAL_FRAME_HEADER_SIZE;
+    let scratch_total = frame_size * VACUUM_COPY_BATCH_SIZE as usize;
+    turso_assert!(
+        scratch_buf.len() == scratch_total,
+        "VACUUM scratch buffer size must match max-batch read size",
+        { "buf_len": scratch_buf.len(), "expected": scratch_total }
+    );
+
+    let mut group = CompletionGroup::new(|_| {});
+    let mut scratch_claimed = false;
+    for (start_frame, run_pages) in &runs {
+        let run_total = frame_size * run_pages.len();
+        let run_scratch = if !scratch_claimed && run_total == scratch_total {
+            scratch_claimed = true;
+            Some(scratch_buf.clone())
+        } else {
+            None
+        };
+        let c = wal.read_frames_batch(
+            *start_frame,
+            run_pages,
+            temp_pager.buffer_pool.clone(),
+            run_scratch,
+        )?;
+        group.add(&c);
+    }
+    let combined = group.build();
+
+    Ok((logical_pages, combined))
+}
+
+fn new_vacuum_read_scratch_buf(
+    temp_pager: &crate::storage::pager::Pager,
+) -> Arc<crate::io::Buffer> {
+    use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
+
+    let frame_size = temp_pager.get_page_size_unchecked().get() as usize + WAL_FRAME_HEADER_SIZE;
+    let scratch_total = frame_size * VACUUM_COPY_BATCH_SIZE as usize;
+    Arc::new(crate::io::Buffer::new_temporary(scratch_total))
+}
+
+fn replace_shared_schema_after_vacuum(source_db: &Database, schema: Arc<crate::schema::Schema>) {
+    source_db
+        .with_schema_mut(|current| {
+            *current = schema.as_ref().clone();
+            Ok(())
+        })
+        .expect("VACUUM shared schema replacement should be infallible");
+}
+
+fn install_mvcc_state_after_vacuum_commit(
+    source_db: &Database,
+    mv_store: &crate::MvStore,
+    header: DatabaseHeader,
+    schema: Arc<crate::schema::Schema>,
+) {
+    mv_store.reset_after_vacuum(header, schema.as_ref());
+    replace_shared_schema_after_vacuum(source_db, schema);
+}
+
+fn abort_unrecoverable_mvcc_vacuum_reload(err: &LimboError) -> ! {
+    tracing::error!(
+        "VACUUM committed a new physical MVCC image but failed to reconcile post-commit state: {err}"
+    );
+    std::process::abort();
+}
+
+fn reload_schema_after_vacuum_commit(
+    connection: &Arc<Connection>,
+    db: usize,
+    source_pager: &crate::storage::pager::Pager,
+) -> Result<()> {
+    turso_assert!(
+        connection
+            .auto_commit
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "VACUUM schema reload must run after restoring auto-commit"
+    );
+
+    let source_db = connection.get_source_database(db);
+    let mv_store = if source_db.mvcc_enabled() {
+        Some(source_db.get_mv_store().as_ref().cloned().ok_or_else(|| {
+            LimboError::InternalError(
+                "MVCC database missing MV store during VACUUM schema reload".to_string(),
+            )
+        })?)
+    } else {
+        None
+    };
+    let is_mvcc = mv_store.is_some();
+
+    // Schema reload under a self-contained read guard. Non-MVCC callers can
+    // still return a regular error if this fails because later operations can
+    // retry via the cleared schema cookie. MVCC must reconcile before the
+    // vacuum gate is released, so MVCC reload failures below fail closed.
+    source_pager.begin_read_tx()?;
+    connection.set_tx_state(crate::connection::TransactionState::Read);
+
+    let reload_result = connection.reparse_schema();
+
+    let final_result = match reload_result {
+        Ok(()) => {
+            // Publish the freshly parsed schema to the shared Database so other
+            // connections see VACUUM's replacement image. This must not rely
+            // on a strictly-newer cookie comparison: VACUUM bumps the cookie
+            // with wrapping arithmetic, and MVCC can also already have the
+            // same logical cookie in this process even though root pages were
+            // rewritten.
+            let schema = connection.schema.read().clone();
+            if let Some(ref mv_store) = mv_store {
+                match source_pager
+                    .io
+                    .block(|| source_pager.with_header(|header| *header))
+                {
+                    Ok(header) => {
+                        install_mvcc_state_after_vacuum_commit(
+                            source_db.as_ref(),
+                            mv_store.as_ref(),
+                            header,
+                            schema,
+                        );
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                replace_shared_schema_after_vacuum(source_db.as_ref(), schema);
+                Ok(())
+            }
+        }
+        Err(err) => Err(err),
+    };
+
+    // Always end the schema-reload read tx and restore state, whether the
+    // reload succeeded or failed.
+    source_pager.end_read_tx();
+    connection.set_tx_state(crate::connection::TransactionState::None);
+
+    if is_mvcc {
+        match final_result {
+            Ok(()) => Ok(()),
+            Err(err) => abort_unrecoverable_mvcc_vacuum_reload(&err),
+        }
+    } else {
+        final_result
+    }
+}
+
+fn reload_physical_schema_for_mvcc_vacuum(
+    connection: &Arc<Connection>,
+    source_pager: &crate::storage::pager::Pager,
+) -> Result<()> {
+    source_pager.begin_read_tx()?;
+    connection.set_tx_state(crate::connection::TransactionState::Read);
+
+    let reparse_result = connection.reparse_schema();
+
+    source_pager.end_read_tx();
+    connection.set_tx_state(crate::connection::TransactionState::None);
+
+    reparse_result
+}
+
+/// Step the in-place VACUUM state machine once. Returns `IO` to yield or `Step`
+/// when the entire operation is complete.
+///
+/// `cleanup_state` independently tracks which resources the opcode has acquired so
+/// that cleanup can roll back correctly even when `phase` has been taken
+/// by `std::mem::take` at the top of the loop.
+fn vacuum_in_place_step(
+    connection: &Arc<Connection>,
+    db: usize,
+    phase: &mut VacuumInPlacePhase,
+    cleanup_state: &mut VacuumInPlaceCleanupState,
+) -> Result<InsnFunctionStepResult> {
+    use crate::io::WriteBatch as IOWriteBatch;
+    use crate::types::IOCompletions;
+    use crate::SyncMode;
+    use std::sync::atomic::Ordering;
+
+    // Capture the source pager once per step call. The pager never changes
+    // during a VACUUM, so this avoids repeated ArcSwap loads in the loop.
+    let source_pager = connection.get_pager_from_database_index(&db)?;
+
+    loop {
+        let current = std::mem::take(phase);
+        match current {
+            VacuumInPlacePhase::Preflight => {
+                // 1. Must be in auto-commit mode (no explicit transaction).
+                if !connection.auto_commit.load(Ordering::SeqCst) {
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM from within a transaction".to_string(),
+                    ));
+                }
+                // 2. No other active root statements on this connection.
+                if connection.n_active_root_statements.load(Ordering::SeqCst) != 1 {
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM - SQL statements in progress".to_string(),
+                    ));
+                }
+                // 3. Reject readonly database.
+                if connection.is_readonly(db) {
+                    return Err(LimboError::ReadOnly);
+                }
+                // 4. Resolve source database mode.
+                let source_db = connection.get_source_database(db);
+                let source_mvcc_enabled = source_db.mvcc_enabled();
+                // 5. Reject in-memory databases.
+                if crate::is_memory_like(&source_db.path) {
+                    return Err(LimboError::InternalError(
+                        "cannot VACUUM an in-memory database".to_string(),
+                    ));
+                }
+                reject_unsupported_vacuum_auto_vacuum_mode(source_pager.get_auto_vacuum_mode())?;
+                // 6. Reject non-WAL pagers.
+                let wal = source_pager.wal.as_ref().ok_or_else(|| {
+                    LimboError::InternalError("VACUUM requires a WAL-mode database".to_string())
+                })?;
+                if source_db.has_live_shared_wal_peer_process()? {
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM while experimental multiprocess WAL is active in another process"
+                            .to_string(),
+                    ));
+                }
+                // 7. In MVCC mode, hold the existing MVCC stop-the-world
+                // gate for the full VACUUM. Callers are expected to run MVCC
+                // checkpoint before VACUUM; this gate only enforces that no
+                // active or new MVCC transactions overlap the physical copy.
+                let mvcc_guard = if source_mvcc_enabled {
+                    let mv_store = source_db.get_mv_store().as_ref().cloned().ok_or_else(|| {
+                        LimboError::InternalError(
+                            "MVCC database missing MV store during VACUUM".to_string(),
+                        )
+                    })?;
+                    let mut guard = MvccVacuumGuard::acquire(connection.clone(), mv_store.clone())?;
+                    if mv_store.has_uncheckpointed_log()? {
+                        return Err(LimboError::TxError(
+                            "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first".to_string(),
+                        ));
+                    }
+                    if connection.get_mv_tx_id_for_db(db).is_some() {
+                        turso_assert!(
+                            false,
+                            "VACUUM must not hold an MVCC transaction after acquiring gate"
+                        );
+                        return Err(LimboError::InternalError(
+                            "VACUUM acquired MVCC gate while this connection has an MVCC transaction"
+                                .to_string(),
+                        ));
+                    }
+                    guard.demote_connection();
+                    // The source connection now reads directly from the
+                    // checkpointed DB image, so its private schema must match
+                    // the physical page-1 cookie rather than MVCC's shared
+                    // logical schema cookie.
+                    reload_physical_schema_for_mvcc_vacuum(connection, &source_pager)?;
+                    Some(guard)
+                } else {
+                    None
+                };
+                if let Some(mvcc_guard) = mvcc_guard {
+                    turso_assert!(
+                        cleanup_state.mvcc_guard.is_none(),
+                        "MVCC VACUUM cleanup state already owns a guard"
+                    );
+                    cleanup_state.mvcc_guard = Some(mvcc_guard);
+                }
+                // 9. Acquire the checkpoint serialization lock early. This
+                // ensures a post-commit TRUNCATE checkpoint won't fail due
+                // to a concurrent checkpointer. If the lock is unavailable
+                // we fail fast before doing any expensive work.
+                wal.try_begin_checkpoint_lock()?;
+                cleanup_state.checkpoint_cleanup = CheckpointLockCleanup::ReleaseRaw;
+                *phase = VacuumInPlacePhase::BeginSourceTx;
+                continue;
+            }
+
+            VacuumInPlacePhase::BeginSourceTx => {
+                // Acquire exclusive WAL access in one shot:
+                // vacuum lock + WAL write lock + connection snapshot.
+                // Checkpoint lock was already acquired in Preflight.
+                match source_pager.begin_exclusive_tx()? {
+                    crate::IOResult::Done(()) => {
+                        connection.auto_commit.store(false, Ordering::SeqCst);
+                        connection.set_tx_state(crate::connection::TransactionState::Write {
+                            schema_did_change: false,
+                        });
+                        cleanup_state.source_tx_open = true;
+                        cleanup_state.vacuum_lock_held = true;
+                        *phase = VacuumInPlacePhase::ReadSourceMetadata;
+                        continue;
+                    }
+                    crate::IOResult::IO(io) => {
+                        *phase = VacuumInPlacePhase::BeginSourceTx;
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+            }
+
+            VacuumInPlacePhase::ReadSourceMetadata => {
+                turso_assert!(
+                    cleanup_state.checkpoint_cleanup == CheckpointLockCleanup::ReleaseRaw,
+                    "VACUUM source metadata phase requires held checkpoint lock"
+                );
+                turso_assert!(
+                    cleanup_state.source_tx_open,
+                    "VACUUM source metadata phase requires source exclusive snapshot"
+                );
+                let source_db = connection.get_source_database(db);
+
+                // Read page size from pager (cached after begin_read_tx).
+                let page_size = source_pager
+                    .get_page_size()
+                    .map(|ps| ps.get())
+                    .unwrap_or(4096);
+
+                // Read reserved bytes and header metadata in a single
+                // with_header call to avoid redundant page-1 access.
+                let io = &*source_pager.io;
+                let (reserved_space, header_meta): (u8, VacuumDbHeaderMeta) =
+                    match connection.get_reserved_bytes() {
+                        Some(val) => {
+                            let dh = io.block(|| {
+                                source_pager.with_header(VacuumDbHeaderMeta::from_source_header)
+                            })?;
+                            (val, dh)
+                        }
+                        None => io.block(|| {
+                            source_pager.with_header(|h| {
+                                (h.reserved_space, VacuumDbHeaderMeta::from_source_header(h))
+                            })
+                        })?,
+                    };
+                // Create temp database.
+                let temp_db =
+                    open_vacuum_temp_db(connection, &source_db, page_size, reserved_space)?;
+
+                mirror_symbols(connection, &temp_db.conn);
+                let source_custom_types = capture_custom_types(connection, db);
+
+                let config = VacuumTargetBuildConfig {
+                    source_conn: connection.clone(),
+                    escaped_schema_name: "main".to_string(),
+                    source_db_id: db,
+                    header_meta,
+                    source_custom_types,
+                    target_mvcc_enabled: false,
+                    target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
+                    copy_mvcc_metadata_table: source_db.mvcc_enabled(),
+                };
+
+                let target_build_context = VacuumTargetBuildContext::new(temp_db.conn.clone());
+
+                *phase = VacuumInPlacePhase::TargetBuild {
+                    config: Box::new(config),
+                    temp_db: Box::new(temp_db),
+                    context: Box::new(target_build_context),
+                };
+                continue;
+            }
+
+            VacuumInPlacePhase::TargetBuild {
+                config,
+                temp_db,
+                mut context,
+            } => {
+                match vacuum_target_build_step(&config, &mut context)? {
+                    crate::IOResult::Done(()) => {
+                        // Temp build complete. Move to read tx on temp.
+                        drop(config);
+                        drop(context);
+                        *phase = VacuumInPlacePhase::BeginTempReadTx { temp_db };
+                        continue;
+                    }
+                    crate::IOResult::IO(io) => {
+                        *phase = VacuumInPlacePhase::TargetBuild {
+                            config,
+                            temp_db,
+                            context,
+                        };
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+            }
+
+            VacuumInPlacePhase::BeginTempReadTx { temp_db } => {
+                // Start a fresh read snapshot on the committed temp image.
+                // The temp COMMIT should already have released its WAL read
+                // mark; if not, the temp transaction lifecycle is wrong.
+                // Start a new read tx so `Wal::find_frame` uses the committed
+                // temp-WAL frame set for copy-back.
+                let temp_pager = temp_db.conn.get_pager();
+                turso_assert!(
+                    !temp_pager.holds_read_lock(),
+                    "VACUUM temp COMMIT should release the temp WAL read lock"
+                );
+                temp_pager.begin_read_tx()?;
+
+                let temp_page_size = temp_pager.get_page_size_unchecked().get() as u64;
+                let temp_db_file_size = temp_pager.db_file.size()?;
+                turso_assert_eq!(
+                    temp_db_file_size,
+                    temp_page_size,
+                    "VACUUM temp DB file must contain only page 1; compacted pages must remain in temp WAL",
+                    {
+                        "temp_db_file_size": temp_db_file_size,
+                        "temp_page_size": temp_page_size
+                    }
+                );
+
+                // Determine the compacted image size from temp page 1 header.
+                let io = &*temp_pager.io;
+                let total_pages: u32 =
+                    io.block(|| temp_pager.with_header(|h| h.database_size.get()))?;
+                let wal = source_pager
+                    .wal
+                    .as_ref()
+                    .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
+
+                turso_assert!(
+                    total_pages > 0,
+                    "VACUUM target build must produce at least page 1 in the committed temp image"
+                );
+
+                // Initialize the source WAL header before the first batch.
+                let page_sz = source_pager.get_page_size_unchecked();
+
+                if let Some(header_write_c) = wal.prepare_wal_start(page_sz)? {
+                    // WAL not yet initialized — yield on the header write.
+                    *phase = VacuumInPlacePhase::InitSourceWalHeader {
+                        temp_db,
+                        total_pages,
+                        completion: header_write_c,
+                        fsync_phase: false,
+                    };
+                    continue;
+                }
+
+                // WAL already initialized — kick off the first read batch.
+                let temp_pager = temp_db.conn.get_pager();
+                let batch_end = vacuum_copy_batch_end(1, total_pages);
+                let read_scratch_buf = new_vacuum_read_scratch_buf(&temp_pager);
+                let (batch_pages, read_completion) =
+                    start_temp_batch_reads(&temp_pager, 1, batch_end, &read_scratch_buf)?;
+
+                *phase = VacuumInPlacePhase::ReadTempBatch {
+                    temp_db,
+                    total_pages,
+                    next_page: batch_end,
+                    prev_prepared: None,
+                    read_scratch_buf,
+                    batch_pages,
+                    read_completion,
+                };
+                continue;
+            }
+
+            VacuumInPlacePhase::InitSourceWalHeader {
+                temp_db,
+                total_pages,
+                completion,
+                fsync_phase,
+            } => {
+                turso_assert!(
+                    total_pages > 0,
+                    "VACUUM source WAL header initialization requires pages to copy"
+                );
+                if !completion.finished() {
+                    *phase = VacuumInPlacePhase::InitSourceWalHeader {
+                        temp_db,
+                        total_pages,
+                        completion: completion.clone(),
+                        fsync_phase,
+                    };
+                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                        completion,
+                    )));
+                }
+                if !completion.succeeded() {
+                    return Err(vacuum_completion_error(&completion, "WAL header init"));
+                }
+
+                if !fsync_phase {
+                    // Header write done — issue the fsync via prepare_wal_finish
+                    // to set WAL `initialized = true`.
+                    let wal = source_pager.wal.as_ref().unwrap();
+                    let sync_c = wal.prepare_wal_finish(source_pager.get_sync_type())?;
+                    *phase = VacuumInPlacePhase::InitSourceWalHeader {
+                        temp_db,
+                        total_pages,
+                        completion: sync_c,
+                        fsync_phase: true,
+                    };
+                    continue;
+                }
+
+                // WAL header fully initialized. Kick off the first read batch.
+                let temp_pager = temp_db.conn.get_pager();
+                let batch_end = vacuum_copy_batch_end(1, total_pages);
+                let read_scratch_buf = new_vacuum_read_scratch_buf(&temp_pager);
+                let (batch_pages, read_completion) =
+                    start_temp_batch_reads(&temp_pager, 1, batch_end, &read_scratch_buf)?;
+
+                *phase = VacuumInPlacePhase::ReadTempBatch {
+                    temp_db,
+                    total_pages,
+                    next_page: batch_end,
+                    prev_prepared: None,
+                    read_scratch_buf,
+                    batch_pages,
+                    read_completion,
+                };
+                continue;
+            }
+
+            VacuumInPlacePhase::ReadTempBatch {
+                temp_db,
+                total_pages,
+                next_page,
+                prev_prepared,
+                read_scratch_buf,
+                batch_pages,
+                read_completion,
+            } => {
+                turso_assert!(
+                    total_pages < u32::MAX,
+                    "VACUUM read batch requires a representable exclusive end page",
+                    { "total_pages": total_pages }
+                );
+                let database_end = total_pages + 1;
+                turso_assert!(
+                    !batch_pages.is_empty(),
+                    "VACUUM read batch must contain pages"
+                );
+                turso_assert!(
+                    batch_pages.len() as u32 <= VACUUM_COPY_BATCH_SIZE,
+                    "VACUUM read batch exceeds configured copy batch size",
+                    { "batch_pages": batch_pages.len(), "batch_size": VACUUM_COPY_BATCH_SIZE }
+                );
+                turso_assert!(
+                    next_page > 1 && next_page <= database_end,
+                    "VACUUM read batch next page is outside database image",
+                    { "next_page": next_page, "total_pages": total_pages }
+                );
+                // Wait for every run in this batch to finish.
+                if !read_completion.finished() {
+                    *phase = VacuumInPlacePhase::ReadTempBatch {
+                        temp_db,
+                        total_pages,
+                        next_page,
+                        prev_prepared,
+                        read_scratch_buf,
+                        batch_pages,
+                        read_completion: read_completion.clone(),
+                    };
+                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                        read_completion,
+                    )));
+                }
+                if !read_completion.succeeded() {
+                    return Err(vacuum_completion_error(&read_completion, "temp batch read"));
+                }
+
+                // All pages in this batch are loaded. Prepare WAL frames.
+                for page in &batch_pages {
+                    turso_assert!(
+                        page.is_loaded(),
+                        "VACUUM read batch page must be loaded before WAL prepare",
+                        { "page_id": page.get().id }
+                    );
+                    turso_assert!(
+                        !page.is_locked(),
+                        "VACUUM read batch page lock leaked before WAL prepare",
+                        { "page_id": page.get().id }
+                    );
+                }
+                let all_read = next_page > total_pages;
+                let wal = source_pager
+                    .wal
+                    .as_ref()
+                    .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
+                let page_sz = source_pager.get_page_size_unchecked();
+
+                let db_size_on_commit = if all_read { Some(total_pages) } else { None };
+
+                let prepared = wal.prepare_frames(
+                    &batch_pages,
+                    page_sz,
+                    db_size_on_commit,
+                    prev_prepared.as_deref(),
+                )?;
+
+                // Submit writes via WriteBatch.
+                let wal_file = wal.wal_file()?;
+                let mut batch = IOWriteBatch::new(wal_file);
+                batch.writev(prepared.offset, &prepared.bufs);
+                let completions = batch.submit()?;
+
+                *phase = VacuumInPlacePhase::WriteWalBatch {
+                    temp_db,
+                    total_pages,
+                    next_page,
+                    prev_prepared: Some(Box::new(prepared)),
+                    read_scratch_buf,
+                    completions,
+                };
+                continue;
+            }
+
+            VacuumInPlacePhase::WriteWalBatch {
+                temp_db,
+                total_pages,
+                next_page,
+                prev_prepared,
+                read_scratch_buf,
+                completions,
+            } => {
+                turso_assert!(
+                    total_pages < u32::MAX,
+                    "VACUUM WAL write batch requires a representable exclusive end page",
+                    { "total_pages": total_pages }
+                );
+                let database_end = total_pages + 1;
+                turso_assert!(
+                    prev_prepared.is_some(),
+                    "VACUUM WAL write batch requires prepared frames"
+                );
+                turso_assert!(
+                    !completions.is_empty(),
+                    "VACUUM WAL write batch requires write completions"
+                );
+                turso_assert!(
+                    next_page > 1 && next_page <= database_end,
+                    "VACUUM WAL write batch next page is outside database image",
+                    { "next_page": next_page, "total_pages": total_pages }
+                );
+                // Wait for all writes in this batch. We yield on the first
+                // unfinished completion; re-entry will re-check them all.
+                let pending = completions.iter().find(|c| !c.finished()).cloned();
+                if let Some(pending) = pending {
+                    *phase = VacuumInPlacePhase::WriteWalBatch {
+                        temp_db,
+                        total_pages,
+                        next_page,
+                        prev_prepared,
+                        read_scratch_buf,
+                        completions,
+                    };
+                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(pending)));
+                }
+
+                // Check for write errors.
+                for c in &completions {
+                    if !c.succeeded() {
+                        return Err(vacuum_completion_error(c, "WAL write"));
+                    }
+                }
+
+                // Commit this batch's prepared frames to advance local WAL
+                // index state (page→frame mapping, max_frame, checksum).
+                //
+                // We intentionally skip finalize_committed_pages() here. That
+                // call clears dirty flags and sets WAL tags on PageRefs that
+                // live in the source page cache. Our pages come from the temp
+                // pager's read_page_no_cache — they are not in the source page
+                // cache and have no dirty state to clear. The source page cache
+                // is invalidated wholesale via clear_page_cache() in Publish.
+                let wal = source_pager.wal.as_ref().unwrap();
+                let prepared = prev_prepared.as_ref().unwrap();
+                wal.commit_prepared_frames(std::slice::from_ref(prepared.as_ref()));
+
+                // More pages to copy?
+                if next_page <= total_pages {
+                    // Kick off the next read batch in parallel.
+                    let temp_pager = temp_db.conn.get_pager();
+                    let batch_end = vacuum_copy_batch_end(next_page, total_pages);
+                    let (batch_pages, read_completion) = start_temp_batch_reads(
+                        &temp_pager,
+                        next_page,
+                        batch_end,
+                        &read_scratch_buf,
+                    )?;
+
+                    *phase = VacuumInPlacePhase::ReadTempBatch {
+                        temp_db,
+                        total_pages,
+                        next_page: batch_end,
+                        prev_prepared,
+                        read_scratch_buf,
+                        batch_pages,
+                        read_completion,
+                    };
+                    continue;
+                }
+
+                // All pages written. Fsync WAL if sync mode requires it.
+                // NORMAL mode skips fsync on WAL commit (fsyncs happen on
+                // checkpoint and WAL restart instead). This matches the regular
+                // pager commit path in Pager::commit_tx / CommitState.
+                let sync_mode = connection.get_sync_mode();
+                if sync_mode == SyncMode::Full {
+                    let sync_c = wal.sync(source_pager.get_sync_type())?;
+                    *phase = VacuumInPlacePhase::SyncSourceWal {
+                        temp_db,
+                        sync_completion: sync_c,
+                    };
+                    continue;
+                }
+
+                // No sync needed — proceed directly to publish.
+                *phase = VacuumInPlacePhase::PublishWalCommit { temp_db };
+                continue;
+            }
+
+            VacuumInPlacePhase::SyncSourceWal {
+                temp_db,
+                sync_completion,
+            } => {
+                if !sync_completion.finished() {
+                    *phase = VacuumInPlacePhase::SyncSourceWal {
+                        temp_db,
+                        sync_completion: sync_completion.clone(),
+                    };
+                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                        sync_completion,
+                    )));
+                }
+                if !sync_completion.succeeded() {
+                    return Err(vacuum_completion_error(&sync_completion, "WAL fsync"));
+                }
+                *phase = VacuumInPlacePhase::PublishWalCommit { temp_db };
+                continue;
+            }
+
+            VacuumInPlacePhase::PublishWalCommit { temp_db } => {
+                turso_assert!(
+                    cleanup_state.checkpoint_cleanup == CheckpointLockCleanup::ReleaseRaw,
+                    "VACUUM publish phase requires held checkpoint lock"
+                );
+                turso_assert!(
+                    cleanup_state.source_tx_open,
+                    "VACUUM publish phase requires source exclusive snapshot"
+                );
+                let wal = source_pager
+                    .wal
+                    .as_ref()
+                    .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
+
+                // Publish the WAL transaction to shared state. Once this
+                // succeeds the compacted image is durable — rollback must
+                // not be attempted even if later schema reload fails.
+                wal.finish_append_frames_commit()?;
+                cleanup_state.wal_commit_published = true;
+
+                source_pager.end_write_tx();
+                cleanup_state.source_tx_open = false;
+
+                // Restore connection bookkeeping immediately. The commit is
+                // durable so there is nothing to roll back; restoring here
+                // means the connection is never left poisoned even if the
+                // checkpoint or schema reload below fails.
+                connection.auto_commit.store(true, Ordering::SeqCst);
+                connection.set_tx_state(crate::connection::TransactionState::None);
+
+                // Invalidate page cache and schema cookie so fresh reads see
+                // the newly committed WAL frames.
+                source_pager.clear_page_cache(false);
+                source_pager.set_schema_cookie(None);
+
+                // Drop temp resources before checkpoint.
+                drop(temp_db);
+
+                *phase = VacuumInPlacePhase::Checkpoint;
+                continue;
+            }
+
+            VacuumInPlacePhase::Checkpoint => {
+                // TRUNCATE checkpoint: copy WAL frames into the DB file,
+                // sync the DB, then truncate the WAL to zero bytes.
+                let sync_mode = connection.get_sync_mode();
+                if cleanup_state.checkpoint_cleanup == CheckpointLockCleanup::ReleaseRaw {
+                    cleanup_state.checkpoint_cleanup = CheckpointLockCleanup::AbortCheckpoint;
+                }
+                match source_pager.checkpoint_with_held_checkpoint_lock(
+                    crate::storage::wal::CheckpointMode::Truncate {
+                        upper_bound_inclusive: None,
+                    },
+                    sync_mode,
+                    true,
+                ) {
+                    Ok(crate::IOResult::Done(result)) => {
+                        cleanup_state.checkpoint_cleanup = CheckpointLockCleanup::None;
+                        if !result.should_truncate() {
+                            if let Err(reload_err) =
+                                reload_schema_after_vacuum_commit(connection, db, &source_pager)
+                            {
+                                tracing::info!(
+                                    "VACUUM schema reload after partial checkpoint failed: {reload_err}"
+                                );
+                            }
+                            if cleanup_state.vacuum_lock_held {
+                                let wal = source_pager.wal.as_ref().ok_or_else(|| {
+                                    LimboError::InternalError("VACUUM requires WAL".into())
+                                })?;
+                                wal.release_vacuum_lock();
+                                cleanup_state.vacuum_lock_held = false;
+                            }
+                            return Err(LimboError::Busy);
+                        }
+                        if cleanup_state.vacuum_lock_held {
+                            let wal = source_pager.wal.as_ref().ok_or_else(|| {
+                                LimboError::InternalError("VACUUM requires WAL".into())
+                            })?;
+                            wal.release_vacuum_lock();
+                            cleanup_state.vacuum_lock_held = false;
+                        }
+                        *phase = VacuumInPlacePhase::SchemaReload;
+                        continue;
+                    }
+                    Ok(crate::IOResult::IO(io)) => {
+                        *phase = VacuumInPlacePhase::Checkpoint;
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    Err(err) => {
+                        tracing::info!("VACUUM post-commit checkpoint failed: {err}");
+                        if cleanup_state.checkpoint_cleanup
+                            == CheckpointLockCleanup::AbortCheckpoint
+                        {
+                            source_pager.cleanup_after_checkpoint_failure();
+                            cleanup_state.checkpoint_cleanup = CheckpointLockCleanup::None;
+                        }
+                        if let Err(reload_err) =
+                            reload_schema_after_vacuum_commit(connection, db, &source_pager)
+                        {
+                            tracing::info!(
+                                "VACUUM schema reload after checkpoint failure also failed: {reload_err}"
+                            );
+                        }
+                        if cleanup_state.vacuum_lock_held {
+                            if let Some(wal) = source_pager.wal.as_ref() {
+                                wal.release_vacuum_lock();
+                                cleanup_state.vacuum_lock_held = false;
+                            }
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+
+            VacuumInPlacePhase::SchemaReload => {
+                reload_schema_after_vacuum_commit(connection, db, &source_pager)?;
+                drop(cleanup_state.mvcc_guard.take());
+
+                *phase = VacuumInPlacePhase::Done;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+
+            VacuumInPlacePhase::Done => {
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
+}
+
+/// Roll back the source transaction and restore connection state after an
+/// in-place VACUUM failure. Uses `cleanup_state` to decide what to undo; this
+/// state is independent of the phase enum and survives `std::mem::take`.
+///
+/// `phase` is taken by value so helper statements inside `TargetBuild` are
+/// dropped before we attempt `rollback_tx`. This
+/// avoids the nestedness suppression bug where live helper statements keep
+/// `Connection::nestedness > 0`, making `rollback_tx` a no-op.
+fn vacuum_in_place_cleanup(
+    connection: &Arc<Connection>,
+    db: usize,
+    mut phase: VacuumInPlacePhase,
+    mut cleanup_state: VacuumInPlaceCleanupState,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+
+    if let VacuumInPlacePhase::TargetBuild { context, .. } = &mut phase {
+        context.cleanup_after_error()?;
+    }
+
+    match cleanup_state.checkpoint_cleanup {
+        CheckpointLockCleanup::ReleaseRaw => {
+            let pager = connection
+                .get_pager_from_database_index(&db)
+                .expect("VACUUM cleanup requires source pager");
+            if let Some(wal) = pager.wal.as_ref() {
+                wal.release_checkpoint_lock();
+            }
+        }
+        CheckpointLockCleanup::AbortCheckpoint => {
+            let pager = connection
+                .get_pager_from_database_index(&db)
+                .expect("VACUUM cleanup requires source pager");
+            pager.cleanup_after_checkpoint_failure();
+        }
+        CheckpointLockCleanup::None => {}
+    }
+
+    // No source transaction to undo. Any raw locks are still released below.
+    if !cleanup_state.source_tx_open {
+        if cleanup_state.vacuum_lock_held {
+            let pager = connection
+                .get_pager_from_database_index(&db)
+                .expect("VACUUM cleanup requires source pager");
+            if let Some(wal) = pager.wal.as_ref() {
+                wal.release_vacuum_lock();
+            }
+        }
+        drop(cleanup_state.mvcc_guard.take());
+        return Ok(());
+    }
+
+    // Drop the phase first to release any target-build helper statements.
+    // Their Drop impls decrement Connection::nestedness, which must happen
+    // before rollback_tx (which is a no-op while nested).
+    drop(phase);
+
+    turso_assert!(
+        !cleanup_state.wal_commit_published || !cleanup_state.source_tx_open,
+        "VACUUM cleanup must not observe a committed WAL publish with source transaction still open"
+    );
+    // Write transaction open but not yet committed — roll back.
+    let pager = connection
+        .get_pager_from_database_index(&db)
+        .expect("VACUUM cleanup requires source pager");
+    pager.rollback_tx(connection);
+
+    if cleanup_state.vacuum_lock_held {
+        let pager = connection
+            .get_pager_from_database_index(&db)
+            .expect("VACUUM cleanup requires source pager");
+        if let Some(wal) = pager.wal.as_ref() {
+            wal.release_vacuum_lock();
+        }
+    }
+
+    connection.auto_commit.store(true, Ordering::SeqCst);
+    connection.set_tx_state(crate::connection::TransactionState::None);
+    drop(cleanup_state.mvcc_guard.take());
+    Ok(())
 }

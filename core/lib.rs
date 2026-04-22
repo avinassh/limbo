@@ -1957,6 +1957,18 @@ impl Database {
     }
 
     #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) fn has_live_shared_wal_peer_process(&self) -> Result<bool> {
+        Ok(self
+            .shared_wal_coordination()?
+            .is_some_and(|authority| !authority.is_last_process_mapping()))
+    }
+
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    pub(crate) fn has_live_shared_wal_peer_process(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
     pub(crate) fn open_shared_wal_coordination_for_open(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {

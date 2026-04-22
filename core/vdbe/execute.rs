@@ -14533,6 +14533,61 @@ fn op_vacuum_into_inner(
     }
 }
 
+// ---------------------------------------------------------------------------
+// In-place VACUUM opcode
+// ---------------------------------------------------------------------------
+
+/// Holds the context for the in-place VACUUM operation across async yields.
+pub(crate) type VacuumInPlaceOpContext = crate::vdbe::vacuum::VacuumInPlaceOpContext;
+
+/// In-place VACUUM - compact the database via target build + direct-WAL
+/// copy-back. The opcode owns the source transaction lifecycle.
+pub fn op_vacuum(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(Vacuum { db }, insn);
+
+    if state.op_vacuum_in_place.is_none() {
+        state.op_vacuum_in_place = Some(Box::new(VacuumInPlaceOpContext::new(*db)));
+    }
+
+    let vacuum_state = state.op_vacuum_in_place.as_mut().unwrap();
+
+    match vacuum_state.step(&program.connection) {
+        Ok(InsnFunctionStepResult::Step) => {
+            state.op_vacuum_in_place = None;
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Ok(InsnFunctionStepResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
+            unreachable!("in-place VACUUM only returns Step or IO")
+        }
+        Err(err) => {
+            if let Err(cleanup_err) = cleanup_op_vacuum_in_place(&program.connection, state) {
+                tracing::error!("VACUUM cleanup failed after error: {cleanup_err}");
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Clean up in-place VACUUM state on error or abort. Rolls back the source
+/// transaction if it was acquired, restores connection state, and drops
+/// temp resources.
+fn cleanup_op_vacuum_in_place(
+    connection: &Arc<Connection>,
+    state: &mut ProgramState,
+) -> Result<()> {
+    let Some(vacuum_state) = state.op_vacuum_in_place.take() else {
+        return Ok(());
+    };
+    vacuum_state.cleanup(connection)
+}
+
 fn with_header<T, F>(
     pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
