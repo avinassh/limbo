@@ -51,7 +51,7 @@ use crate::{
             OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState,
             OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
             OpNoConflictState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
-            OpVacuumIntoState,
+            VacuumInPlaceOpContext, VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -467,7 +467,8 @@ pub struct ProgramState {
     op_row_id_state: OpRowIdState,
     op_transaction_state: OpTransactionState,
     op_journal_mode_state: OpJournalModeState,
-    op_vacuum_into_state: Option<OpVacuumIntoState>,
+    op_vacuum_into: Option<Box<VacuumIntoOpContext>>,
+    op_vacuum_in_place: Option<Box<VacuumInPlaceOpContext>>,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -583,7 +584,8 @@ impl ProgramState {
             op_row_id_state: OpRowIdState::Start,
             op_transaction_state: OpTransactionState::Start,
             op_journal_mode_state: OpJournalModeState::default(),
-            op_vacuum_into_state: None,
+            op_vacuum_into: None,
+            op_vacuum_in_place: None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -720,7 +722,8 @@ impl ProgramState {
         self.op_program_state = OpProgramState::Start;
         self.op_transaction_state = OpTransactionState::Start;
         self.op_journal_mode_state = OpJournalModeState::default();
-        self.op_vacuum_into_state = None;
+        self.op_vacuum_into = None;
+        self.op_vacuum_in_place = None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
@@ -2070,10 +2073,16 @@ impl Program {
 
         let mut abort_error: Option<LimboError> = None;
 
-        // VACUUM INTO state can own internal helper statements whose drop path
-        // releases nested guards. Drop them before checking whether this program
+        // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
+        // releases nested guards. Clean it before checking whether this program
         // is itself nested; otherwise abort could skip top-level cleanup.
-        state.op_vacuum_into_state = None;
+        if let Err(err) = execute::cleanup_vacuum_state(&self.connection, state) {
+            capture_abort_error(
+                &mut abort_error,
+                err,
+                "Failed to clean up VACUUM state during abort",
+            );
+        }
 
         // Only end trigger execution if the subprogram was actually running.
         // Cached (pooled) statements may be dropped after their trigger execution
