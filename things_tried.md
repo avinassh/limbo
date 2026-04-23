@@ -632,3 +632,113 @@ unrelated bug U17.
 
 Bugs 22-24 all logged as new VACUUM bugs this session. Also logged
 unrelated bugs U15, U16, U17.
+
+
+## Session 7
+
+### 32. VACUUM fails on SQLite-created DB with INSTEAD OF trigger on view
+Turso can open and query (SELECT and INSTEAD-OF-mediated INSERT) a
+SQLite DB that contains `CREATE TRIGGER ... INSTEAD OF INSERT ON v`.
+VACUUM's post-data replay of the CREATE TRIGGER hits
+`core/translate/trigger.rs:161-163` which requires the target table to
+resolve as a btree table (not a view) — error is "no such table: v".
+Even if the resolver accepted views, `core/translate/trigger.rs:172`
+would reject INSTEAD OF with "INSTEAD OF triggers are not supported
+yet". VACUUM INTO fails the same way and leaks a 4-KB partial dest.
+Logged as Bug 25.
+
+### 33. VACUUM gives "Corrupt database: no schema metadata" on FTS4/RTREE backing tables
+FTS4 creates backing tables `ft_content`, `ft_segments`, `ft_segdir`,
+`ft_docsize`, `ft_stat` (rowid-based, not WITHOUT ROWID). RTREE
+similarly creates `r_rowid`, `r_node`, `r_parent`. When Turso opens
+such a DB, the virtual-table module isn't loaded; the backing tables
+have rootpage != 0 in sqlite_master but `get_btree_table(name)`
+returns None in Turso's schema. VACUUM's `build_copy_sql` bails with
+"Corrupt database: no schema metadata for storage-backed table
+<name>". The error message incorrectly suggests data corruption;
+the source DB is otherwise healthy. Distinct from Bug 18 (FTS5
+WITHOUT ROWID parser rejection). Logged as Bug 26.
+
+### 34. VACUUM corrupts schema for CREATE VIEW with reserved-keyword column names
+When source has `CREATE VIEW v("order") AS ...`, Turso's VIEW parser
+strips quotes from the column list when re-stringifying. Post-VACUUM
+sqlite_master contains `CREATE VIEW v (order) AS ...` — malformed
+because `order` is a reserved keyword. Both Turso and SQLite fail to
+parse the schema; SQLite reports "malformed database schema (v) - near
+'order': syntax error". Affects every reserved keyword tested
+(`order`, `where`, `select`, `from`, `having`, `limit`, `union`).
+Scope: CREATE VIEW column_list only — CREATE TABLE, INDEX, TRIGGER OF
+lists all preserve quotes. Data integrity bug. Logged as Bug 27.
+
+### 35. VACUUM fails on SQLite-created DB with partial index using non-deterministic WHERE functions
+SQLite allows `CREATE INDEX ix ON t(a) WHERE datetime('now') > '...'`
+at CREATE time on an empty table, storing the index in sqlite_master.
+Turso's CREATE INDEX parser is stricter — it rejects WHERE clauses that
+reference non-deterministic functions with "cannot use aggregate,
+window functions or reference other tables in WHERE clause of CREATE
+INDEX". So Turso can OPEN such a DB but cannot VACUUM/VACUUM INTO it.
+VACUUM INTO also leaks a 4-KB partial dest (Bug 14/20 family). Logged
+as Bug 28.
+
+### 36. Other things tried, no new bug
+- Various STRICT table shapes with ANY, REAL, BLOB, INT — preserved
+- Custom type chains (CREATE TYPE t2 BASE t1) — rejected, base type
+  must be built-in
+- VACUUM INTO via symlinked paths — WAL sidecar lands next to symlink,
+  not resolved target (SQLite behaves the same — not new)
+- VACUUM after many ALTER ADD COLUMN / RENAME / DROP chains — OK
+- VACUUM + triggers with UPDATE/INSERT/DELETE bodies of various shapes
+  — all preserved. Including UPSERT (INSERT ON CONFLICT DO UPDATE) in
+  trigger body, WITH/CTE in trigger body (some variants rejected by
+  both Turso and SQLite at parse time), NEW/OLD compound references
+- VACUUM + DEFAULT expressions with sqlite_version(), last_insert_rowid(),
+  strftime, julianday, abs, MIN/MAX, hex(zeroblob(N)), printf — preserved
+- VACUUM + CHECK constraints using IIF, CAST, CASE-WHEN, json_valid,
+  compound AND/OR, CURRENT_TIME, IS NULL — preserved
+- VACUUM + indexes with expression indexes (abs, lower, json_extract,
+  iif, CASE WHEN), partial indexes with IS NULL / BETWEEN / GLOB /
+  typeof() / LIKE '%[abc]%' — preserved
+- VACUUM + view with recursive CTE (CREATE accepts, query fails) —
+  schema preserved intact
+- VACUUM + CDC 'id'/'before'/'after'/'full' modes with INSERT INTO
+  reveals phantom commit marker (Bug 16/23 family, already logged)
+- VACUUM + PRAGMA page_size = 512 / 65536 — preserved
+- VACUUM + PRAGMA default_cache_size — Turso's default is -2000 (2 MB
+  in KB units); SQLite defaults to 0. Not a divergence from VACUUM's
+  perspective since from_source_header copies source value
+- VACUUM + PRAGMA user_version = INT32_MAX / -1 — preserved
+- VACUUM + MVCC + views / triggers / custom types — each preserved
+  individually; MVCC demotion to WAL persists (Bug 15)
+- VACUUM + reserved column keywords via `"UNION"`, `"HAVING"`, etc as
+  TABLE / INDEX / TRIGGER OF elements — all preserved with quotes
+- VACUUM + column with weird escape shapes (`"a""b"`, `"c'd"`) — OK
+- VACUUM + encrypted source + MVCC + custom types combo — VACUUM INTO
+  produces plaintext with custom type meta visible (Bug 5 + Bug 9 combo)
+- VACUUM + source that has NUMERIC/DECIMAL precision — preserved
+- VACUUM + source with compound PK, BLOB PK, REAL PK — preserved
+- VACUUM + source where stored SQL has multi-line/newline DEFAULT —
+  preserved
+- Stack overflow on VACUUM when source has CHECK constraint with 100+
+  AND clauses (already-documented U8 extended: VACUUM itself aborts
+  on schema parse even with 0 data rows)
+- VACUUM of DB that uses CREATE TABLE `IF NOT EXISTS` — SQLite strips
+  IF NOT EXISTS from stored SQL (same as Turso), so no divergence
+- VACUUM when sqlite_master has no storage rows but sqlite_sequence
+  exists (dropped all AUTOINCREMENT tables) — VACUUM removes
+  sqlite_sequence post-VACUUM (matches SQLite)
+- VACUUM of DB with empty MVCC (no user tables, only
+  __turso_internal_mvcc_meta) — succeeds
+- VACUUM INTO always produces `.db-log` sidecar for MVCC sources
+  (Bug 19 extension: BOTH `.db-wal` AND `.db-log` as zero-byte files)
+- VACUUM preservation of sqlite_sequence with NULL/BLOB/REAL/orphan
+  entries — preserved through VACUUM
+- Turso's UPDATE on turso_cdc_version panics with "cdc_rowid_before_reg
+  must be set" (unrelated bug not tied to VACUUM, logged as U18)
+- VACUUM preservation of sqlite_master rowid ordering: both SQLite and
+  Turso reorder post-VACUUM to tables-first-then-indexes (matches)
+
+Bugs 25-28 all logged as new VACUUM bugs this session (4 concrete
+Turso-on-SQLite divergences that block or corrupt VACUUM on otherwise
+valid databases). Unrelated bug U18 (panic on UPDATE
+turso_cdc_version) also added.
+

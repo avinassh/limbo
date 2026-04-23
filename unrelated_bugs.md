@@ -314,3 +314,34 @@ AUTOINCREMENT tables is stored in lowercase (U9 family — we observed
 that `CREATE TABLE MyTable(id INTEGER PRIMARY KEY AUTOINCREMENT);`
 followed by `INSERT` leaves `sqlite_sequence.name='mytable'` rather
 than SQLite's `'MyTable'`).
+
+## U18: UPDATE on `turso_cdc_version` panics with "cdc_rowid_before_reg must be set"
+
+```
+$ tursodb /tmp/x.db "CREATE TABLE t(a);
+                     PRAGMA unstable_capture_data_changes_conn='full';
+                     INSERT INTO t VALUES (1);
+                     UPDATE turso_cdc_version SET version = 'v999';"
+thread 'main' panicked at core/translate/emitter/update.rs:2204:42:
+cdc_rowid_before_reg must be set
+```
+
+Running `UPDATE` against the `turso_cdc_version` system table (which
+tracks the CDC schema version per user table) when CDC is enabled
+crashes the CLI with a panic rather than returning a user-visible
+error. The panic is unconditional — it fires for any UPDATE against
+`turso_cdc_version`, including UPDATE of an orphan row. INSERT and
+SELECT against the same table work fine, and VACUUM on a DB that has
+a populated `turso_cdc_version` table is unaffected.
+
+Not a VACUUM bug — surfaces on UPDATE in any CDC-enabled session —
+but it means that users who enable CDC and then try to administer
+the per-table version strings crash the process, losing any unwritten
+work. Panicking on user-driven DML is a correctness violation; SQLite
+would either refuse the statement or succeed.
+
+Also: the pattern "UPDATE on a CDC-managed system table panics" is
+broader than this one table. Every UPDATE against `turso_cdc_version`
+or similar CDC-tracked internal tables risks the same panic whenever
+the emitter path expects a before-register state that the
+non-regular-INSERT source never populated.

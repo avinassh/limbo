@@ -943,3 +943,238 @@ manual schema-repair (drop and recreate each offending index). The bug
 composes nastily with Bug 20: VACUUM INTO against such a database
 leaks the destination file AND blocks retries until the operator
 unlinks the leaked output.
+
+## Bug 25: VACUUM fails on SQLite-created databases containing INSTEAD OF triggers on views
+
+**Location**: `core/vdbe/vacuum.rs::vacuum_target_build_step`
+`VacuumTargetBuildPhase::PreparePostData` replays `CREATE TRIGGER` against
+the target connection via `state.target_conn.prepare(&entry.sql)?;`. For an
+`INSTEAD OF INSERT ON v` trigger, the target parser cannot resolve `v` as
+a table (`core/translate/trigger.rs:161-163` requires the target to be a
+btree table, and also rejects `INSTEAD OF` at line 172 even when it IS a
+view). The prepare error propagates out of the target build and the
+whole VACUUM aborts.
+
+The source DB is fully queryable: SELECT from the table and the view both
+work, and INSERT INTO v correctly fires the trigger. Only VACUUM and
+VACUUM INTO are affected.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/iotr.db "
+  CREATE TABLE t(a);
+  CREATE VIEW v AS SELECT a FROM t;
+  CREATE TRIGGER trg INSTEAD OF INSERT ON v
+    BEGIN INSERT INTO t VALUES (NEW.a); END;
+  INSERT INTO v VALUES (1);
+  INSERT INTO v VALUES (2);
+  SELECT * FROM t;"
+1
+2
+$ tursodb --experimental-views /tmp/iotr.db "SELECT * FROM t; SELECT * FROM v;"
+1
+2
+1
+2
+$ tursodb --experimental-views /tmp/iotr.db "VACUUM;"
+Error: Parse error: no such table: v
+
+$ tursodb --experimental-views /tmp/iotr.db "VACUUM INTO '/tmp/iotr_out.db';"
+Error: Parse error: no such table: v
+$ ls -la /tmp/iotr_out.db*
+-rw-rw-r-- 4096 /tmp/iotr_out.db       <-- leaked (Bug 14/20 family)
+-rw-rw-r--    0 /tmp/iotr_out.db-wal
+```
+
+The `--experimental-views` flag is not required — VACUUM and VACUUM INTO
+fail the same way without it, because `vacuum_target_opts_from_source`
+carries the source's feature flag through to the target connection.
+
+**Impact**: Users migrating SQLite databases that use INSTEAD OF triggers
+(a common pattern for making views updatable, or for logging/mirroring
+writes) cannot run VACUUM on Turso. The database remains usable for reads
+and INSTEAD OF-mediated writes, so users may not notice the VACUUM gap
+until maintenance time. Combined with Bug 14/20, `VACUUM INTO` also leaks
+a 4-KB partial destination file and blocks retries with "output file
+already exists." Root cause is twofold and deep in Turso's trigger
+implementation (`core/translate/trigger.rs:161-172`): (a) `get_table()`
+resolves only btree tables, not views, and (b) even if it did, the
+subsequent INSTEAD OF guard rejects the feature. Until both are
+addressed, replay of a stored INSTEAD OF CREATE TRIGGER will always
+fail.
+
+## Bug 26: VACUUM returns "Corrupt database: no schema metadata" for SQLite FTS4/RTREE backing tables
+
+**Location**: `core/vdbe/vacuum.rs::build_copy_sql` (around line 977):
+```rust
+let Some(btree) = source_btree_table else {
+    return Err(LimboError::Corrupt(format!(
+        "no schema metadata for storage-backed table \"{escaped_table_name}\""
+    )));
+};
+```
+
+FTS4 creates backing tables `ft_content`, `ft_segments`, `ft_segdir`,
+`ft_docsize`, `ft_stat` (all rowid-based regular tables). RTREE creates
+`r_rowid`, `r_node`, `r_parent`. When Turso opens such a DB, the
+virtual-table module ("fts4", "rtree") is not registered, so the virtual
+table's CREATE VIRTUAL TABLE fails to resolve the module and the
+backing tables do not get fully wired into Turso's in-memory schema
+(specifically, `get_btree_table(name)` returns None even though the
+sqlite_master row has `rootpage != 0`). At VACUUM time,
+`classify_schema_entries` pushes these backing tables into
+`tables_to_copy` (since rootpage != 0), but the lookup via
+`source_conn.with_schema(...).get_btree_table(name)` returns None, and
+`build_copy_sql` bails with "Corrupt database: no schema metadata...".
+
+This is distinct from Bug 18 (WITHOUT ROWID): FTS5 backing tables
+contain `WITHOUT ROWID` and hit the parser rejection earlier. FTS4 and
+RTREE backing tables are *rowid* tables and do not use WITHOUT ROWID,
+so they pass the parser but fail on the schema-metadata lookup.
+
+**Reproduction (FTS4)**:
+```
+$ sqlite3 /tmp/fts4.db "CREATE VIRTUAL TABLE ft USING fts4(c);
+                        INSERT INTO ft VALUES ('hello');"
+$ tursodb /tmp/fts4.db "VACUUM;"
+Error: Corrupt database: no schema metadata for storage-backed table "ft_content"
+```
+
+**Reproduction (RTREE)**:
+```
+$ sqlite3 /tmp/rtree.db "CREATE VIRTUAL TABLE r USING rtree(id, minX, maxX, minY, maxY);
+                         INSERT INTO r VALUES (1, 0.0, 1.0, 0.0, 1.0);"
+$ tursodb /tmp/rtree.db "VACUUM;"
+Error: Corrupt database: no schema metadata for storage-backed table "r_rowid"
+```
+
+Same error on `VACUUM INTO` (but dest file is not leaked because the
+error happens before any writes land). The error message
+("Corrupt database") is misleading — the source DB is not corrupt;
+Turso just cannot handle backing tables of unknown virtual-table
+modules. Tooling that treats "Corrupt database" as a signal to rebuild
+will misdiagnose these databases.
+
+**Impact**: Any SQLite-origin database that uses FTS4 or RTREE (common
+for search and spatial indexes) cannot be VACUUMed on Turso. The user
+sees a scary "Corrupt database" error that incorrectly suggests data
+integrity issues. Combined with Bug 18 (FTS5/WITHOUT ROWID), essentially
+all SQLite virtual-table extensions lock out VACUUM on Turso, even
+though the rest of the database is readable. Unlike Bug 18, the error
+pathway here doesn't leak the destination file during VACUUM INTO.
+
+## Bug 27: VACUUM corrupts schema for CREATE VIEW with reserved-keyword column names (data integrity)
+
+**Location**: `core/vdbe/vacuum.rs::vacuum_target_build_step`
+`VacuumTargetBuildPhase::PreparePostData` replays `CREATE VIEW` on the
+target via `state.target_conn.prepare(&entry.sql)?`. Turso's parser
+re-stringifier for CREATE VIEW **strips the quotes** around column list
+entries regardless of whether the identifier is a reserved keyword. The
+target sqlite_master ends up with `CREATE VIEW v (order) AS ...` instead
+of `CREATE VIEW v ("order") AS ...`. That stored SQL is **malformed**:
+`order` is a reserved keyword and cannot be used unquoted as an
+identifier. Both Turso and SQLite fail to parse the schema after the
+VACUUM — the view becomes unusable in both engines, and SQLite reports
+a "malformed database schema" error for the entire database.
+
+Reserved-keyword column names WORK when wrapped in the VIEW column list
+of a SQLite-created DB because SQLite preserves the quotes in its
+sqlite_master.sql. Turso's parser silently re-stringifies these to
+unquoted form on replay, producing invalid SQL.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db "
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES (42);
+  CREATE VIEW v(\"order\") AS SELECT a FROM t;"
+$ sqlite3 /tmp/x.db 'SELECT * FROM v;'
+42
+$ tursodb --experimental-views /tmp/x.db 'SELECT * FROM v;'
+42
+$ tursodb --experimental-views /tmp/x.db 'VACUUM;'
+$ tursodb --experimental-views /tmp/x.db 'SELECT sql FROM sqlite_master;'
+CREATE TABLE t (a)
+CREATE VIEW v (order) AS SELECT a FROM t         <-- QUOTES STRIPPED
+$ tursodb --experimental-views /tmp/x.db 'SELECT * FROM v;'
+Error: Parse error: no such table: v
+$ sqlite3 /tmp/x.db 'SELECT * FROM v;'
+Error: in prepare, malformed database schema (v) - near "order": syntax error (11)
+```
+
+Affects every reserved keyword we tested as a view column name:
+`order`, `where`, `from`, `select`, `having`, `limit`, `union`. (For
+`union` Turso's own parser happens to still resolve the view, but
+SQLite consistently rejects the post-VACUUM schema with "malformed
+database schema".) The bug applies identically to `VACUUM INTO`: the
+destination DB is created but has the same corrupted view schema.
+
+The bug is localized to **CREATE VIEW (column_list)** entries. CREATE
+TABLE, CREATE INDEX, CREATE TRIGGER `OF` column lists, and SELECT AS
+aliases all preserve quotes correctly. Turso's own CREATE VIEW
+has the same quote-stripping on initial parse, so the bug exists
+independent of VACUUM (see also U-family parser normalization) — but
+**VACUUM amplifies it**: a SQLite-origin DB that was functional before
+VACUUM becomes corrupt and cross-engine-unreadable after a VACUUM pass
+on Turso.
+
+**Impact**: Data integrity bug. Post-VACUUM, the database has
+malformed schema rows that SQLite cannot parse. Users migrating from
+or interoperating with SQLite can have a functional database become
+unreadable by SQLite after a routine VACUUM on Turso. Even Turso fails
+to query the view for most reserved keywords. There is no recovery
+short of `PRAGMA writable_schema` manual edits (which Turso doesn't
+support) or dropping and re-creating the view. The "corruption" is
+text-level malformed schema rather than page-level damage, so tools
+that rely on header/page integrity (like dbhash or file-integrity
+monitors) do not flag it, yet the schema is genuinely broken.
+
+## Bug 28: VACUUM fails on SQLite-created DB with partial index whose WHERE uses non-deterministic functions
+
+**Location**: `core/vdbe/vacuum.rs::vacuum_target_build_step`
+`VacuumTargetBuildPhase::PrepareCreateIndex` calls
+`state.target_conn.prepare(&entry.sql)?`. Turso's CREATE INDEX parser
+rejects any WHERE clause that references non-deterministic functions
+(e.g., `datetime('now')`, `random()`, `strftime(...)`) with the error
+"cannot use aggregate, window functions or reference other tables in
+WHERE clause of CREATE INDEX". SQLite is more permissive: it allows the
+WHERE clause to contain non-deterministic expressions (as long as the
+table is empty at CREATE INDEX time — SQLite only rejects when trying
+to index existing non-deterministic rows, but the CREATE itself
+succeeds).
+
+This means: a SQLite-created DB where a partial index's WHERE uses
+`datetime('now')` or similar, and where the table was empty at index
+creation, stores that index in sqlite_master. Turso can OPEN such a
+DB fine and read/write it. But VACUUM (and VACUUM INTO) fails because
+the target build replays the CREATE INDEX statement through Turso's
+parser, which applies the stricter check.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db "CREATE TABLE t(a INTEGER);
+                     CREATE INDEX ix ON t(a) WHERE datetime('now') > '2024-01-01';
+                     INSERT INTO t VALUES (1);"
+$ tursodb /tmp/x.db "SELECT * FROM t;"
+1
+$ tursodb /tmp/x.db "VACUUM;"
+Error: Parse error: Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:
+ datetime ('now') > '2024-01-01'
+$ tursodb /tmp/x.db "VACUUM INTO '/tmp/out.db';"
+Error: Parse error: Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:
+ datetime ('now') > '2024-01-01'
+$ ls /tmp/out.db*
+-rw-rw-r-- 4096 /tmp/out.db       <-- leaked (Bug 14/20 family)
+-rw-rw-r--    0 /tmp/out.db-wal
+```
+
+**Impact**: Any SQLite-origin database that uses partial indexes with
+non-deterministic WHERE clauses (e.g., `WHERE created_at > datetime('now')`
+for time-windowed indexes) can be queried by Turso but cannot be
+VACUUMed. Combined with Bug 14/20, VACUUM INTO also leaks a 4-KB
+partial destination file. The root cause is a parser strictness
+mismatch; it compounds with the SQLite divergence in that the exact
+WHERE form that SQLite-based tooling produces cannot be roundtripped
+through Turso's VACUUM.
+
+
