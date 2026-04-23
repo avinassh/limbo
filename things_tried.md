@@ -497,3 +497,138 @@ user-visible problem: change_counter rewinds confuse tooling (17), WITHOUT ROWID
 source DBs can't be VACUUMed at all (18), `.db-wal` sidecar breaks single-file
 backup assumptions (19), parse-time failure leaks dest files (20), journal_mode
 header bytes silently differ from SQLite's output (21).
+
+
+## Session 6
+
+### 28. `PRAGMA auto_vacuum=MODE; VACUUM;` does not apply pending mode
+Tested both enabling (source auto_vacuum=NONE, pragma=FULL, VACUUM) and
+disabling (source auto_vacuum=FULL via SQLite-created DB, pragma=NONE,
+VACUUM). In both directions Turso preserves the source's on-disk auto_vacuum
+mode, ignoring the pending pragma override. Header byte 52
+(`largest_root_btree_page`) is unchanged after VACUUM. SQLite treats this
+pragma-plus-VACUUM pair as the documented way to change modes on an
+existing DB. Turso's silent no-op leaves portable code broken. Logged as
+Bug 22. The underlying getter `source_pager.get_auto_vacuum_mode()` used
+in `target_auto_vacuum_mode` reads the pager's current mode rather than
+the pending override.
+
+### 29. VACUUM INTO emits phantom CDC commit marker that never lands on disk
+Extension of Bug 16. The source connection's CDC machinery writes a
+`change_type=2` commit marker when VACUUM INTO's implicit `COMMIT` fires,
+but the row is never durable. `PRAGMA wal_checkpoint(FULL)` in the same
+session already reveals its absence (row count goes 3→2). Reopening the
+DB in a fresh Turso process, or reading via `sqlite3`, confirms only the
+genuine INSERT and its commit marker are on disk. CDC consumers observing
+through a separate tailer see 2 rows; the connection that ran VACUUM INTO
+observes 3 until it issues any real write or a checkpoint. Subsequent
+real writes in the same session make the phantom row durable
+retroactively — so the bug only surfaces when VACUUM INTO is the last
+write on the connection or when cache invalidation happens first. Logged
+as Bug 23.
+
+### 30. VACUUM fails after ALTER TABLE RENAME COLUMN on expression indexes and COLLATE indexes
+Tested:
+- `CREATE INDEX ix ON t(old_col * 2)` → after RENAME COLUMN → stored SQL stays `(old_col * 2)` (stale)
+- `CREATE INDEX ix ON t(old_col COLLATE BINARY)` → stays `(old_col COLLATE BINARY)` (stale)
+- `CREATE INDEX ix ON t(old_col)` → correctly updated to `(new_col)` ✓
+- `CREATE INDEX ix ON t(b) WHERE old_col > 0` → correctly updated ✓
+- `CHECK(old_col > 0)` in table → correctly updated ✓
+- `GENERATED ALWAYS AS (old_col * 2)` → correctly updated ✓
+- FK `REFERENCES p(old_col)` → correctly updated ✓
+- Trigger body `NEW.old_col` → correctly updated ✓
+- View `SELECT old_col FROM t` → correctly updated ✓
+
+So ALTER TABLE RENAME COLUMN only misses two specific shapes of CREATE
+INDEX — expression column list entries and column-COLLATE suffixes.
+Once the stale SQL is in sqlite_master, VACUUM's target build replays
+the CREATE INDEX via `prepare()` on the target, which rejects the stale
+column name with "invalid expression in CREATE INDEX". VACUUM and
+VACUUM INTO both fail on the same parse; VACUUM INTO additionally
+leaks a 4-KB partial destination (Bug 14/20 family cleanup gap).
+Logged as Bug 24. ALTER RENAME COLUMN side of the issue logged as
+unrelated bug U17.
+
+### 31. Other things tried, no new bug
+- VACUUM of MVCC source with uncheckpointed writes → works (VACUUM INTO
+  captures the logical state correctly)
+- VACUUM + sqlite_sequence with NULL seq → overwritten to 1 (extension of
+  Bug 6, already noted in session 3)
+- VACUUM with source mixed-case table name → sqlite_sequence.name also
+  lowercased (extension of U9)
+- VACUUM with source containing `turso_cdc` table — CDC table preserved
+  across VACUUM INTO; `turso_cdc_version` preserved intact
+- `CREATE TEMP VIEW` persists as a permanent view in main sqlite_master
+  (unrelated to VACUUM — logged as U15)
+- `ALTER TABLE ADD COLUMN ... GENERATED AS (...) VIRTUAL` drops the
+  VIRTUAL keyword from stored SQL; CREATE TABLE at schema-creation time
+  preserves it. Not a VACUUM bug but surfaces in post-VACUUM schema
+  (logged as U16)
+- VACUUM with many ALTER TABLE RENAME + ADD + DROP sequence → schema
+  consistent post-VACUUM
+- VACUUM + INSTEAD OF triggers on views → feature not supported in Turso
+- VACUUM + RECURSIVE CTE stored view → CREATE VIEW accepts, query
+  rejects; VACUUM preserves the view definition unchanged
+- VACUUM with source having CREATE VIRTUAL TABLE for fts5 module →
+  module not registered, source can't be created
+- VACUUM + FTS index method (`USING fts`) → preserved end-to-end in
+  both in-place and INTO; post-VACUUM fts_match() still works on dest
+- VACUUM + FTS + DELETE from base table → index correctly updated
+- VACUUM with concurrent VACUUM INTO from two processes → one wins,
+  other fails with "output file already exists"
+- VACUUM INTO with concurrent INSERT on another connection → both
+  succeed (VACUUM uses source read-only snapshot)
+- VACUUM INTO via `/dev/shm` cross-mount → works
+- VACUUM INTO with path containing single space `' '` → created as
+  file named ' ' (relative to CWD)
+- VACUUM INTO FIFO / existing char device / directory → rejected by
+  existence check (Bug 12 family)
+- VACUUM with AUTOINCREMENT sequence=INT64_MAX → VACUUM preserves
+  the max-seq; next AUTOINCREMENT insert fails with "database is full"
+  (same behavior as SQLite)
+- VACUUM + negative rowids with explicit IPK → preserved
+- VACUUM + compound PK with REAL + TEXT columns → preserved
+- VACUUM + CREATE INDEX with NULLS LAST / CASE + COLLATE → preserved
+- VACUUM + very long column name (1000 chars) → preserved
+- VACUUM + reserved keyword column names ("order", "select", "table") → preserved
+- VACUUM + numeric DEFAULT (hex, unary-minus, negative) → preserved
+- VACUUM + CHECK constraint with julianday / CAST / IIF / IN list → preserved
+- VACUUM + CTAS from view → schema reformatted at table-definition level
+  (U3 family)
+- VACUUM + orphan sqlite_stat1 rows for dropped indexes / tables → preserved (U12)
+- VACUUM + wal_checkpoint(PASSIVE) right before VACUUM → works
+- VACUUM + PRAGMA temp_store=MEMORY per-conn → per-conn, preserved
+- VACUUM of DB where source has views + partial indexes + expression
+  indexes + CHECK + FK simultaneously → no additional bugs observed
+- VACUUM of SQLite-created DB with PRAGMA wal_autocheckpoint=0 →
+  opens and VACUUMs fine on Turso
+- VACUUM + incremental_vacuum mode source → correctly rejected by
+  `reject_unsupported_vacuum_auto_vacuum_mode`
+- VACUUM of attached DB via `VACUUM aux INTO '...'` → captures only
+  aux contents (not main), as expected
+- VACUUM with sqlite_sequence rows with NULL seq, NULL name, empty name,
+  duplicate names → preserved through VACUUM (only integer seq gets
+  clobbered per Bug 6)
+- VACUUM with `CREATE INDEX ix ON t USING fts (...)` → FTS backing
+  btree table preserved; searches work post-VACUUM
+- Trigger execution ordering: SQLite and Turso both fire triggers in
+  REVERSE creation order (highest rowid first). VACUUM preserves the
+  rowid order, so firing order is stable across VACUUM
+- VACUUM + WINDOW function view / DISTINCT view / UNION view →
+  preserved
+- VACUUM + BEFORE UPDATE OF multi-col trigger → preserved
+- VACUUM + RAISE(FAIL), RAISE(ABORT) in trigger → preserved
+- VACUUM + ALTER TABLE ADD COLUMN REFERENCES + FK ON DELETE CASCADE → preserved
+- VACUUM + table with 20-column composite index → preserved
+- VACUUM + table with 500 triggers on same event → preserved
+- VACUUM + 200 table schema (many tables) → works
+- VACUUM with encrypted source → in-place stays encrypted; VACUUM INTO
+  produces plaintext with source's reserved_space preserved (dest has
+  wasted reserved space per page) — reconfirms Bug 5 with new detail
+- VACUUM + ATTACH → main VACUUM unaffected; aux VACUUM rejected; aux
+  INTO works
+- VACUUM of huge blob (1MB randomblob) → overflow pages preserved
+- VACUUM of binary BLOB with embedded NUL / magic-bytes-like content → preserved
+
+Bugs 22-24 all logged as new VACUUM bugs this session. Also logged
+unrelated bugs U15, U16, U17.

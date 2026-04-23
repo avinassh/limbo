@@ -779,3 +779,167 @@ file and Bug 17's reset change_counter, the Turso VACUUM INTO output
 diverges from SQLite's in three independent ways, all pointing to the
 destination being "a fresh Turso DB that happens to contain the source's
 user data" rather than "a self-similar copy of the source."
+
+## Bug 22: `PRAGMA auto_vacuum=MODE; VACUUM` does not apply the pending mode change
+
+**Location**: `core/vdbe/vacuum.rs::VacuumInPlacePhase::ReadSourceMetadata` and
+`core/vdbe/execute.rs::VacuumIntoOpPhase::Init`. Both paths compute
+`target_auto_vacuum_mode = source_pager.get_auto_vacuum_mode()` which
+ignores any `PRAGMA auto_vacuum=...` pending from the same connection.
+
+The SQLite-documented way to change auto_vacuum mode on an existing
+database is `PRAGMA auto_vacuum = <mode>; VACUUM;`. Turso silently
+accepts the pragma (its getter returns the new value) but the subsequent
+VACUUM reads the *source pager's current mode* rather than the pending
+override, so the mode never actually changes on disk. This is distinct
+from U2 (which is about the pragma by itself being ineffective on fresh
+DBs) because here the pragma + VACUUM pair is explicitly the vector that
+SQLite designates for an on-disk mode change.
+
+**Reproduction** (enable auto_vacuum):
+```
+$ tursodb --experimental-autovacuum x.db \
+    "CREATE TABLE t(a); INSERT INTO t VALUES(1),(2);
+     PRAGMA auto_vacuum=FULL; VACUUM; PRAGMA auto_vacuum;"
+0
+$ xxd -s 52 -l 4 x.db     # largest_root_btree_page header field
+00000034: 0000 0000     ← auto_vacuum mode byte still 0 (NONE)
+# SQLite on equivalent input: 00000034: 0000 0003 (auto_vacuum=FULL)
+```
+
+**Reproduction** (disable auto_vacuum — source started with FULL via
+sqlite3):
+```
+$ sqlite3 av.db "PRAGMA auto_vacuum=FULL; CREATE TABLE t(a);
+                 INSERT INTO t VALUES(1);"
+$ xxd -s 52 -l 4 av.db     # 00000003 (FULL)
+$ tursodb --experimental-autovacuum av.db \
+    "PRAGMA auto_vacuum=NONE; VACUUM; PRAGMA auto_vacuum;"
+1
+$ xxd -s 52 -l 4 av.db     # 00000003 (still FULL)
+# SQLite on same input correctly switches to 0 (NONE)
+```
+
+**Impact**: The pragma-plus-VACUUM workflow to change auto_vacuum mode
+is silently ineffective. Portable code that moves a database between
+modes via this documented recipe will keep whatever mode the database
+was in, with no error or warning. Combined with `reject_unsupported_vacuum_auto_vacuum_mode`
+(which blocks VACUUM on incremental-vacuum source DBs), users who want
+to downgrade an incremental-vacuum DB to FULL or NONE have no working
+path on Turso.
+
+## Bug 23: VACUUM INTO's spurious CDC commit marker is a connection-visible phantom row that never lands on disk
+
+**Location**: Extension of Bug 16 (`core/vdbe/execute.rs::op_vacuum_into_inner`
+`VacuumIntoOpPhase::Init` `BEGIN` and `::Done` `COMMIT`). The source
+connection's CDC machinery writes a `change_type=2` commit marker row
+when the source's wrapping `COMMIT` fires, but that row never makes it
+to the persistent `turso_cdc` btree — only the connection's in-memory
+view of `turso_cdc` shows it.
+
+Bug 16 observed that VACUUM INTO adds a CDC commit marker. This bug
+goes further: that marker is **not durable**. A `PRAGMA wal_checkpoint(FULL)`,
+a connection close / reopen, or a second Turso process all reveal that
+the row is absent. Other CDC rows emitted by real INSERTs in the same
+session are durable; only VACUUM INTO's marker is phantom.
+
+**Reproduction**:
+```
+$ tursodb /tmp/c.db "
+  CREATE TABLE t(a);
+  PRAGMA unstable_capture_data_changes_conn='full';
+  INSERT INTO t VALUES(1);
+  VACUUM INTO '/tmp/out.db';
+  SELECT count(*) FROM turso_cdc;        -- 3  (INSERT + its commit + VACUUM-INTO commit)
+  PRAGMA wal_checkpoint(FULL);
+  SELECT count(*) FROM turso_cdc;"       -- 2  (checkpoint reveals the phantom)
+
+$ tursodb /tmp/c.db 'SELECT count(*) FROM turso_cdc;'
+2                                        -- fresh connection: only 2 rows on disk
+
+$ sqlite3 /tmp/c.db 'SELECT change_id FROM turso_cdc;'
+1
+2                                        -- SQLite confirms: row 3 never persisted
+```
+
+The connection that ran VACUUM INTO observes a CDC stream with three
+rows before the checkpoint and two rows afterwards. If a subsequent
+user-level write commits in the same session, the commit marker row
+*does* become durable (via the next write's own commit path), so the
+bug is invisible under workloads that don't idle immediately after
+VACUUM INTO.
+
+**Impact**: CDC consumers see inconsistent row counts depending on
+whether they read through the connection that ran VACUUM INTO or
+through a separate connection / process. Replication and audit tools
+observe a phantom commit marker that disappears on re-read, breaking
+the "CDC log entries are append-only and durable once observed"
+invariant. The inconsistency compounds across connections: an operator
+running `VACUUM INTO` and immediately querying `turso_cdc` sees a row
+that an external CDC tailer will never see.
+
+## Bug 24: VACUUM fails after `ALTER TABLE RENAME COLUMN` on a column referenced by an expression index or a `COLLATE` clause
+
+**Location**: `ALTER TABLE RENAME COLUMN` implementation (pre-existing
+bug) does not update the stored CREATE INDEX SQL for two specific index
+shapes: expression indexes (`CREATE INDEX ix ON t(col * 2)`) and
+column-with-COLLATE indexes (`CREATE INDEX ix ON t(col COLLATE BINARY)`).
+When VACUUM later tries to replay the stale CREATE INDEX against the
+renamed table, the target connection fails to parse the stale column
+reference and aborts the whole VACUUM.
+
+ALTER TABLE RENAME COLUMN correctly updates:
+- Direct column references in index column lists (`(col)`)
+- Partial index WHERE clauses (including complex ones with parens)
+- CHECK constraints (including compound expressions)
+- Trigger bodies
+- Generated column expressions
+- FOREIGN KEY references
+
+But not:
+- Index expression list entries like `col * 2`, `printf('%d', col)`, `(a + b)`
+- Index column list entries with `col COLLATE ...` suffixes
+
+**Reproduction**:
+```
+$ tursodb x.db "
+  CREATE TABLE t(old_col INTEGER, b TEXT);
+  CREATE INDEX ix_expr    ON t(old_col * 2);
+  CREATE INDEX ix_collate ON t(old_col COLLATE BINARY);
+  INSERT INTO t VALUES (1, 'x');
+  ALTER TABLE t RENAME COLUMN old_col TO new_col;
+  SELECT sql FROM sqlite_master;"
+CREATE TABLE t (new_col INTEGER, b TEXT)
+CREATE INDEX ix_expr ON t (old_col * 2)             -- stale, still old_col
+CREATE INDEX ix_collate ON t (old_col COLLATE BINARY) -- stale, still old_col
+
+$ tursodb x.db "VACUUM;"
+Error: Parse error: Error: invalid expression in CREATE INDEX: old_col * 2
+```
+
+The database is still queryable — the indexes work for reads because
+Turso's runtime resolves columns against the current table schema —
+but VACUUM is broken for the lifetime of the database. VACUUM INTO has
+the same failure and leaves a 4-KB partial destination file behind
+(Bug 14/20 family cleanup gap).
+
+Verified with SQLite as oracle:
+```
+$ sqlite3 y.db "CREATE TABLE t(old_col INTEGER, b TEXT);
+                CREATE INDEX ix_expr    ON t(old_col * 2);
+                CREATE INDEX ix_collate ON t(old_col COLLATE BINARY);
+                ALTER TABLE t RENAME COLUMN old_col TO new_col;
+                SELECT sql FROM sqlite_master;"
+CREATE TABLE t(new_col INTEGER, b TEXT)
+CREATE INDEX ix_expr ON t(new_col * 2)                -- correctly updated
+CREATE INDEX ix_collate ON t(new_col COLLATE BINARY)  -- correctly updated
+```
+
+**Impact**: A user whose schema uses expression or COLLATE indexes on
+any column that ever gets renamed hits a permanent VACUUM block. The
+database remains serviceable for normal queries, but regular
+maintenance (VACUUM, VACUUM INTO for backup) cannot run without a
+manual schema-repair (drop and recreate each offending index). The bug
+composes nastily with Bug 20: VACUUM INTO against such a database
+leaks the destination file AND blocks retries until the operator
+unlinks the leaked output.

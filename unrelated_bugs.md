@@ -223,3 +223,94 @@ Not a VACUUM bug — surfaces on any DELETE attempt — but it blocks the
 standard SQLite pattern of "delete orphan sqlite_sequence rows before
 VACUUM" that users sometimes run to clean up after DROP TABLE on an
 AUTOINCREMENT table.
+
+## U15: `CREATE TEMP VIEW` is stored as a permanent main-schema view
+
+```
+$ tursodb x.db "CREATE TABLE t(a);
+                CREATE TEMP VIEW tv AS SELECT a*10 FROM t;
+                INSERT INTO t VALUES (1),(2);
+                SELECT type, name FROM sqlite_master;
+                SELECT type, name FROM sqlite_temp_master;"
+table|t
+view|tv          ← wrong: should be in temp schema only
+(temp_master: empty)
+```
+
+SQLite correctly places `tv` in `sqlite_temp_master` (the TEMP schema
+is destroyed on connection close). Turso instead writes the view to
+the persistent `sqlite_master`, so the "temp" view survives across
+processes and becomes a normal on-disk view. `CREATE TEMP TABLE` is
+handled correctly (temp schema only); the bug is specific to views.
+
+Not a VACUUM bug, but it interacts with VACUUM badly: VACUUM reads
+from main `sqlite_master`, sees the misfiled "temp" view, and copies
+it forward into the destination. So any VACUUM (in-place or INTO) of
+a database where a user ever ran `CREATE TEMP VIEW` carries that view
+forward into the cleaned copy, long after the user intended it to be
+dropped.
+
+## U16: `ALTER TABLE ADD COLUMN ... GENERATED ALWAYS AS (...) VIRTUAL` drops the `VIRTUAL` keyword from the stored CREATE TABLE SQL
+
+```
+$ tursodb x.db "
+  CREATE TABLE t(a INTEGER);
+  INSERT INTO t VALUES(5);
+  ALTER TABLE t ADD COLUMN b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL;
+  SELECT sql FROM sqlite_master;"
+CREATE TABLE t (a INTEGER, b INTEGER AS (a * 2))     ← missing VIRTUAL
+
+$ tursodb y.db "
+  CREATE TABLE t(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+  SELECT sql FROM sqlite_master;"
+CREATE TABLE t (a INTEGER, b INTEGER AS (a * 2) VIRTUAL)   ← correct
+```
+
+`CREATE TABLE` preserves the `VIRTUAL` keyword; `ALTER TABLE ADD
+COLUMN` of the same declaration does not. The column still *behaves*
+virtually (inserts into it are rejected with "cannot INSERT into
+generated column"), so the only user-visible effect is the malformed
+stored SQL. But VACUUM replays that malformed SQL verbatim, so the
+post-VACUUM schema continues to miss the `VIRTUAL` suffix.
+
+Not a VACUUM bug, but surfaces via VACUUM because post-VACUUM
+introspection (e.g., schema diff tools, dump/restore pipelines) sees
+a schema that's missing the storage kind annotation on generated
+columns added via ALTER.
+
+## U17: `ALTER TABLE RENAME COLUMN` does not update stale column references in stored `CREATE INDEX` SQL for expression and COLLATE indexes
+
+SQLite's `ALTER TABLE RENAME COLUMN` rewrites every stored SQL string
+that references the renamed column — table SQL, index SQL, trigger
+bodies, view SELECTs, FK clauses. Turso's implementation updates
+most of these but misses two shapes of CREATE INDEX:
+
+- Expression indexes: `CREATE INDEX ix ON t(col * 2)` stays as
+  `col * 2` instead of becoming `new_col * 2`.
+- Column-with-COLLATE indexes: `CREATE INDEX ix ON t(col COLLATE BINARY)`
+  stays as `col COLLATE BINARY` instead of `new_col COLLATE BINARY`.
+
+```
+$ tursodb x.db "
+  CREATE TABLE t(old_col INTEGER, b TEXT);
+  CREATE INDEX ix_expr    ON t(old_col * 2);
+  CREATE INDEX ix_collate ON t(old_col COLLATE BINARY);
+  ALTER TABLE t RENAME COLUMN old_col TO new_col;
+  SELECT sql FROM sqlite_master;"
+CREATE TABLE t (new_col INTEGER, b TEXT)                     ← updated
+CREATE INDEX ix_expr ON t (old_col * 2)                      ← NOT updated
+CREATE INDEX ix_collate ON t (old_col COLLATE BINARY)        ← NOT updated
+```
+
+SQLite correctly rewrites both. Turso's schema becomes internally
+inconsistent: the table has column `new_col`, the indexes reference
+`old_col`. The indexes continue to function at query time because
+Turso's runtime resolves column names against the current schema, so
+the bug is silent for most users. It turns lethal at VACUUM time — see
+`vacuum_bugs.md` Bug 24.
+
+Same class of bug: the `name` column in sqlite_sequence rows for
+AUTOINCREMENT tables is stored in lowercase (U9 family — we observed
+that `CREATE TABLE MyTable(id INTEGER PRIMARY KEY AUTOINCREMENT);`
+followed by `INSERT` leaves `sqlite_sequence.name='mytable'` rather
+than SQLite's `'MyTable'`).
