@@ -145,3 +145,27 @@ about the WAL file coordination mechanism, and it surfaces for every open
 failure (parent directory missing, unsupported URI path, etc.). This is an
 extension of U4 — now observed in three distinct paths — suggesting the
 error lives in a generic `statfs` wrapper that all file opens go through.
+
+## U12: DROP TABLE / DROP INDEX doesn't clean up sqlite_stat1 rows
+
+SQLite removes stat1 rows when the owning table or index is dropped, so
+`sqlite_stat1` never accumulates entries for objects that no longer exist.
+Turso's DROP doesn't touch `sqlite_stat1`, so stale rows accumulate for
+any object that was ANALYZEd before being dropped.
+
+```
+CREATE TABLE t1(a);
+CREATE INDEX ix1 ON t1(a);
+INSERT INTO t1 VALUES(1);
+ANALYZE;
+DROP TABLE t1;
+SELECT * FROM sqlite_stat1;
+-- SQLite: no rows
+-- Turso:  t1||1, t1|ix1|1 1   (stale rows for dropped table)
+```
+
+Same behaviour for `DROP INDEX`. Not a VACUUM bug — happens independent of
+VACUUM — but VACUUM happily copies the stale stat rows to the target, so a
+database that survives a VACUUM carries the extra `sqlite_stat1` footprint
+forward. Caught while comparing `sqlite_stat1` contents between source and
+VACUUM target.

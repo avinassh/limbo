@@ -297,3 +297,86 @@ is still in sqlite_master. `VACUUM INTO` on the same source is unaffected
 - Stack overflow on INSERT with a CHECK containing ~80 `AND`-combined sub-expressions
   — unrelated to VACUUM but VACUUM would hit it on any DB that contains such schema
 - VACUUM INTO under readonly source — rejected with appropriate error
+
+
+## Session 4
+
+### 20. VACUUM INTO adds spurious CDC commit marker on source
+Running VACUUM INTO from a connection with CDC enabled
+(`PRAGMA unstable_capture_data_changes_conn='full'`, same for `'before'`,
+`'after'`, `'id'`) adds a new `change_type=2` (commit marker) row to the
+source's `turso_cdc` table. Reproduces even when no data was inserted since
+enabling CDC — the bare `BEGIN`/`COMMIT` wrapped around the VACUUM INTO copy
+trips the source's CDC commit-record emission path. In-place `VACUUM` on the
+same source does **not** add a CDC record (it uses a lower-level WAL commit
+that bypasses CDC). Repeated `VACUUM INTO` calls append one commit marker
+each, so 2 calls in a row take the CDC count from N → N+2. Logged as Bug 16.
+
+### 21. DROP TABLE / DROP INDEX leave stale sqlite_stat1 rows
+Not a VACUUM bug but surfaced while comparing sqlite_stat1 across VACUUM.
+SQLite cleans stat rows for the dropped object; Turso doesn't, and VACUUM
+copies the stale rows forward. Logged in unrelated_bugs.md as U12.
+
+### 22. Other things tried, no new bug
+- VACUUM with WITHOUT ROWID table — rejected (feature unsupported), unchanged
+- VACUUM with VIRTUAL TABLE USING fts5/rtree — modules not registered
+- VACUUM with CREATE TABLE sqlite_foo — rejected by reserved-prefix check (OK)
+- VACUUM with CREATE TABLE __turso_internal_foo — same, OK
+- VACUUM on :memory: — rejected explicitly; VACUUM INTO from :memory: works
+- VACUUM on readonly connection — rejected; VACUUM INTO works
+- VACUUM inside BEGIN / within txn — rejected (both forms)
+- VACUUM INTO pre-existing .db-wal leftover but fresh .db — succeeds
+- VACUUM INTO to path with URL encoding `%20` — written verbatim, OK
+- VACUUM INTO to path containing single quotes or `~` — Bug 1 / not expanded
+- VACUUM INTO to path via `..` path traversal — resolved, OK
+- VACUUM INTO to symlink/hard-link pointing back to source — rejected as exists
+- VACUUM INTO with PRAGMA query_only=1 — rejected with clean error
+- VACUUM INTO restrictive umask — honors 0077 on the output file
+- Repeated VACUUM on the same DB — schema_version bumps by 1 each time
+- Repeated failed VACUUM (CHECK violation) — source stays usable; no state
+  leaks through to the next attempt (unlike Bug 14's VACUUM INTO path)
+- VACUUM with 500-column table — OK
+- VACUUM with large trigger body (100 statements), 50 triggers on one table,
+  window-function views, CTE-referring views, UNION views — all preserved
+- VACUUM with INSTEAD OF trigger on a view — parser rejects INSTEAD OF
+- VACUUM with FK cycle (A→B, B→A) and FK off — data preserved
+- VACUUM with complex CHECK (CASE / CAST / multi-column) — preserved
+- VACUUM with ALTER ADD COLUMN NOT NULL DEFAULT — preserved
+- VACUUM with ALTER RENAME then DROP then ADD COLUMN chain — OK
+- VACUUM with sqlite_stat1 manually stuffed with non-numeric stat — preserved
+- VACUUM with orphan sqlite_stat1 rows (for missing tables/indexes) — preserved
+- VACUUM with duplicate sqlite_sequence rows (same name) — preserved (matches
+  SQLite behaviour)
+- VACUUM with AUTOINCREMENT sequence set to negative — clobbered to max(rowid)
+  (extension of Bug 6)
+- VACUUM with DEFAULT CURRENT_TIMESTAMP / DEFAULT random() — values not
+  re-evaluated on copy (correct)
+- VACUUM with indexes on generated virtual columns / json_extract / abs/upper
+  expressions — all preserved
+- VACUUM with BLOB primary key, TEXT PK, INTEGER PK ALIAS not first-column
+- VACUUM with very large BLOB (1MB) / many large rows / 100-1000 row tables
+- VACUUM with JSONB values, Inf, NaN, INT64 max/min — preserved
+- VACUUM with rowid aliased by all three (`rowid`,`_rowid_`,`oid`) — preserved
+- VACUUM with PRAGMA cache_size=negative — per-connection, preserved as-is
+- VACUUM with PRAGMA synchronous=EXTRA — preserved
+- VACUUM with PRAGMA locking_mode=EXCLUSIVE — preserved
+- VACUUM with PRAGMA journal_size_limit — pragma unsupported  
+- VACUUM with PRAGMA recursive_triggers — pragma unsupported (U1)
+- VACUUM of DB with CDC-enabled schema — CDC tables + contents preserved
+- VACUUM INTO of DB with CDC — preserves CDC records in target; source gets
+  extra commit-marker row (Bug 16)
+- VACUUM of MVCC DB — in-place demotes to WAL (Bug 15); VACUUM INTO keeps MVCC
+- MVCC VACUUM INTO target's __turso_internal_mvcc_meta starts with
+  persistent_tx_ts_max=2 (own value, not source's). Behaviour OK since target
+  is a fresh file; not flagged as a bug
+- MVCC in-place VACUUM preserves __turso_internal_mvcc_meta row (value=4)
+- User-defined collations/functions aren't directly creatable from SQL, so the
+  `mirror_symbols` path is exercised mainly through built-ins, which work
+- VACUUM INTO output file permissions honour current umask correctly
+- VACUUM INTO of a read-only source connection — succeeds (writes only target)
+- Integrity-check after VACUUM with many rows, deletes, freelist pages — OK
+- VACUUM on DB where only DROP TABLE remains (empty sqlite_sequence) — matches
+  SQLite: empty sqlite_sequence disappears post-VACUUM
+- Rootpage reassignment after VACUUM mirrors SQLite's behaviour (t=2,
+  sqlite_stat1=3, ix=4 when source has indexes+stat1)
+- UNIQUE with many NULLs — preserved (NULL!=NULL per SQL)

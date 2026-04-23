@@ -543,3 +543,40 @@ signal. Correctness-sensitive workloads relying on MVCC could read data under
 incompatible isolation semantics until someone runs `PRAGMA journal_mode='mvcc'`
 again. This is a silent feature downgrade, not a loss of data, but it bypasses
 the consent-required nature of journal_mode changes.
+
+## Bug 16: VACUUM INTO adds a spurious CDC commit-marker record on the source when CDC is enabled
+
+**Location**: `core/vdbe/execute.rs:14404` and `14526` — `op_vacuum_into_inner` wraps the
+operation in a `BEGIN` / `COMMIT` pair on the *source* connection to pin source
+state during the copy. The final `COMMIT` goes through the regular
+transaction-commit machinery, which emits a CDC `change_type=2` (commit-marker)
+row for the source connection's CDC stream. The in-place `VACUUM` path does not
+go through regular `BEGIN`/`COMMIT` on the source (it drives the source
+directly at the WAL layer), so no spurious CDC record is emitted there.
+
+**Reproduction**:
+```
+CREATE TABLE t(a);
+PRAGMA unstable_capture_data_changes_conn='full';
+INSERT INTO t VALUES(1);
+SELECT 'before:', change_id, change_type FROM turso_cdc;
+-- before: (1|1|t), (2|2|)  — INSERT + its commit marker
+VACUUM INTO '/tmp/out.db';
+SELECT 'after:', change_id, change_type FROM turso_cdc;
+-- after:  (1|1|t), (2|2|), (3|2|)  ← new commit marker from VACUUM INTO
+```
+
+The source's `turso_cdc` table has gained a row after a read-only
+maintenance operation that should not have modified any user data. For an
+in-place `VACUUM` in the same scenario the CDC log is unchanged. Each
+subsequent `VACUUM INTO` adds another commit-marker: running it twice in a
+row goes 2 → 3 → 4 CDC rows even though user data never changed.
+
+**Impact**: CDC consumers observing the source's CDC stream see a spurious
+commit marker for every successful `VACUUM INTO`. Tooling that derives
+transaction boundaries from commit markers (replication, logical decoding,
+audit logs) will record phantom transactions tied to backup/maintenance
+operations. The two VACUUM opcodes also diverge in observable side-effects,
+so portability of the "CDC of a read-only operation should be empty"
+invariant depends on which opcode the operator happened to choose.
+Reproduces with every CDC mode (`'id'`, `'before'`, `'after'`, `'full'`).
