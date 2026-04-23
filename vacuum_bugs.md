@@ -580,3 +580,202 @@ operations. The two VACUUM opcodes also diverge in observable side-effects,
 so portability of the "CDC of a read-only operation should be empty"
 invariant depends on which opcode the operator happened to choose.
 Reproduces with every CDC mode (`'id'`, `'before'`, `'after'`, `'full'`).
+
+## Bug 17: VACUUM rewrites header change_counter to 1, losing the source's counter value
+
+**Location**: `core/vdbe/vacuum.rs::VacuumDbHeaderMeta::from_source_header` +
+`apply_to` — the header fields copied by VACUUM do not include
+`change_counter` (offset 24-27) or `version_valid_for` (offset 92-95), and
+the target DB is built with a fresh pager header where `change_counter=1`.
+In-place VACUUM commits the rebuilt image, which overwrites the source's
+page 1 with the target's page 1.
+
+SQLite's VACUUM bumps `change_counter` by 1 (relative to the prior value),
+keeping the invariant that `change_counter` is monotonically non-decreasing
+across every write. This is how SQLite's read transactions detect that the
+database has changed between reads — a cached `change_counter` that is
+less than the current one means "refresh the cache." Turso's VACUUM
+replaces the counter with 1, which can be *lower* than what a process
+observed before the VACUUM.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db "CREATE TABLE t(a); INSERT INTO t VALUES(1);
+                     INSERT INTO t VALUES(2); INSERT INTO t VALUES(3);
+                     /* ... more inserts ... */"
+$ xxd -s 24 -l 4 /tmp/x.db     # change_counter = 0x0b (11)
+00000018: 0000 000b                                ....
+$ tursodb /tmp/x.db "VACUUM;"
+$ xxd -s 24 -l 4 /tmp/x.db     # change_counter = 1 (!)
+00000018: 0000 0001                                ....
+```
+
+The `version_valid_for` field (offset 92) similarly moves from SQLite's
+`change_counter`-tracking value to Turso's hardcoded `0x002e7e58`
+(3047000, the SQLite-3.47.0 library version). Both fields lose their
+SQLite-compatibility semantics.
+
+**Impact**: A concurrent SQLite reader that cached `change_counter=11`
+before Turso's VACUUM will, on its next access, see `change_counter=1`.
+SQLite's read-path logic uses "if cached != current, refresh" — a lower
+current value after a write still triggers a refresh, but tooling that
+reasons about monotonic counters (backup tools, replication cursors,
+monitoring) will misinterpret the reset as a database rewind. Same
+behaviour on both `VACUUM` in-place and `VACUUM INTO` (the destination
+always starts with `change_counter=1`).
+
+## Bug 18: VACUUM fails on SQLite-created databases containing WITHOUT ROWID tables (incl. FTS5/RTREE backing tables)
+
+**Location**: `core/vdbe/vacuum.rs::vacuum_target_build_step` —
+`VacuumTargetBuildPhase::PrepareCreateTable` calls
+`state.target_conn.prepare(sql_str)` on each source-table CREATE
+statement. Turso's parser rejects `WITHOUT ROWID` outright
+(`parser/src/parser.rs`), so the replay of any CREATE TABLE that contains
+that suffix errors out with `"WITHOUT ROWID tables are not supported"`.
+
+This blocks VACUUM on any SQLite-created database that uses WITHOUT ROWID
+tables directly, and also on any database that uses FTS5 or RTREE — both
+of which create WITHOUT ROWID backing tables (`fts_idx`, `fts_config`,
+etc.) as part of their virtual-table bootstrap. Turso can open and even
+modify such a database partway (SELECT from unrelated tables, create new
+user tables), because the schema-load path skips unparseable tables
+rather than failing the open; but VACUUM tries to re-create every
+storage-backed table via `prepare()`, which hits the WITHOUT ROWID
+rejection and aborts.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/fts.db "CREATE VIRTUAL TABLE fts USING fts5(c);
+                       INSERT INTO fts VALUES('hello');"
+$ tursodb /tmp/fts.db "SELECT type, name FROM sqlite_master;"
+# Turso prints: fts, fts_data, fts_idx, fts_content, fts_docsize, fts_config
+# (fts_idx and fts_config are WITHOUT ROWID backing tables)
+$ tursodb /tmp/fts.db "VACUUM;"
+Error: Parse error: WITHOUT ROWID tables are not supported
+
+$ sqlite3 /tmp/user_wor.db "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;
+                            INSERT INTO t VALUES(1, 'hello');"
+$ tursodb /tmp/user_wor.db "VACUUM;"
+Error: Parse error: WITHOUT ROWID tables are not supported
+```
+
+Same failure on `VACUUM INTO` — the destination file is left behind at
+its partial-build size (extension of Bug 14).
+
+**Impact**: Users migrating from or interoperating with SQLite cannot run
+VACUUM/VACUUM INTO on any database that contains WITHOUT ROWID tables —
+including the FTS5/RTREE backing tables they never explicitly created.
+Because Turso otherwise presents these databases as partially-usable
+(sqlite_master reads return the rows, unrelated tables are writable),
+users can accumulate work into such a database and only discover the
+VACUUM gap at maintenance time, with no clean workaround short of
+migrating the data to a fresh database.
+
+## Bug 19: VACUUM INTO writes an extra empty `.db-wal` sidecar file to the destination path
+
+**Location**: `core/vdbe/execute.rs::op_vacuum_into_inner`
+(`VacuumIntoOpPhase::Init`) — the output database is opened with Turso's
+default WAL mode, which allocates and persists a WAL sidecar file even
+when zero frames are committed to it. `finalize_vacuum_into_output`
+runs a TRUNCATE checkpoint, but the WAL file itself is retained as a
+zero-byte sidecar after the handle is closed.
+
+SQLite's `VACUUM INTO` produces only the `.db` file — the destination
+opens in the default rollback-journal mode and the journal file is
+deleted after each statement. Turso's destination opens in WAL mode
+regardless of whether the source was in WAL or rollback mode, so the
+destination directory ends up with both `dest.db` and `dest.db-wal`.
+
+**Reproduction**:
+```
+$ tursodb /tmp/src.db "CREATE TABLE t(a); INSERT INTO t VALUES(1);"
+$ tursodb /tmp/src.db "VACUUM INTO '/tmp/dst.db';"
+$ ls -la /tmp/dst.db*
+-rw-rw-r-- 1 ubuntu ubuntu 8192 /tmp/dst.db
+-rw-rw-r-- 1 ubuntu ubuntu    0 /tmp/dst.db-wal
+
+$ sqlite3 /tmp/src.db "VACUUM INTO '/tmp/sq_dst.db';"
+$ ls -la /tmp/sq_dst.db*
+-rw-rw-r-- 1 ubuntu ubuntu 8192 /tmp/sq_dst.db
+# (no -wal file)
+```
+
+**Impact**: Portable backup scripts that stream the `.db` file to cloud
+storage or compress it as a single artifact miss the `.db-wal` sidecar.
+The sidecar is empty and technically safe to drop, but its mere
+existence surprises users who expect VACUUM INTO to produce a single
+self-contained file (as SQLite does). Tooling that uses the dest path to
+detect "did the VACUUM finish cleanly?" (via mtime or size checks) will
+see the `.db-wal` and misdiagnose incomplete-backup. Because Turso also
+defaults to WAL mode, the journal_mode bytes (offset 18-19) in the dest
+header are `02 02` regardless of the source's journal mode — a related
+divergence from SQLite's `VACUUM INTO`, which always produces a rollback
+-journal destination (`01 01`).
+
+## Bug 20: VACUUM INTO mid-copy failure from parser rejection leaks the destination file (extension of Bug 14)
+
+**Location**: `core/vdbe/execute.rs::cleanup_op_vacuum_into` — the same
+cleanup gap as Bug 14, but triggered by the target build's parser
+(Bug 18) rather than by a runtime constraint violation (Bug 11).
+
+**Reproduction** (re-using Bug 18's failure trigger):
+```
+$ sqlite3 /tmp/fts.db "CREATE VIRTUAL TABLE fts USING fts5(c);
+                       INSERT INTO fts VALUES('hello');"
+$ tursodb /tmp/fts.db "VACUUM INTO '/tmp/fts_dst.db';"
+Error: Parse error: WITHOUT ROWID tables are not supported
+$ ls -la /tmp/fts_dst.db*
+-rw-rw-r-- 1 ubuntu ubuntu 4096 /tmp/fts_dst.db       # leaked
+-rw-rw-r-- 1 ubuntu ubuntu    0 /tmp/fts_dst.db-wal   # leaked
+
+$ tursodb /tmp/fts.db "VACUUM INTO '/tmp/fts_dst.db';"
+Error: Parse error: output file already exists: /tmp/fts_dst.db
+```
+
+**Impact**: Same retry-unfriendly state as Bug 14: a failed VACUUM INTO
+leaves the destination half-built and blocks subsequent attempts with
+the "already exists" preflight. The cleanup function's scope needs to
+cover target-build parse errors, not just runtime failures. Together
+with Bug 18, this means users with FTS5/RTREE-using databases hit a
+double footgun: VACUUM INTO can't finish, AND retry fails until the
+operator manually deletes the leaked output.
+
+## Bug 21: VACUUM INTO destination file is opened in WAL journal mode, so bytes 18/19 of the output header differ from any SQLite-created source
+
+**Location**: `core/vdbe/execute.rs::op_vacuum_into_inner`
+(`VacuumIntoOpPhase::Init`) — when the output is opened via
+`Database::open_file_with_flags`, Turso's default pager-opens-WAL policy
+applies; there's no "honour the source's journal mode" code path. The
+file-format-write-version / file-format-read-version bytes (offsets 18
+and 19 of the SQLite header, per <https://www.sqlite.org/fileformat.html>)
+are always written as `02 02` on the destination.
+
+SQLite's `VACUUM INTO` writes `01 01` to the destination (rollback mode)
+regardless of the source. This field is a *self-describing* hint about
+the journal mode used at file creation; SQLite will continue to upgrade
+the bytes when WAL mode is enabled on the resulting file.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/src.db "CREATE TABLE t(a); INSERT INTO t VALUES(1);"
+$ xxd -s 16 -l 4 /tmp/src.db     # src: 1000 0101 (page_size=4096, rollback)
+
+$ tursodb /tmp/src.db "VACUUM INTO '/tmp/turso_dst.db';"
+$ xxd -s 16 -l 4 /tmp/turso_dst.db
+# 1000 0202 (WAL)
+
+$ sqlite3 /tmp/src.db "VACUUM INTO '/tmp/sqlite_dst.db';"
+$ xxd -s 16 -l 4 /tmp/sqlite_dst.db
+# 1000 0101 (rollback, preserving the source)
+```
+
+**Impact**: Users who run `VACUUM INTO` expecting a bit-identical copy of
+the source header (for cross-platform backup, or for tooling that reads
+raw header bytes) will see a file-format-version mismatch. The dest
+still parses correctly in SQLite — WAL-tagged headers are valid there —
+so the divergence is silent: `diff` on the two headers reveals it only
+to someone who already suspects it. Combined with Bug 19's sidecar
+file and Bug 17's reset change_counter, the Turso VACUUM INTO output
+diverges from SQLite's in three independent ways, all pointing to the
+destination being "a fresh Turso DB that happens to contain the source's
+user data" rather than "a self-similar copy of the source."

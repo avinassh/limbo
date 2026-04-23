@@ -380,3 +380,120 @@ copies the stale rows forward. Logged in unrelated_bugs.md as U12.
 - Rootpage reassignment after VACUUM mirrors SQLite's behaviour (t=2,
   sqlite_stat1=3, ix=4 when source has indexes+stat1)
 - UNIQUE with many NULLs — preserved (NULL!=NULL per SQL)
+
+
+## Session 5
+
+### 23. change_counter (header offset 24-27) reset to 1 by Turso VACUUM
+SQLite's VACUUM bumps change_counter by 1; Turso's VACUUM writes
+`change_counter=1` to the new page 1 regardless of the source's value.
+Verified with a SQLite-created DB whose change_counter was `0x0b` (11);
+after Turso VACUUM the bytes are `0x01`. `version_valid_for` (offset 92)
+also shifts from SQLite's counter-tracking value to Turso's hardcoded
+`0x002e7e58` (3047000, SQLite 3.47.0 version). Logged as Bug 17. Note
+Turso doesn't increment change_counter on regular writes either, so the
+general "counter frozen at 1" is a broader Turso issue — but VACUUM
+*overwrites* a higher counter with 1, so the specific rewind behaviour is
+VACUUM-only.
+
+### 24. VACUUM on DB with WITHOUT ROWID tables (SQLite, FTS5/RTREE backing)
+Replay-time CREATE TABLE parser rejects `WITHOUT ROWID` (Turso doesn't
+support that clause). A SQLite-created DB with FTS5 or RTREE creates
+backing tables with `WITHOUT ROWID` suffix in their CREATE SQL; Turso
+reads these via sqlite_master fine but VACUUM fails with
+"WITHOUT ROWID tables are not supported". Logged as Bug 18. Verified also
+for plain user-created `WITHOUT ROWID` tables. Same failure on VACUUM INTO,
+which also leaves the partial dest file (Bug 14 cleanup gap, formalized
+separately as Bug 20).
+
+### 25. VACUUM INTO leaves `.db-wal` sidecar in output dir
+Turso's destination opens in WAL mode by default, producing a
+`dest.db-wal` file alongside `dest.db`. SQLite's VACUUM INTO produces
+only `dest.db` (rollback journal mode). Logged as Bug 19. Related:
+the destination's journal_mode header bytes (offset 18-19) are always
+`02 02` in Turso vs `01 01` in SQLite — logged separately as Bug 21
+because the header divergence is observable even after unlinking the
+sidecar.
+
+### 26. Partial dest leak from VACUUM INTO + Bug 18 trigger
+VACUUM INTO on a SQLite DB with FTS5 backing (WITHOUT ROWID) fails at
+the target build's CREATE TABLE step; the destination `.db` (4096 bytes,
+magic header + page-1 stub) and empty `.db-wal` remain on disk. Retry
+fails with "output file already exists". This is Bug 14's cleanup gap
+triggered via a different failure trigger; logged separately as Bug 20
+because it demonstrates the gap is not specific to CHECK constraints.
+
+### 27. Other things tried, no new bug
+- VACUUM INTO across filesystems (tmpfs/dev/shm as dest) — works
+- VACUUM INTO through dangling symlinks — writes to target
+- VACUUM INTO into a path that's a regular file at depth-1 parent — rejected
+- VACUUM INTO into a read-only dir — rejected with "permission denied"
+- `VACUUM INTO ?` parameter binding — rejected at parse (Bug 8)
+- VACUUM with `PRAGMA query_only=1` — rejected cleanly
+- VACUUM with temp_store=MEMORY setting — no effect (still WAL)
+- VACUUM with cache_spill OFF — unsupported pragma
+- VACUUM INTO where source is in-memory (`:memory:`) — output created on disk
+- VACUUM INTO with `--vfs=memory` source — still writes dest to disk
+- VACUUM INTO with `--vfs=syscall` — works
+- VACUUM INTO concurrent attempts on same source — one wins, others Locking error
+- VACUUM INTO during concurrent readonly SELECT — works (VACUUM uses exclusive)
+- VACUUM of a DB with SIGKILL mid-operation — source preserved; dest artifact
+  leaks (Bug 14 family)
+- VACUUM of BLOBs with embedded NULs — bit-preserving
+- VACUUM of huge BLOBs (200000 bytes via randomblob) — preserved
+- VACUUM of sparse rowids (INT64_MAX, 10^12 gaps) — preserved
+- VACUUM of text-affinity columns with mixed types — type preservation works
+- VACUUM with `PRAGMA auto_vacuum=INCREMENTAL` — rejected with InternalError
+- VACUUM of DB with composite PRIMARY KEY — rowid preserved
+- VACUUM of DB with REAL/BLOB PRIMARY KEY — rowid preserved
+- VACUUM of DB with BLOB primary key sort — preserved
+- VACUUM + DEFAULT CURRENT_TIMESTAMP — values preserved (not re-evaluated)
+- VACUUM + DEFAULT subquery expression — rejected at INSERT time (not VACUUM)
+- VACUUM + TEMP TABLE in same session — unaffected (per-connection temp schema)
+- VACUUM + TEMP TRIGGER — survives in sqlite_temp_master
+- VACUUM of MVCC DB without checkpoint — VACUUM INTO works; in-place rejected
+  by preflight check
+- VACUUM preserves column type text with precision (DECIMAL(10,2), etc.)
+- VACUUM preserves STRICT keyword in CREATE TABLE
+- VACUUM preserves bracket-quoted column names (normalized to unquoted form)
+- VACUUM preserves DEFERRABLE/INITIALLY DEFERRED FK clauses
+- VACUUM preserves ON UPDATE CASCADE / ON DELETE CASCADE clauses
+- VACUUM preserves compound PRIMARY KEY + autoindex
+- VACUUM preserves UNIQUE indexes with COLLATE per column
+- VACUUM preserves NULLs in UNIQUE indexes (multiple NULLs allowed)
+- VACUUM preserves JSONB blobs byte-exactly
+- VACUUM preserves -0.0 (though SQLite's display may show as 0.0)
+- VACUUM preserves Inf/NaN/INT64 boundaries
+- VACUUM preserves Unicode table/column names (emoji, CJK)
+- VACUUM preserves ALTER TABLE RENAME/DROP/ADD column chain
+- VACUUM preserves triggers with multi-statement body
+- VACUUM preserves DEFERRED/IMMEDIATE/EXCLUSIVE BEGIN rejection
+- `VACUUM MAIN INTO '...'` works despite `VACUUM MAIN` being case-rejected
+  (Bug 4 discrepancy still present)
+- VACUUM of attached DB via `VACUUM att` rejected; `VACUUM att INTO` works
+- `PRAGMA synchronous` per-conn values not preserved across VACUUM
+- `PRAGMA locking_mode=NORMAL` rejected ("locking_mode must be EXCLUSIVE")
+- VACUUM of tables with very many columns (SQLITE_MAX_COLUMN boundary) — Bug 13
+- VACUUM with multiprocess-WAL source — works; dest has empty -wal but no -tshm
+- Multiple VACUUMs in a row — file stays same size, schema_cookie bumps each time
+- VACUUM with PRAGMA page_size=65536 — 2 pages (128KB file) preserved
+- VACUUM of wide INDEX (26 columns) — preserved
+- VACUUM + expression index on json_extract — preserved
+- VACUUM + partial index with WHERE literal 1=1 — preserved
+- VACUUM + orphan sqlite_stat1 rows for dropped tables — preserved (U12)
+- VACUUM + orphan view (table dropped but view still in sqlite_master) —
+  preserved (matches SQLite)
+- VACUUM + orphan trigger (table dropped from trigger body) — preserved
+- VACUUM + DROP COLUMN referenced in trigger OF clause — allowed; trigger keeps
+  stale column reference (matches SQLite)
+- VACUUM of sqlite_sequence with NULL name / NULL seq / orphan entries — preserved
+- VACUUM preserves INSERT OR REPLACE ON CONFLICT clause in CREATE TABLE
+- CTAS (CREATE TABLE AS SELECT) schema text reformatted after VACUUM (U3 family)
+- VACUUM + PRAGMA encoding='UTF-16le' source — rejected at open (Turso UTF-8 only)
+
+Bugs 17-21 all logged as new VACUUM bugs. Some are divergences from SQLite
+rather than outright breakages, but each has a concrete way to surface as a
+user-visible problem: change_counter rewinds confuse tooling (17), WITHOUT ROWID
+source DBs can't be VACUUMed at all (18), `.db-wal` sidecar breaks single-file
+backup assumptions (19), parse-time failure leaks dest files (20), journal_mode
+header bytes silently differ from SQLite's output (21).

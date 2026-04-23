@@ -169,3 +169,57 @@ VACUUM — but VACUUM happily copies the stale stat rows to the target, so a
 database that survives a VACUUM carries the extra `sqlite_stat1` footprint
 forward. Caught while comparing `sqlite_stat1` contents between source and
 VACUUM target.
+
+## U13: Turso never increments the header `change_counter` on writes
+
+```
+$ sqlite3 /tmp/x.db "CREATE TABLE t(a); INSERT INTO t VALUES(1);
+                     INSERT INTO t VALUES(2); INSERT INTO t VALUES(3);"
+$ xxd -s 24 -l 4 /tmp/x.db    # 0000 0004 (4)  — SQLite bumped on each write
+
+$ tursodb /tmp/x.db "CREATE TABLE u(b); INSERT INTO u VALUES(1);"
+# Turso's change_counter never left 1; SQLite's header bumped to 2 after open.
+```
+
+The SQLite format specification (<https://sqlite.org/fileformat.html>)
+defines `change_counter` at offset 24 as incrementing on each write
+transaction, and pairs with `version_valid_for` at offset 92 to let readers
+detect torn writes. Turso writes a new page-1 header but never increments
+this counter, so both fields stay at their initial values
+(`change_counter=1`, `version_valid_for=3047000` — the SQLite-3.47.0
+library version).
+
+Impact: SQLite readers reuse a cached schema across reads based on
+`change_counter` comparisons. If the on-disk counter equals the cached
+one, SQLite skips re-reading page 1. A Turso writer that never bumps the
+counter means SQLite reader processes can miss schema changes or data
+changes — they'll reuse a stale cache.
+
+Not a VACUUM bug — happens on every write — but VACUUM specifically
+*rewrites* the counter to `1` (see vacuum_bugs.md Bug 17), so a VACUUM
+after a SQLite writer's edits can move the counter *backwards*, which
+breaks SQLite's "monotonic counter" assumption differently from ordinary
+no-op writes.
+
+## U14: `DELETE FROM sqlite_sequence` rejected but `INSERT`/`UPDATE` allowed
+
+```
+$ tursodb x.db "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);
+                 INSERT INTO t VALUES(5);
+                 INSERT INTO sqlite_sequence VALUES('orphan', 100);   -- allowed
+                 UPDATE sqlite_sequence SET seq = 999 WHERE name = 't';  -- allowed
+                 DELETE FROM sqlite_sequence WHERE name = 'orphan';   -- rejected!"
+  × Parse error: table sqlite_sequence may not be modified
+```
+
+SQLite's system tables have a uniform policy: sqlite_sequence is
+modifiable by the user for all DML. Turso permits INSERT and UPDATE but
+specifically rejects DELETE as "may not be modified" — an inconsistent
+split across operations on the same table. Workaround is to `UPDATE
+... SET seq = -1` or similar, but that leaves the row and changes its
+AUTOINCREMENT-counter interpretation.
+
+Not a VACUUM bug — surfaces on any DELETE attempt — but it blocks the
+standard SQLite pattern of "delete orphan sqlite_sequence rows before
+VACUUM" that users sometimes run to clean up after DROP TABLE on an
+AUTOINCREMENT table.
