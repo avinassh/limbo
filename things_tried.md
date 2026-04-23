@@ -207,3 +207,93 @@ Logged as Bug 10.
   producing an unexpected filename. Extension of Bug 1
 
 
+
+
+## Session 3
+
+### 14. CHECK constraint re-enforcement during VACUUM
+Used `PRAGMA ignore_check_constraints=ON` to seed a row that violates a
+column CHECK constraint. Turso's VACUUM fails with the CHECK error on the
+copy INSERT; SQLite's page-level xfer preserves the row. Verified on
+both `VACUUM` and `VACUUM INTO`, and for `ALTER TABLE ADD COLUMN CHECK(...)`
+which can introduce violations that pre-existing rows retain. Setting
+`ignore_check_constraints=ON` in the source connection before VACUUM is
+irrelevant because the VACUUM target connection has its own evaluation
+state. Logged as Bug 11.
+
+### 15. VACUUM INTO destination existence check
+Tested `touch /tmp/out.db` (zero-byte file) then VACUUM INTO into it.
+SQLite fills the zero-byte placeholder; Turso rejects it as "output file
+already exists". Also tested symlinks, FIFOs, directories, chardev-style
+paths (/dev/null) — all rejected by the existence check. Only dangling
+symlinks currently slip through. Logged as Bug 12.
+
+### 16. VACUUM on 2000-column table without INTEGER PRIMARY KEY
+Binary-searched the boundary: 1999 columns works, 2000 fails. Root cause
+is that `build_copy_sql` prepends a rowid pseudo-column so `SELECT` has
+`N+1` columns, exceeding `SQLITE_MAX_COLUMN = 2000`. With an
+INTEGER PRIMARY KEY alias column the rowid is reused instead of
+prepended, so wide tables with an IPK are fine. Logged as Bug 13.
+
+### 17. VACUUM INTO leaves partial destination on mid-copy failure
+Verified via Bug 11's CHECK-failure path. After the error, `/tmp/out.db`
+and `/tmp/out.db-wal` remain on disk (first at 4096 bytes, WAL at 0). The
+next VACUUM INTO call then fails with "output file already exists",
+trapping unattended maintenance scripts. The cleanup function
+`cleanup_op_vacuum_into` drops the db handle but never unlinks. Logged
+as Bug 14.
+
+### 18. In-place VACUUM demotes MVCC source to WAL
+Created a DB with `PRAGMA journal_mode='mvcc'`, ran a truncate checkpoint,
+then `VACUUM`. Before VACUUM: fresh connection reports `mvcc`. After
+VACUUM: fresh connection reports `wal`, even though `__turso_internal_mvcc_meta`
+is still in sqlite_master. `VACUUM INTO` on the same source is unaffected
+(destination reports `mvcc`). Logged as Bug 15.
+
+### 19. Other things tried, no new bug
+- Schema_version preservation — both sqlite/turso bump by 1 on VACUUM (OK)
+- Schema_version preservation on VACUUM INTO — both bump by 1 (OK)
+- Encoding stays UTF-8 (UTF-16 source rejected at open before VACUUM)
+- Reserved bytes / cipher_plaintext_header_size PRAGMAs unsupported
+- Journal mode preserved (wal → wal, mvcc VACUUM INTO → mvcc)
+- Foreign keys disabled during VACUUM so FK violations (with PRAGMA foreign_keys=OFF)
+  are preserved; FK state is per-connection so it doesn't affect the rebuild
+- VACUUM inside `BEGIN` / `SAVEPOINT` correctly rejected
+- VACUUM INTO to same path as source — rejected as already-exists
+- Symlink source and dangling-symlink dest both succeed
+- Path with `/./` or `//` or trailing spaces or leading dot — all OK
+- Comments in CREATE TABLE stripped at parse time (U3 territory, not VACUUM)
+- `IF NOT EXISTS` stripped from CREATE TABLE but preserved on CREATE INDEX
+  (parser inconsistency, not VACUUM). sqlite strips on both.
+- UNIQUE indexes with many NULLs preserved (NULL != NULL per SQL)
+- `sqlite_sequence.name='non-existent'` preserved through VACUUM
+- `sqlite_sequence.seq='not an int'` — Turso overwrites with 1 (extension of Bug 6)
+- `sqlite_sequence` empty rows / `name=''` / `name=NULL` — all preserved
+- Very long path (>200 chars) — OK
+- Path with colon, shell metacharacters — OK
+- VACUUM INTO URI (`file:...`) rejected with cryptic error (U4)
+- Partial indexes with WHERE clause — OK
+- Multi-column DESC/ASC indexes — OK
+- Expression indexes with `json_extract` / `lower` / `length` — OK
+- NULLS FIRST / NULLS LAST in CREATE INDEX preserved
+- Trigger OF column-list preserved; column rename updates OF list
+- Trigger BEFORE UPDATE OF cols — doesn't fire during VACUUM copy (OK)
+- TEMP tables unaffected by VACUUM (expected)
+- Triggers on sqlite_master-referencing views survive — OK
+- CREATE TABLE AS SELECT (CTAS) schema text reformatted after VACUUM (U3)
+- Custom types (`CREATE TYPE ... BASE ...`) — see Bug 9 from session 2
+- ATTACHed DBs unaffected by VACUUM on main; VACUUM <attached> INTO works
+- Large blobs (1MB single blob) preserved via overflow pages
+- 100+ secondary indexes — VACUUM succeeds
+- ALTER RENAME COLUMN updates references in triggers and sqlite_master
+- `CHECK(...)` with CAST expressions preserved
+- DEFAULT expressions (including random()) — initial values persisted, not re-evaluated
+- JSONB blobs preserved with correct byte-layout
+- Boolean columns preserved as integer 0/1 via typeof
+- Numeric affinity (INT2, MEDIUMINT, BIGINT, TINYINT) — all preserved
+- zeroblob(N) preserved
+- DATETIME column — text/real/integer storage preserved per value
+- Unicode (emoji) in TEXT column preserved
+- Stack overflow on INSERT with a CHECK containing ~80 `AND`-combined sub-expressions
+  — unrelated to VACUUM but VACUUM would hit it on any DB that contains such schema
+- VACUUM INTO under readonly source — rejected with appropriate error

@@ -88,3 +88,60 @@ flags that don't currently exist (`--cipher`/`--hexkey`). Only the original
 create-and-use session works; any subsequent `tursodb file.db ...` command
 fails. Not VACUUM-specific, but bit me while investigating Bug 5.
 
+
+## U8: Stack overflow on CHECK constraint with many AND clauses during INSERT
+
+```
+CREATE TABLE t(a INTEGER CHECK(a != 0 AND a != 1 AND ... AND a != 79));
+INSERT INTO t VALUES(999);
+-- thread 'main' has overflowed its stack
+-- fatal runtime error: stack overflow, aborting
+```
+
+Crash occurs at 80 AND clauses (70 works). Deep recursive AST evaluation
+during constraint checking. The CREATE TABLE succeeds and stores the
+schema, so subsequent INSERT and VACUUM attempts both abort the whole
+process. Not VACUUM-specific, but VACUUM is unrecoverable on any such DB.
+
+## U9: sqlite_master.name column is stored lowercased
+
+```
+$ tursodb x.db 'Create Table MyTable(MyColumn INTEGER);'
+$ tursodb x.db 'SELECT name, sql FROM sqlite_master;'
+mytable|CREATE TABLE MyTable (MyColumn INTEGER)
+```
+
+Turso stores the TABLE name in `sqlite_master.name` lowercased (`mytable`),
+while `sql` preserves the original case (`MyTable`). SQLite preserves the
+exact case in both (`MyTable|CREATE TABLE MyTable(...)`).
+
+Introspection tools that read `sqlite_master.name` for display or for
+case-sensitive matching against another store break on Turso. Not a VACUUM
+bug (surfaces on the initial CREATE TABLE), but it affects users who inspect
+sqlite_master after VACUUM.
+
+## U10: PRAGMA ignore_check_constraints accepted but scoped to a single statement only
+
+`PRAGMA ignore_check_constraints=ON;` is accepted as valid SQL by Turso. It
+is effective inside the same statement batch as an INSERT that would
+otherwise fail CHECK — the row is persisted. But the effect does not persist
+for a subsequent VACUUM issued later in the same connection (see Bug 11).
+The exact scope of the pragma (compile-time flag on individual statements?
+connection-wide?) is unclear, and the flag is not mirrored to the VACUUM
+target connection anyway.
+
+## U11: Cryptic "statfs shared WAL coordination path" error for any I/O open failure on VACUUM INTO
+
+```
+VACUUM INTO '/nonexistent/dir/out.db';
+-- Error: I/O error (statfs shared WAL coordination path): entity not found
+
+VACUUM INTO 'file:/tmp/out.db';
+-- Error: I/O error (statfs shared WAL coordination path): entity not found
+```
+
+The "shared WAL coordination path" part of the message leaks internal state
+about the WAL file coordination mechanism, and it surfaces for every open
+failure (parent directory missing, unsupported URI path, etc.). This is an
+extension of U4 — now observed in three distinct paths — suggesting the
+error lives in a generic `statfs` wrapper that all file opens go through.

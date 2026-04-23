@@ -378,3 +378,168 @@ SELECT rowid, a FROM t;
 will observe a different post-VACUUM shape on Turso vs SQLite. The same
 divergence appears on `VACUUM INTO`: the destination carries forward the
 source rowids instead of tight-packing them.
+
+## Bug 11: VACUUM fails on CHECK-constraint-violating rows (SQLite preserves)
+
+**Location**: `core/vdbe/vacuum.rs::build_copy_sql` + target `INSERT INTO ... VALUES`
+path. The VACUUM copies via SQL `INSERT`, which the INSERT opcode compiles with
+a full CHECK-constraint enforcement epilogue. There is no "disable CHECK" flag
+mirrored to the target build connection.
+
+SQLite's `vacuum.c` copies data via the page/B-tree layer (xfer optimization
+and raw INSERT with constraints disabled), so pre-existing rows that violate
+CHECK constraints survive unchanged. Turso's VACUUM re-evaluates CHECK on every
+copied row and aborts on the first violation.
+
+**Reproduction**:
+```
+CREATE TABLE t(a INTEGER CHECK(a > 0));
+PRAGMA ignore_check_constraints=ON;
+INSERT INTO t VALUES(-5);    -- row persisted because constraint is bypassed
+VACUUM;
+-- SQLite:  succeeds, row preserved
+-- Turso:   Error: Runtime error: CHECK constraint failed: a > 0 (19)
+```
+
+Same behavior on `VACUUM INTO '/tmp/out.db'`. Also triggers whenever a CHECK
+constraint was added via `ALTER TABLE ADD COLUMN ... CHECK(...) DEFAULT ...`
+against pre-existing rows whose default would violate the new constraint —
+Turso accepts the ALTER and stores the violating data, but a subsequent
+VACUUM then fails.
+
+**Impact**: VACUUM becomes a footgun on any database where historical data
+predates a CHECK constraint, or where `ignore_check_constraints=ON` was ever
+used. The source remains usable after the failure, but the user cannot compact
+the database until every offending row is deleted by hand. Portable code that
+works unchanged on SQLite silently breaks on Turso's VACUUM.
+
+## Bug 12: VACUUM INTO rejects pre-existing zero-length destination files
+
+**Location**: `core/vdbe/execute.rs:14394` —
+`if std::path::Path::new(dest_path).exists()` returns an unconditional
+"output file already exists" error.
+
+SQLite's documented behavior for `VACUUM INTO` accepts an existing zero-length
+destination file: `SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE` is happy to
+fill an empty placeholder. Many deployments pre-create the destination file
+(e.g., via `touch` from a shell driver or from the kernel open-with-O_CREAT
+path) and expect VACUUM INTO to write into it.
+
+**Reproduction**:
+```
+$ touch /tmp/out.db                 # empty file, size 0
+$ sqlite3 src.db "VACUUM INTO '/tmp/out.db';"   # SQLite: succeeds, out.db filled
+$ tursodb src.db   "VACUUM INTO '/tmp/out.db';" # Turso: Error: Parse error: output file already exists: /tmp/out.db
+```
+
+**Impact**: Portable backup/replication scripts that rely on pre-creating
+the destination (common for mode/ownership control) fail on Turso. The
+workaround is to unlink the file first, which is racy and breaks "touch"-based
+pre-allocation. The check is too strict: it should be `metadata(dest).len() != 0`
+before rejecting.
+
+## Bug 13: VACUUM fails on user tables with `SQLITE_MAX_COLUMN` columns
+
+**Location**: `core/vdbe/vacuum.rs::build_copy_sql` adds a leading rowid alias
+pseudo-column to the copy `SELECT` whenever `has_rowid` is true. The statement
+then exceeds `core/translate/select.rs::SQLITE_MAX_COLUMN` (2000) by one
+column and bails with "too many columns in result set". SQLite's VACUUM
+copies via the page/xfer layer rather than a SELECT, so it does not hit this
+limit.
+
+**Reproduction**:
+```
+CREATE TABLE t(c1 INTEGER DEFAULT 0, c2 INTEGER DEFAULT 0, ..., c2000 INTEGER DEFAULT 0);
+-- (exactly 2000 columns, no INTEGER PRIMARY KEY — table has an implicit rowid)
+INSERT INTO t DEFAULT VALUES;
+VACUUM;
+-- SQLite: succeeds
+-- Turso:  Error: Parse error: too many columns in result set
+```
+
+1999 non-PK columns + the synthetic `rowid` alias = 2000 and works. 2000
+non-PK columns + synthetic rowid = 2001 and exceeds the limit.
+
+Declaring an `INTEGER PRIMARY KEY` alias column changes the behavior — the
+alias column IS the rowid, so no extra pseudo-column is prepended and the
+select still sits at 2000. The bug therefore surfaces only when the source
+has hit the full SQLITE_MAX_COLUMN budget and does not declare an explicit
+INTEGER PRIMARY KEY.
+
+**Impact**: A user who imports a wide schema (analytics tables near the
+SQLite column limit) can successfully create and query the table, but VACUUM
+fails permanently with no clean workaround short of a schema migration to
+introduce an INTEGER PRIMARY KEY.
+
+## Bug 14: VACUUM INTO leaks the destination file on mid-vacuum failure
+
+**Location**: `core/vdbe/execute.rs::cleanup_op_vacuum_into` —
+the cleanup routine calls `target_build_context.cleanup_after_error()` and
+drops `_output_db`, but never unlinks `dest_path`.
+
+Any mid-vacuum failure after the destination handle is opened (e.g., a CHECK
+constraint violation during the copy loop per Bug 11, a unique violation on
+a secondary index, etc.) leaves the freshly-written `dest.db` and `dest.db-wal`
+on disk. On retry, the preflight existence check (Bug 12's same line) rejects
+the operation with "output file already exists: ...", so the user cannot retry
+without manually removing the leftovers. The partial file is a valid SQLite
+header but an incomplete image.
+
+**Reproduction** (re-using Bug 11 as the failure trigger):
+```
+CREATE TABLE t(a INTEGER CHECK(a > 0));
+PRAGMA ignore_check_constraints=ON;
+INSERT INTO t VALUES(-5);
+VACUUM INTO '/tmp/out.db';    -- fails mid-copy on CHECK
+-- Error: Runtime error: CHECK constraint failed: a > 0 (19)
+$ ls -la /tmp/out.db*
+-rw-rw-r-- 4096 /tmp/out.db       <-- leaked
+-rw-rw-r--    0 /tmp/out.db-wal   <-- leaked
+
+VACUUM INTO '/tmp/out.db';    -- retry
+-- Error: Parse error: output file already exists: /tmp/out.db
+```
+
+**Impact**: Failed VACUUM INTO transitions the backup driver into a "needs
+manual cleanup" state that prevents retries. In unattended maintenance
+scripts (cron/scheduled jobs), this cascades into repeated failures until
+a human intervenes. SQLite's vacuum.c removes the output file on error paths
+via its `pDestDb->onError` cleanup; Turso's corresponding cleanup is missing
+the unlink.
+
+## Bug 15: In-place VACUUM on an MVCC database silently demotes the source to WAL journal mode
+
+**Location**: `core/vdbe/vacuum.rs::VacuumInPlacePhase` — after the copy-back
+commits, the source file still contains `__turso_internal_mvcc_meta`, but the
+journal-mode detection that fresh connections run at open time returns `wal`
+instead of `mvcc`. The VACUUM's TRUNCATE checkpoint and subsequent schema
+reload leave the source looking like a plain WAL database.
+
+**Reproduction**:
+```
+PRAGMA journal_mode='mvcc';
+CREATE TABLE t(a);
+INSERT INTO t VALUES(1);
+PRAGMA wal_checkpoint(TRUNCATE);    -- required preflight for MVCC VACUUM
+-- New connection reports: journal_mode = mvcc  ✓
+VACUUM;
+-- New connection after VACUUM reports: journal_mode = wal  ✗
+SELECT type, name FROM sqlite_master;
+-- table|__turso_internal_mvcc_meta   (still physically present)
+-- table|t
+```
+
+After VACUUM, a user has to manually `PRAGMA journal_mode='mvcc'` to re-enter
+MVCC mode. In the default-connection path (which opens, reads, uses), code
+that depended on MVCC semantics (snapshot isolation etc.) silently switches to
+plain WAL semantics with no error.
+
+`VACUUM INTO` on the same MVCC source is unaffected — the destination image
+is correctly tagged as MVCC and fresh connections to it report `journal_mode = mvcc`.
+
+**Impact**: Applications that use MVCC for snapshot-isolated reads will, after
+any maintenance VACUUM, revert to plain WAL isolation without any user-visible
+signal. Correctness-sensitive workloads relying on MVCC could read data under
+incompatible isolation semantics until someone runs `PRAGMA journal_mode='mvcc'`
+again. This is a silent feature downgrade, not a loss of data, but it bypasses
+the consent-required nature of journal_mode changes.
