@@ -1177,4 +1177,234 @@ mismatch; it compounds with the SQLite divergence in that the exact
 WHERE form that SQLite-based tooling produces cannot be roundtripped
 through Turso's VACUUM.
 
+## Bug 29: In-place VACUUM panics with "must not already hold a read lock" after `SELECT * FROM pragma_*` virtual tables
+
+**Location**: `core/storage/wal.rs:3789` — assertion in
+`begin_exclusive_tx`. The in-place VACUUM preflight (`VacuumInPlacePhase::BeginSourceTx`)
+calls `source_pager.begin_exclusive_tx()`, which has an internal
+assertion that the connection must not already hold a read lock. The
+PRAGMA virtual-table form (`SELECT * FROM pragma_<name>(...)`) opens a
+read transaction internally and does not release it before the next
+statement, so a subsequent `VACUUM` trips the assertion.
+
+**Reproduction**:
+```
+$ tursodb /tmp/x.db "
+  CREATE TABLE t(a);
+  SELECT * FROM pragma_foreign_keys;
+  VACUUM;
+"
+0
+thread 'main' panicked at core/storage/wal.rs:3789:9:
+begin_exclusive_tx: must not already hold a read lock
+```
+
+The panic reproduces with every PRAGMA virtual-table form tested:
+`pragma_foreign_keys`, `pragma_journal_mode`, `pragma_table_info`,
+`pragma_table_list`, `pragma_index_list`, `pragma_index_xinfo`,
+`pragma_function_list`, `pragma_database_list`, `pragma_module_list`.
+The corresponding `PRAGMA <name>` (function form) does NOT trigger the
+panic — only the `SELECT * FROM pragma_<name>` virtual-table form does.
+
+`VACUUM INTO '...'` on the same source is unaffected because that
+opcode goes through the regular `BEGIN`/`COMMIT` path on the source
+rather than `begin_exclusive_tx`.
+
+Without a user table (so the DB is empty), the same panic surfaces as
+Bug 3's "begin_exclusive_tx can be done on an initialized database"
+InternalError instead — but with any user table present, it's a hard
+panic (process abort with backtrace) rather than a clean error.
+
+**Impact**: Any maintenance script that probes schema metadata via the
+PRAGMA virtual tables before running an in-place `VACUUM` will crash
+the entire process with a panic instead of receiving a normal SQL
+error. This is the most severe failure mode tested: the assertion
+trips inside Turso's internal state machine, leaving the connection
+state effectively unrecoverable. The panic-then-process-abort path
+also bypasses any cleanup, leaving any partial WAL state behind.
+
+## Bug 30: VACUUM creates duplicate sqlite_sequence rows when source has sqlite_sequence rowid != 1
+
+**Location**: `core/vdbe/vacuum.rs::VacuumTargetBuildPhase::CopyRows`
+for the `sqlite_sequence` table (combined with the AUTOINCREMENT
+counter machinery firing on every INSERT). When the source's
+`sqlite_sequence` row has a non-1 rowid (e.g., user manually rebuilt
+the table or the row was originally allocated at a higher rowid), the
+VACUUM copy-back leaves both the auto-generated rowid=1 row AND the
+source row with its original rowid in the target. SQLite's vacuum.c
+preserves only one row at the new compacted rowid.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db "
+  CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT);
+  INSERT INTO t (id) VALUES (10);
+  DELETE FROM sqlite_sequence;
+  INSERT INTO sqlite_sequence (rowid, name, seq) VALUES (5, 't', 100);
+"
+$ sqlite3 /tmp/x.db "SELECT rowid, name, seq FROM sqlite_sequence;"
+5|t|100
+
+$ tursodb /tmp/x.db "VACUUM;"
+$ tursodb /tmp/x.db "SELECT rowid, name, seq FROM sqlite_sequence;"
+1|t|1               <-- spurious row created by AUTOINCREMENT machinery during VACUUM
+5|t|100             <-- source row preserved at original rowid
+
+$ sqlite3 /tmp/x.db "SELECT rowid, name, seq FROM sqlite_sequence;"
+1|t|100             <-- SQLite: single row, rowid renumbered, seq preserved
+```
+
+The bug also reproduces with rowid=0, negative rowids, and orphan
+sqlite_sequence rows for tables that don't exist or aren't AUTOINCREMENT.
+For each non-1 source rowid, Turso ends up with two rows after VACUUM:
+the auto-created `(1, 't', 1)` row from the AUTOINCREMENT counter and
+the source's original `(rowid, name, seq)` row preserved verbatim.
+
+**Impact**: After VACUUM, the user-visible `sqlite_sequence` table has
+rows that did not exist before — both the source's row AND a new row
+for any AUTOINCREMENT table whose counter the AUTOINCREMENT machinery
+populated during the copy. Downstream tools that count `sqlite_sequence`
+rows or assume one row per AUTOINCREMENT table will see inconsistent
+state. The duplicate row also breaks the implicit 1-to-1 mapping
+between AUTOINCREMENT tables and sqlite_sequence rows, breaking
+tools that derive table identity from sqlite_sequence.
+
+## Bug 31: VACUUM clobbers same-session UPDATE to sqlite_sequence with the AUTOINCREMENT cache value
+
+**Location**: Same connection that performed an INSERT into an
+AUTOINCREMENT table caches the table's AUTOINCREMENT counter
+in connection state (per `core/vdbe/vacuum.rs:725` `todo: sqlite
+disables AUTOINCREMENT during vacuum, but we don't have such a way
+yet`). When that connection then runs `UPDATE sqlite_sequence SET
+name=NULL WHERE name='t';` and follows with `VACUUM;`, the cached
+counter writes back during the VACUUM copy and overwrites the user's
+NULL/renamed value with the original `name='t', seq=...`.
+
+The bug is **same-session-specific**: if the UPDATE happens in a
+different connection (or different process), the value is preserved
+through VACUUM. Only when an INSERT into the AUTOINCREMENT table
+already populated the connection's internal cache does VACUUM trip
+the writeback.
+
+**Reproduction**:
+```
+$ tursodb /tmp/x.db "
+  CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT);
+  INSERT INTO t DEFAULT VALUES;             -- populates conn's AUTOINCREMENT cache
+  UPDATE sqlite_sequence SET name=NULL WHERE name='t';
+  SELECT 'before:', rowid, typeof(name), name, seq FROM sqlite_sequence;
+  VACUUM;
+  SELECT 'after:', rowid, typeof(name), name, seq FROM sqlite_sequence;
+"
+before:|1|null||1
+after:|1|text|t|1                  <-- name reverted from NULL to 't'
+
+# In a fresh connection AFTER the bug fired, the change is durable:
+$ tursodb /tmp/x.db "SELECT rowid, typeof(name), name, seq FROM sqlite_sequence;"
+1|text|t|1                          <-- bug-installed value persists on disk
+
+# Compare same-session in SQLite:
+$ sqlite3 /tmp/y.db "
+  CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT);
+  INSERT INTO t DEFAULT VALUES;
+  UPDATE sqlite_sequence SET name=NULL WHERE name='t';
+  VACUUM;
+  SELECT 'after:', rowid, typeof(name), name, seq FROM sqlite_sequence;
+"
+after:|1|null||1                    <-- SQLite: NULL preserved
+```
+
+A more dramatic variant: same connection updates the *name* (not just
+to NULL) — the source loses one row to the user's UPDATE and gains
+one row from the AUTOINCREMENT cache, so the post-VACUUM table has
+TWO rows where the source had one:
+```
+$ tursodb /tmp/x.db "
+  CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT);
+  INSERT INTO t DEFAULT VALUES;
+  UPDATE sqlite_sequence SET name='renamed' WHERE name='t';
+  SELECT 'before:', * FROM sqlite_sequence;
+  VACUUM;
+  SELECT 'after:', * FROM sqlite_sequence;
+"
+before:|renamed|1
+after:|renamed|1                    <-- source row preserved
+after:|t|1                          <-- spurious row from AUTOINCREMENT cache
+```
+
+**Impact**: Same-session VACUUM after any UPDATE on `sqlite_sequence`
+silently clobbers the user's intent with whatever the AUTOINCREMENT
+machinery cached. Apps that perform "INSERT into AI table; tweak the
+sequence; VACUUM; close" workflows lose the tweak. Combined with
+Bug 30, you can end up with both a clobbered name AND a duplicated
+row. The bug surfaces as either:
+1. Reverted UPDATE (NULL → 't', or other value → original name)
+2. Phantom duplicate row alongside the user's edited row
+
+## Bug 33: VACUUM with CDC enabled creates a new sqlite_sequence row tracking the internal turso_cdc table's AUTOINCREMENT counter
+
+**Location**: Same root cause as Bug 31's AUTOINCREMENT machinery firing
+during VACUUM copy, applied to Turso's *internal* `turso_cdc` table
+(which is defined with `change_id INTEGER PRIMARY KEY AUTOINCREMENT`
+when CDC is enabled). CDC's normal write path inserts into `turso_cdc`
+without going through the connection's AUTOINCREMENT counter cache, so
+pre-VACUUM `sqlite_sequence` is empty (or has no `turso_cdc` row).
+VACUUM's copy loop then re-INSERTs every `turso_cdc` row through the
+regular INSERT machinery, which DOES update `sqlite_sequence` —
+producing a `(turso_cdc, max(change_id))` row that wasn't there before.
+
+**Reproduction**:
+```
+$ tursodb /tmp/x.db "
+  CREATE TABLE t (a);
+  PRAGMA unstable_capture_data_changes_conn='full';
+  INSERT INTO t VALUES (1);
+"
+
+$ tursodb /tmp/x.db "SELECT count(*) FROM sqlite_sequence;"
+0                                   <-- pre-VACUUM: empty sqlite_sequence
+
+$ tursodb /tmp/x.db "SELECT count(*) FROM turso_cdc;"
+2                                   <-- 2 CDC rows (insert + commit marker)
+
+$ tursodb /tmp/x.db "VACUUM;"
+$ tursodb /tmp/x.db "SELECT * FROM sqlite_sequence;"
+turso_cdc|2                         <-- post-VACUUM: new row appears
+```
+
+The new row is durable and visible to fresh connections. Source's
+`turso_cdc` data is unchanged, but its `sqlite_sequence` table now
+tracks an internal Turso table that the user did not opt into
+tracking. With both a user AUTOINCREMENT table AND CDC enabled,
+sqlite_sequence ends up with two entries:
+```
+$ tursodb /tmp/x.db "
+  CREATE TABLE t1 (id INTEGER PRIMARY KEY AUTOINCREMENT);
+  CREATE TABLE t2 (id INTEGER PRIMARY KEY AUTOINCREMENT);
+  PRAGMA unstable_capture_data_changes_conn='full';
+  INSERT INTO t1 DEFAULT VALUES;
+  INSERT INTO t2 DEFAULT VALUES;
+  SELECT 'before:', name, seq FROM sqlite_sequence ORDER BY name;
+  VACUUM;
+  SELECT 'after:', name, seq FROM sqlite_sequence ORDER BY name;
+"
+before:|t1|1
+before:|t2|1
+after:|t1|1
+after:|t2|1
+after:|turso_cdc|4                  <-- new row tracking internal table
+```
+
+**Impact**: The mere presence of CDC on the source connection causes
+VACUUM to *modify user-visible source data* (sqlite_sequence) with a
+row tracking an internal implementation detail (`turso_cdc`). Tools
+that snapshot sqlite_sequence pre/post VACUUM see new rows tied to
+implementation internals. The same row also leaks to VACUUM INTO
+output, polluting the destination's sqlite_sequence with a turso_cdc
+row even when CDC was an opt-in choice on the source side. Rolls
+combined with Bug 6 (clobbered AI counters) and Bug 30 (duplicate
+rows) into a broader pattern: VACUUM's AUTOINCREMENT-cache leak is
+the root cause, and every internal Turso table that uses
+AUTOINCREMENT (turso_cdc plus any future internal feature) becomes
+a vector for unwanted sqlite_sequence pollution.
 

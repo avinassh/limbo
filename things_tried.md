@@ -742,3 +742,137 @@ Turso-on-SQLite divergences that block or corrupt VACUUM on otherwise
 valid databases). Unrelated bug U18 (panic on UPDATE
 turso_cdc_version) also added.
 
+
+## Session 8
+
+### 36. In-place VACUUM panics when prior statement used PRAGMA virtual table
+`SELECT * FROM pragma_<name>(...)` opens an internal read transaction
+that does NOT release before the next statement. A subsequent
+`VACUUM;` calls `source_pager.begin_exclusive_tx()`, which has an
+internal assertion forbidding a held read lock — process panics with
+"begin_exclusive_tx: must not already hold a read lock" at
+`core/storage/wal.rs:3789`. Reproduces with at least:
+`pragma_foreign_keys`, `pragma_journal_mode`, `pragma_table_info`,
+`pragma_table_list`, `pragma_index_list`, `pragma_index_xinfo`,
+`pragma_function_list`, `pragma_database_list`, `pragma_module_list`.
+The function-form `PRAGMA <name>` (without SELECT FROM) does NOT
+trigger the panic. `VACUUM INTO '...'` is unaffected (uses regular
+BEGIN path). Logged as Bug 29.
+
+### 37. VACUUM creates duplicate sqlite_sequence rows when source has rowid != 1
+Source: `INSERT INTO sqlite_sequence (rowid, name, seq) VALUES (5, 't', 100)`
+plus an AUTOINCREMENT table `t`. After Turso VACUUM, sqlite_sequence
+has TWO rows: the source's row preserved at rowid=5 plus a fresh
+`(1, 't', 1)` row from the AUTOINCREMENT machinery firing during the
+copy. SQLite preserves a single row at the new compacted rowid.
+Reproduces with rowid=0, negative rowids, and orphan rows for
+non-existent tables. Logged as Bug 30.
+
+### 38. VACUUM clobbers same-session UPDATE to sqlite_sequence
+Same connection that did INSERT into AUTOINCREMENT table caches the
+counter. UPDATE sqlite_sequence to NULL/different name in the same
+session, then VACUUM — Turso's AUTOINCREMENT cache writes back during
+VACUUM copy, overwriting the user's update. Bug doesn't reproduce
+across separate connections (where the cache is empty). Two failure
+modes:
+1. UPDATE name=NULL → VACUUM restores name='t' (NULL → text)
+2. UPDATE name='renamed' → VACUUM creates duplicate row, both
+   'renamed' AND 't' present
+Logged as Bug 31.
+
+### 39. VACUUM with CDC adds turso_cdc row to sqlite_sequence
+The internal `turso_cdc` table is defined with `INTEGER PRIMARY KEY
+AUTOINCREMENT`. CDC's normal write path doesn't fire the AUTOINCREMENT
+counter, so pre-VACUUM sqlite_sequence is empty. VACUUM's copy loop
+re-inserts every turso_cdc row through the regular INSERT machinery,
+which DOES update sqlite_sequence — producing a `turso_cdc|N` row that
+wasn't there before. Affects any source using CDC, including the
+copy-to-destination via VACUUM INTO. Logged as Bug 33. Same root
+cause as Bug 31 / Bug 6 (AUTOINCREMENT-cache leak during VACUUM
+copy).
+
+### 40. Other things tried, no new bug
+- VACUUM with very many indexes (50+ on same table) — preserved
+- VACUUM with INSERT OR REPLACE on PK conflict — preserved
+- VACUUM with UPSERT (INSERT ON CONFLICT DO UPDATE) — preserved
+- VACUUM with RETURNING clause — works
+- VACUUM with sqlite_sequence having NULL/BLOB/REAL/text seq — preserved
+  (only NULL→max(rowid) clobbering per Bug 6 family)
+- VACUUM with sqlite_sequence having BLOB/Unicode/multi-line name — preserved
+- VACUUM with multi-byte UTF-8 emoji/Japanese/Hebrew — preserved
+- VACUUM with very long path (200+ chars) for VACUUM INTO — works
+- VACUUM with Unicode path (üñîçødé.db) — works
+- VACUUM with cross-mount destination (tmpfs/dev/shm) — works
+- VACUUM INTO with relative path / absolute path / Windows-style — works
+- VACUUM INTO with empty literal path — Turso rejects with clean error;
+  SQLite silently accepts (creates a temp file)
+- VACUUM after PRAGMA cipher in same session — preserves encryption
+- VACUUM INTO on encrypted source — produces plaintext (Bug 5 reconfirmed)
+- VACUUM after multiple connections do schema changes — final state preserved
+- VACUUM with CHECK using printf/IIF/CASE/CAST/julianday/datetime/
+  json_valid/json_extract — preserved
+- VACUUM with index using lower/upper/abs/hex/length/cast — preserved
+- VACUUM with TRIGGER body containing semicolons in string literals — preserved
+- VACUUM with TRIGGER body containing reserved-keyword column refs — preserved
+- VACUUM with TRIGGER WHEN clause referencing OLD/NEW.rowid — preserved
+- VACUUM with TRIGGER firing during INSERT, BEFORE/AFTER, RAISE — preserved;
+  none of these triggers fire during VACUUM copy phase (correct)
+- VACUUM with CHECK constraints on STRICT tables — preserved
+- VACUUM with FK self-referencing chain (10 levels deep) — preserved
+- VACUUM with FK ON UPDATE/DELETE NO ACTION clauses — preserved
+- VACUUM with sqlite_master entries having weird names (rowid, oid,
+  sqlite_master, sqlite_sequence as user data) — preserved
+- VACUUM with PRAGMA short_column_names / busy_timeout / max_page_count
+  / locking_mode / synchronous / cache_spill / temp_store — per-conn,
+  preserved
+- VACUUM with EXPLAIN VACUUM — does NOT execute the actual VACUUM (good)
+- VACUUM with EXPLAIN VACUUM INTO 'x.db' — does NOT create the file
+- VACUUM with INSERT INTO with json_each as source — works
+- VACUUM with Indexes ASC/DESC mixed, NULLS FIRST/LAST (turso rejects
+  the latter at parse time) — works for ASC/DESC
+- VACUUM with PRAGMA journal_mode=DELETE source from sqlite — turso
+  silently converts to WAL on open (general turso behavior, not VACUUM-specific)
+- VACUUM with sqlite-created DB with CHARACTER(20) / NUMERIC(10,2)
+  / DECIMAL(8) / VARCHAR / etc. — preserved (with parser whitespace
+  reformatting per U-family)
+- VACUUM after pragma_function_list (function form, not VT) — works
+- VACUUM with sqlite_sequence having seq value > max(rowid) — preserved
+- VACUUM with sqlite_sequence having multiple rows for same name
+  (SQL allows duplicates) — both preserved
+- VACUUM with `[t]` SQLite-bracket-quoted identifiers — Turso strips
+  the brackets and re-stringifies as `t (a INTEGER, b TEXT)` (U-family
+  parser normalization, amplified by VACUUM)
+- VACUUM with backtick-quoted identifiers — preserved through VACUUM
+- VACUUM with multi-line schema text containing -- and /* */ comments —
+  comments stripped, formatting flattened (U3 family)
+- VACUUM with PRAGMA cache_size=N (positive page count) — Turso has a
+  minimum of 200 pages, silently caps lower values (not VACUUM-specific)
+- VACUUM with INSERT INTO trigger that has RAISE(ROLLBACK/ABORT/IGNORE)
+  conditions — VACUUM doesn't fire these triggers, source rows preserved
+- VACUUM with sqlite_sequence containing a row with rowid=0 — Bug 30 family
+- VACUUM with INSERT OR IGNORE / OR REPLACE / OR ABORT — preserved
+- VACUUM with UNIQUE composite indexes + multiple NULLs — preserved
+- VACUUM with FK self-FK + ON DELETE CASCADE — preserved
+- VACUUM with INTEGER PRIMARY KEY DESC — preserved (autoindex retained)
+- VACUUM with column name "rowid" / "ROWID" / "PRIMARY" (reserved word) — preserved
+- VACUUM with column having tab/newline/special chars in name — preserved
+- VACUUM with TEXT containing only NUL bytes — preserved
+- VACUUM with BLOB containing magic-bytes-like content — preserved
+- VACUUM with very large blob (1MB) in single row — preserved (overflow OK)
+- VACUUM with CTAS-derived view containing window functions — preserved
+- VACUUM with view referencing dropped table — preserved (SQLite-compatible)
+- VACUUM with CDC mode 'before'/'after'/'id'/'full' — Bug 33 reproduces in all modes
+- VACUUM with sqlite_sequence row where seq is JSON-shaped TEXT — preserved
+- VACUUM in `:memory:` rejected; `VACUUM INTO ':memory:'` writes a
+  literal file named `:memory:` (existing behavior)
+- VACUUM with various PRAGMA function forms (table_info, index_list,
+  database_list, function_list) followed by VACUUM — works
+
+Bugs 29-31 and Bug 33 logged as new VACUUM bugs this session
+(panic + 3 sqlite_sequence-related divergences, all surfacing as
+post-VACUUM data shape differences from SQLite). All 4 are
+distinct from existing Bug 6/9/14/15/20/24-28 family, sharing the
+common root cause that VACUUM's INSERT path through the regular
+target connection fires AUTOINCREMENT/cache machinery that the
+source-side bypass never does.
+
