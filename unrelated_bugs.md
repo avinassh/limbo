@@ -50,3 +50,41 @@ The error references "shared WAL coordination path" even when the problem
 is that the output directory doesn't exist. This leaks internal state into
 the user-facing error.
 
+## U5: Stack overflow on self-referential FK + `ON DELETE CASCADE`
+
+```
+PRAGMA foreign_keys=ON;
+CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER
+  REFERENCES t(id) ON DELETE CASCADE);
+INSERT INTO t VALUES(1, NULL), (2, 1), (3, 2), (4, 2);
+DELETE FROM t WHERE id=1;
+-- thread 'main' has overflowed its stack
+-- fatal runtime error: stack overflow, aborting
+```
+
+Crashes the process with a stack overflow instead of performing the cascade
+deletion or returning a controlled error. Not a VACUUM bug — pure
+FK/trigger evaluation issue — but the crash is severe (SIGABRT, no recovery).
+
+## U6: MVCC databases silently ignore `PRAGMA page_size`
+
+```
+$ tursodb fresh.db "PRAGMA journal_mode='mvcc'; PRAGMA page_size=8192;
+                    CREATE TABLE t(a); PRAGMA page_size;"
+4096   -- expected 8192
+```
+
+`PRAGMA page_size` works on non-MVCC fresh DBs but is silently dropped on
+MVCC-mode fresh DBs. Not a VACUUM bug; surfaced while testing VACUUM
+page_size handling under MVCC.
+
+## U7: CLI fails to open an encrypted DB on second invocation
+
+The CLI reads page 1 eagerly during `open`, before any user SQL runs. That
+means for an encrypted database, the first `PRAGMA cipher`/`hexkey` pair
+after `open` arrives too late — header magic check rejects the file as
+"not a database". Workaround requires passing the encryption key via CLI
+flags that don't currently exist (`--cipher`/`--hexkey`). Only the original
+create-and-use session works; any subsequent `tursodb file.db ...` command
+fails. Not VACUUM-specific, but bit me while investigating Bug 5.
+

@@ -180,3 +180,201 @@ database. In-place `VACUUM` on the same source remains encrypted (that path
 correctly forwards the key through `open_vacuum_temp_db`), so the bug is
 specific to `VACUUM INTO` and easy to miss in casual testing.
 
+## Bug 6: VACUUM clobbers sqlite_sequence.seq when the manual value is lower than max(rowid)
+
+**Location**: `core/vdbe/vacuum.rs` — `build_copy_sql` + `classify_schema_entries`
+(ordering of copies) combined with the AUTOINCREMENT counter machinery that
+fires on every INSERT the copy loop issues.
+
+The sqlite_sequence row has `rowid=1`, before the AUTOINCREMENT table `t`
+(whose rowid is 2). VACUUM copies tables in rowid-ordered sequence, so:
+
+1. sqlite_sequence is copied first. `INSERT OR REPLACE INTO sqlite_sequence
+   VALUES ('t', 50)` writes the source value (50) into the target.
+2. Table `t` data is copied. Each INSERT with an explicit rowid (e.g., id=100)
+   fires the target's AUTOINCREMENT counter machinery, which bumps
+   sqlite_sequence.seq to `max(existing, inserted_id) = max(50, 100) = 100`.
+
+The intended invariant is that the target's sqlite_sequence reflects the
+source's seq exactly. SQLite's `vacuum.c` ships data through the page layer
+directly and does not fire AUTOINCREMENT tracking during the rebuild, so it
+preserves the source value unchanged. Turso's `todo: sqlite disables
+AUTOINCREMENT during vacuum, but we don't have such a way yet` comment at
+`core/vdbe/vacuum.rs:725` acknowledges the gap.
+
+**Reproduction**:
+```
+CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, val);
+INSERT INTO t(val) VALUES('a');
+INSERT INTO t(id, val) VALUES(100, 'b');
+UPDATE sqlite_sequence SET seq = 50 WHERE name = 't';
+SELECT seq FROM sqlite_sequence;  -- source: 50
+VACUUM;
+SELECT seq FROM sqlite_sequence;  -- SQLite: 50, Turso: 100
+```
+
+Same divergence on `VACUUM INTO '...'`: the destination also reports seq=100
+instead of the source's 50.
+
+**Impact**: Apps that manually manage AUTOINCREMENT counters (to reset them,
+reserve a range, or skip values) will silently lose their manual seq after
+VACUUM — the next INSERT will produce a rowid based on the clobbered value.
+Because SQLite documents and preserves this manual override, portable code
+relying on it will break on Turso only after a VACUUM.
+
+## Bug 7: `PRAGMA page_size=N` followed by `VACUUM` does not change page_size
+
+**Location**: `core/vdbe/vacuum.rs` `VacuumInPlacePhase::ReadSourceMetadata`
+and `core/vdbe/execute.rs` `VacuumIntoOpPhase::Init` — both read the pager's
+current page_size and use it verbatim.
+
+SQLite documents that `PRAGMA page_size=N;` prior to `VACUUM` is the
+supported way to change an existing database's page size (see
+<https://sqlite.org/pragma.html#pragma_page_size>: "The page_size pragma is
+intended for use when initially creating a database file *or else prior to
+a VACUUM or ALTER operation*"). Turso accepts the pragma silently (no error)
+but the subsequent VACUUM reads the old page_size from the source pager:
+
+```rust
+// vdbe/vacuum.rs — in-place
+let page_size = source_pager.get_page_size().map(|ps| ps.get()).unwrap_or(4096);
+// ...
+let temp_db = open_vacuum_temp_db(connection, &source_db, page_size, reserved_space)?;
+
+// vdbe/execute.rs — VACUUM INTO
+let page_size: u32 = extract_pragma_int(
+    &program.connection.pragma_query(&format!("\"{escaped_schema_name}\".page_size"))?,
+    "page_size",
+)?;
+```
+
+Both read the *current* page_size rather than the pending override, so the
+target is built at the same size as the source.
+
+**Reproduction** (in-place):
+```
+$ tursodb x.db "CREATE TABLE t(a); INSERT INTO t VALUES(1);"
+$ tursodb x.db "PRAGMA page_size=8192; VACUUM; PRAGMA page_size;"
+4096
+# SQLite on equivalent input: 8192
+```
+
+**Reproduction** (VACUUM INTO):
+```
+$ tursodb x.db "PRAGMA page_size=8192; VACUUM INTO 'y.db';"
+$ tursodb y.db "PRAGMA page_size;"
+4096
+# SQLite: 8192
+```
+
+**Impact**: Users cannot migrate an existing database to a different page
+size via VACUUM. The pragma-plus-VACUUM workflow is the SQLite-documented
+way to do this; portable code that relies on it silently keeps the old page
+size on Turso. The bug is silent (no error) so there is no indication the
+intended change did not happen.
+
+## Bug 8: `VACUUM INTO` does not accept expressions or parameter binding for the path
+
+**Location**: `core/translate/vacuum.rs:67-85` `extract_path_from_expr`.
+
+Turso's parser dispatches `VACUUM INTO <expr>` to a helper that only
+matches `Expr::Literal(Literal::String(_))` or `Expr::Id(_)` and rejects
+every other AST node with "VACUUM INTO requires a string literal path".
+SQLite, in contrast, treats the destination as an ordinary expression: it
+permits `VACUUM INTO ?`, `VACUUM INTO ('/tmp/' || 'foo.db')`, and any other
+scalar expression that evaluates to a string at run time.
+
+**Reproduction**:
+```sql
+-- All three accepted by SQLite, rejected by Turso:
+VACUUM INTO ?;                        -- parameter binding
+VACUUM INTO '/tmp/' || 'foo.db';      -- expression
+VACUUM INTO :dest;                    -- named parameter
+```
+
+Turso output:
+```
+Error: Parse error: VACUUM INTO requires a string literal path
+```
+
+SQLite, via the Python binding, correctly executes `VACUUM INTO ?` with a
+supplied parameter value and writes the output to the bound path.
+
+**Impact**: Library callers cannot parameterize the destination path —
+every backup site must interpolate the path into the SQL text instead of
+using the driver's binding API. That forces string concatenation at the
+application level, opens a SQL-injection surface if user-supplied paths are
+ever passed, and breaks portable code that prepares a statement once and
+reuses it with different paths.
+
+## Bug 9: VACUUM adds a spurious sqlite_autoindex_* row to sqlite_master for `__turso_internal_types`
+
+**Location**: `core/vdbe/vacuum.rs::vacuum_target_build_step` —
+`VacuumTargetBuildPhase::PrepareCreateTable` replays the source's CREATE
+TABLE SQL under `start_nested()`/`end_nested()` (for system tables). The
+in-memory implicit PK index on `__turso_internal_types(name)` lands in
+sqlite_master during the target build, but the source's sqlite_master never
+contained that row (the bootstrap path that originally created the table
+evidently skips registering the autoindex).
+
+**Reproduction**:
+```
+$ tursodb --experimental-custom-types x.db \
+    "CREATE TYPE pos_int BASE INTEGER; CREATE TABLE t(a pos_int);"
+$ tursodb --experimental-custom-types x.db \
+    "SELECT type, name FROM sqlite_master;"
+table|__turso_internal_types
+table|t
+
+$ tursodb --experimental-custom-types x.db "VACUUM;"
+$ tursodb --experimental-custom-types x.db \
+    "SELECT type, name FROM sqlite_master;"
+table|__turso_internal_types
+index|sqlite_autoindex___turso_internal_types_1
+table|t
+```
+
+**Impact**: The user-visible sqlite_master row count grows by one every
+time a user runs VACUUM on a database that has ever used `CREATE TYPE`.
+Apps that enumerate sqlite_master (introspection tools, schema diffs,
+dbhash-style checksums) will see an unexpected new row. Because this is
+a one-way mutation — the spurious row persists after VACUUM and is itself
+copied by any future VACUUM — there is no way to get back to the original
+sqlite_master shape without manual intervention.
+
+## Bug 10: VACUUM does not renumber rowids for tables without INTEGER PRIMARY KEY (SQLite compat)
+
+**Location**: `core/vdbe/vacuum.rs::build_copy_sql` — when `btree.has_rowid`
+is true the function always prepends a rowid-alias pseudo-column to both
+the SELECT and INSERT column lists, so the source rowids are copied
+verbatim into the target.
+
+SQLite's documentation notes that "The VACUUM command may change the
+ROWIDs of entries in any table that does not have an explicit INTEGER
+PRIMARY KEY." In practice SQLite's `vacuum.c` issues `INSERT INTO NEW.t
+SELECT * FROM OLD.t` (no rowid column), which causes a contiguous
+renumbering (1, 2, 3, …) in the target. Turso carries the original rowid
+across.
+
+**Reproduction**:
+```
+CREATE TABLE t(a TEXT);  -- has_rowid, no INTEGER PRIMARY KEY
+INSERT INTO t VALUES('a'), ('b'), ('c'), ('d');
+DELETE FROM t WHERE a IN ('b','c');
+SELECT rowid, a FROM t;   -- 1|a, 4|d
+VACUUM;
+SELECT rowid, a FROM t;
+-- SQLite: 1|a, 2|d     (renumbered)
+-- Turso:  1|a, 4|d     (preserved)
+```
+
+**Impact**: SQLite-compat divergence. Applications that:
+- serialize rowids as external identifiers and *expect* them to stay stable
+  across VACUUM (portable SQLite apps have historically had to treat this
+  as unsafe because SQLite says so),
+- use `max(rowid)` after VACUUM to estimate density or available slots, or
+- rely on sparse-rowid maintenance via VACUUM for space reuse,
+
+will observe a different post-VACUUM shape on Turso vs SQLite. The same
+divergence appears on `VACUUM INTO`: the destination carries forward the
+source rowids instead of tight-packing them.
