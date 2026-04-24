@@ -1,6 +1,6 @@
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
-    compute_dbhash_with_options_and_database_opts, ExecRows, TempDatabase,
+    compute_dbhash_with_options_and_database_opts, do_flush, ExecRows, TempDatabase,
 };
 use crate::queued_io::{QueuedIo, QueuedIoEvent, QueuedIoOpKind};
 use rusqlite::Connection as SqliteConnection;
@@ -185,6 +185,36 @@ fn assert_plain_vacuum_folded_into_db_file(tmp_db: &TempDatabase, conn: &Arc<Con
         0,
         "VACUUM should truncate the source WAL after checkpoint"
     );
+}
+
+fn assert_plain_vacuum_preserves_content_hash(
+    tmp_db: &TempDatabase,
+    conn: &Arc<Connection>,
+) -> anyhow::Result<()> {
+    // Plain VACUUM can rebuild equivalent sqlite_schema SQL text with different
+    // formatting, so the stable invariant here is table content, not schema
+    // text. Integrity-check covers the post-VACUUM structural side.
+    //
+    // Intentionally do not `cacheflush()` after VACUUM here. Some callers
+    // assert that plain VACUUM left the physical `-wal` folded into the DB
+    // file; a post-VACUUM cacheflush can emit a fresh WAL frame from the live
+    // connection and obscure that invariant.
+    let hash_opts = turso_dbhash::DbHashOptions {
+        without_schema: true,
+        ..Default::default()
+    };
+    do_flush(conn, tmp_db)?;
+    let before = compute_dbhash_with_options_and_database_opts(tmp_db, &hash_opts, tmp_db.db_opts);
+
+    conn.execute("VACUUM")?;
+
+    let after = compute_dbhash_with_options_and_database_opts(tmp_db, &hash_opts, tmp_db.db_opts);
+    assert_eq!(
+        before.hash, after.hash,
+        "plain VACUUM changed logical database content: before={}, after={}",
+        before.hash, after.hash
+    );
+    Ok(())
 }
 
 fn assert_plain_vacuum_preserves_autovacuum_mode(
@@ -3697,6 +3727,110 @@ fn test_vacuum_into_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Resu
 // Plain VACUUM tests
 // ---------------------------------------------------------------------------
 
+/// Plain VACUUM must preserve generated column values.
+#[test]
+fn test_plain_vacuum_preserves_generated_columns() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_generated_columns(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE t (
+            a INTEGER,
+            b INTEGER,
+            c INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL
+        )",
+    )?;
+    conn.execute("INSERT INTO t (a, b) VALUES (10, 20), (100, 200), (7, 8)")?;
+    conn.execute("DELETE FROM t WHERE a = 7")?;
+
+    let before_rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT a, b, c FROM t ORDER BY a");
+    assert_eq!(before_rows, vec![(10, 20, 30), (100, 200, 300)]);
+
+    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
+
+    let after_rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT a, b, c FROM t ORDER BY a");
+    assert_eq!(after_rows, before_rows);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    Ok(())
+}
+
+/// Plain VACUUM must preserve custom type definitions and keep decoded values
+/// usable on both the current and reopened connections.
+#[test]
+fn test_plain_vacuum_preserves_custom_types() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, amount cents) STRICT")?;
+    conn.execute("INSERT INTO t VALUES (1, 42), (2, 100)")?;
+
+    let before_rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM t ORDER BY id");
+    assert_eq!(before_rows, vec![(1, 42), (2, 100)]);
+    let before_hash = compute_plain_vacuum_dbhash(&tmp_db);
+
+    conn.execute("VACUUM")?;
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+    assert_plain_vacuum_integrity_and_hash(&tmp_db, &conn, &before_hash);
+
+    let after_rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM t ORDER BY id");
+    assert_eq!(after_rows, before_rows);
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, opts);
+    let reopened_conn = reopened.connect_limbo();
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
+    assert_eq!(compute_plain_vacuum_dbhash(&reopened), before_hash);
+    let reopened_rows: Vec<(i64, i64)> =
+        reopened_conn.exec_rows("SELECT id, amount FROM t ORDER BY id");
+    assert_eq!(reopened_rows, before_rows);
+
+    Ok(())
+}
+
+/// Plain VACUUM reparses the main schema only; an initialized temp schema on
+/// the same connection must remain usable across the reload.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test]
+fn test_plain_vacuum_keeps_temp_schema_on_same_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE main_t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    for id in 0..80 {
+        conn.execute(format!(
+            "INSERT INTO main_t VALUES({id}, '{}')",
+            "m".repeat(180)
+        ))?;
+    }
+    conn.execute("DELETE FROM main_t WHERE id >= 20")?;
+
+    conn.execute("CREATE TEMP TABLE temp_ids(id INTEGER PRIMARY KEY, note TEXT)")?;
+    conn.execute("INSERT INTO temp.temp_ids VALUES (1, 'one'), (2, 'two')")?;
+
+    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
+
+    let temp_rows: Vec<(i64, String)> =
+        conn.exec_rows("SELECT id, note FROM temp.temp_ids ORDER BY id");
+    assert_eq!(
+        temp_rows,
+        vec![(1, "one".to_string()), (2, "two".to_string())]
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM main_t"), 20);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    conn.execute("INSERT INTO temp.temp_ids VALUES (3, 'three')")?;
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM temp.temp_ids"), 3);
+
+    Ok(())
+}
+
 /// Basic plain VACUUM: data survives the compaction round-trip.
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c REAL);")]
@@ -3792,6 +3926,58 @@ fn test_plain_vacuum_preserves_indexes(tmp_db: TempDatabase) -> anyhow::Result<(
     let rows: Vec<(String,)> = conn.exec_rows("SELECT b FROM t1 WHERE b > 'b' ORDER BY b");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, "gamma");
+
+    Ok(())
+}
+
+/// Plain VACUUM must preserve custom index-method indexes on the source
+/// connection after schema reload.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test]
+fn test_plain_vacuum_preserves_custom_index_method(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
+    conn.execute("CREATE INDEX vec_idx ON vectors USING toy_vector_sparse_ivf (embedding)")?;
+    conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector32_sparse('[1, 0, 0, 0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector32_sparse('[0, 1, 0, 0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector32_sparse('[0, 0, 1, 0]'))")?;
+    let before_nearest: Vec<(i64, String, f64)> = conn.exec_rows(
+        "SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
+         FROM vectors ORDER BY distance LIMIT 1",
+    );
+
+    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
+
+    let indexes: Vec<(String,)> = conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'vectors' ORDER BY name",
+    );
+    assert_eq!(
+        indexes,
+        vec![
+            ("vec_idx".to_string(),),
+            ("vec_idx_inverted_index".to_string(),),
+            ("vec_idx_stats".to_string(),),
+        ],
+    );
+
+    let eqp: Vec<(i64, i64, i64, String)> = conn.exec_rows(
+        "EXPLAIN QUERY PLAN \
+         SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
+         FROM vectors ORDER BY distance LIMIT 1",
+    );
+    assert!(
+        eqp.iter()
+            .any(|(_, _, _, detail)| detail.contains("INDEX METHOD")),
+        "nearest-neighbor query should use custom index method after plain VACUUM, got plan: {eqp:?}",
+    );
+
+    let nearest: Vec<(i64, String, f64)> = conn.exec_rows(
+        "SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
+         FROM vectors ORDER BY distance LIMIT 1",
+    );
+    assert_eq!(nearest, before_nearest);
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
 
     Ok(())
 }
@@ -4567,6 +4753,185 @@ fn assert_mvcc_vacuum_workload(
     let table_scan_hot: Vec<(i64,)> =
         conn.exec_rows("SELECT id FROM t NOT INDEXED WHERE tag = 'hot' ORDER BY id");
     assert_eq!(indexed_hot, table_scan_hot);
+
+    Ok(())
+}
+
+fn populate_mvcc_multi_object_vacuum_workload(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    for table in ["a", "b", "c"] {
+        conn.execute(format!(
+            "CREATE TABLE {table}(id INTEGER PRIMARY KEY, tag TEXT NOT NULL, payload TEXT)"
+        ))?;
+        conn.execute(format!("CREATE INDEX idx_{table}_tag ON {table}(tag)"))?;
+    }
+
+    for id in 0..90 {
+        conn.execute(format!(
+            "INSERT INTO a VALUES({id}, 'tag-{}', '{}')",
+            id % 3,
+            "a".repeat(120)
+        ))?;
+        conn.execute(format!(
+            "INSERT INTO b VALUES({id}, 'tag-{}', '{}')",
+            id % 4,
+            "b".repeat(120)
+        ))?;
+        conn.execute(format!(
+            "INSERT INTO c VALUES({id}, 'tag-{}', '{}')",
+            id % 5,
+            "c".repeat(120)
+        ))?;
+    }
+
+    conn.execute("DELETE FROM a WHERE id % 4 = 0")?;
+    conn.execute("DELETE FROM b WHERE id % 5 = 0")?;
+    conn.execute("DELETE FROM c WHERE id % 6 = 0")?;
+    conn.execute("UPDATE a SET tag = 'hot-a' WHERE id % 10 = 1")?;
+    conn.execute("UPDATE b SET tag = 'hot-b' WHERE id % 9 = 2")?;
+    conn.execute("UPDATE c SET tag = 'hot-c' WHERE id % 8 = 3")?;
+    Ok(())
+}
+
+fn assert_mvcc_multi_object_vacuum_workload(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    assert_eq!(run_integrity_check(conn), "ok");
+
+    assert_eq!(scalar_i64(conn, "SELECT COUNT(*) FROM a"), 67);
+    assert_eq!(scalar_i64(conn, "SELECT COUNT(*) FROM b"), 72);
+    assert_eq!(scalar_i64(conn, "SELECT COUNT(*) FROM c"), 75);
+
+    let hot_a: Vec<(i64,)> = conn.exec_rows("SELECT id FROM a WHERE tag = 'hot-a' ORDER BY id");
+    let hot_a_scan: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM a NOT INDEXED WHERE tag = 'hot-a' ORDER BY id");
+    assert_eq!(hot_a, hot_a_scan);
+    assert_eq!(
+        hot_a,
+        vec![(1,), (11,), (21,), (31,), (41,), (51,), (61,), (71,), (81,)]
+    );
+
+    let hot_b: Vec<(i64,)> = conn.exec_rows("SELECT id FROM b WHERE tag = 'hot-b' ORDER BY id");
+    let hot_b_scan: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM b NOT INDEXED WHERE tag = 'hot-b' ORDER BY id");
+    assert_eq!(hot_b, hot_b_scan);
+    assert_eq!(
+        hot_b,
+        vec![(2,), (11,), (29,), (38,), (47,), (56,), (74,), (83,)]
+    );
+
+    let hot_c: Vec<(i64,)> = conn.exec_rows("SELECT id FROM c WHERE tag = 'hot-c' ORDER BY id");
+    let hot_c_scan: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM c NOT INDEXED WHERE tag = 'hot-c' ORDER BY id");
+    assert_eq!(hot_c, hot_c_scan);
+    assert_eq!(
+        hot_c,
+        vec![
+            (3,),
+            (11,),
+            (19,),
+            (27,),
+            (35,),
+            (43,),
+            (51,),
+            (59,),
+            (67,),
+            (75,),
+            (83,)
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_plain_vacuum_multi_object_rootpage_reset() -> anyhow::Result<()> {
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_multi_object_rootpage_reset.db");
+    let conn = tmp_db.connect_limbo();
+
+    populate_mvcc_multi_object_vacuum_workload(&conn)?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(mvcc_log_file_size(&tmp_db), 0);
+
+    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+    assert_mvcc_multi_object_vacuum_workload(&conn)?;
+
+    conn.execute("INSERT INTO a VALUES(1000, 'after-a', 'payload-a')")?;
+    conn.execute("UPDATE a SET tag = 'after-a-updated' WHERE id = 1")?;
+    conn.execute("INSERT INTO b VALUES(1001, 'after-b', 'payload-b')")?;
+    conn.execute("DELETE FROM b WHERE id = 3")?;
+    conn.execute("INSERT INTO c VALUES(1002, 'after-c', 'payload-c')")?;
+    conn.execute("UPDATE c SET tag = 'after-c-updated' WHERE id = 11")?;
+
+    let after_a: Vec<(i64,)> = conn.exec_rows("SELECT id FROM a WHERE tag = 'after-a' ORDER BY id");
+    assert_eq!(after_a, vec![(1000,)]);
+    let after_a_updated: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM a WHERE tag = 'after-a-updated' ORDER BY id");
+    assert_eq!(after_a_updated, vec![(1,)]);
+    let after_b: Vec<(i64,)> = conn.exec_rows("SELECT id FROM b WHERE tag = 'after-b' ORDER BY id");
+    assert_eq!(after_b, vec![(1001,)]);
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM b WHERE id = 3"), 0);
+    let after_c: Vec<(i64,)> = conn.exec_rows("SELECT id FROM c WHERE tag = 'after-c' ORDER BY id");
+    assert_eq!(after_c, vec![(1002,)]);
+    let after_c_updated: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM c WHERE tag = 'after-c-updated' ORDER BY id");
+    assert_eq!(after_c_updated, vec![(11,)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(mvcc_log_file_size(&tmp_db), 0);
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let reopened_conn = reopened.connect_limbo();
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
+    let reopened_a: Vec<(i64,)> =
+        reopened_conn.exec_rows("SELECT id FROM a WHERE tag = 'after-a' ORDER BY id");
+    assert_eq!(reopened_a, vec![(1000,)]);
+    let reopened_b: Vec<(i64,)> =
+        reopened_conn.exec_rows("SELECT id FROM b WHERE tag = 'after-b' ORDER BY id");
+    assert_eq!(reopened_b, vec![(1001,)]);
+    let reopened_c: Vec<(i64,)> =
+        reopened_conn.exec_rows("SELECT id FROM c WHERE tag = 'after-c' ORDER BY id");
+    assert_eq!(reopened_c, vec![(1002,)]);
+
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_plain_vacuum_discards_reused_index_rootpage_state() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc(
+        "test_mvcc_plain_vacuum_discards_reused_index_rootpage_state.db",
+    );
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("CREATE UNIQUE INDEX idx_old ON t(v COLLATE NOCASE)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")?;
+    conn.execute("UPDATE t SET v = 'c' WHERE id = 1")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(mvcc_log_file_size(&tmp_db), 0);
+
+    conn.execute("DROP INDEX idx_old")?;
+    conn.execute("DROP TABLE t")?;
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("CREATE UNIQUE INDEX idx_new ON u(v COLLATE BINARY)")?;
+    // Plain MVCC VACUUM is only legal after logical changes are checkpointed
+    // into the B-tree image. The stale state being tested is the empty MVCC
+    // index bucket that checkpoint GC leaves behind.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(mvcc_log_file_size(&tmp_db), 0);
+
+    conn.execute("VACUUM")?;
+    conn.execute("INSERT INTO u VALUES (1, 'a')")?;
+    conn.execute("INSERT INTO u VALUES (2, 'A')")?;
+
+    let indexed: Vec<(String,)> = conn.exec_rows("SELECT v FROM u INDEXED BY idx_new ORDER BY v");
+    let scanned: Vec<(String,)> = conn.exec_rows("SELECT v FROM u NOT INDEXED ORDER BY v");
+    assert_eq!(scanned, vec![("A".to_string(),), ("a".to_string(),)]);
+    assert_eq!(
+        indexed, scanned,
+        "post-VACUUM MVCC index state must use idx_new's BINARY collation"
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
 
     Ok(())
 }
