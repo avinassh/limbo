@@ -1,0 +1,350 @@
+@database :temp:
+
+# Reproducers for the VACUUM bugs logged in vacuum_bugs.md.
+# Each test exercises one bug and is written to express the CORRECT
+# (expected) behavior. On current Turso most of these fail; they pass
+# after the corresponding fix lands.
+#
+# Bugs that require a SQLite-created source database, a filesystem
+# check, or an experimental feature flag (encryption, custom types,
+# autovacuum, index methods) live in tests/integration/vacuum_bugs.rs
+# instead of this file. See that file for:
+#   Bug 1, 5, 7, 9, 12, 13, 14, 17, 18, 19, 20, 21, 22, 25, 26, 27, 28, 30.
+
+# ---------------------------------------------------------------------
+# Bug 2: VACUUM fails on databases with MATERIALIZED VIEWs.
+# ---------------------------------------------------------------------
+@backend rust
+@requires materialized_views "Bug 2 involves CREATE MATERIALIZED VIEW"
+test vacuum-bug2-materialized-view-inplace {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (1, 'hello');
+    CREATE MATERIALIZED VIEW mv AS SELECT * FROM t WHERE a > 0;
+    VACUUM;
+    SELECT a, b FROM mv ORDER BY a;
+}
+expect {
+    1|hello
+}
+
+# ---------------------------------------------------------------------
+# Bug 3: In-place VACUUM on a never-initialized DB returns an internal
+# error instead of being a silent no-op (SQLite behaviour).
+# ---------------------------------------------------------------------
+@backend rust
+test vacuum-bug3-empty-never-initialized-db {
+    VACUUM;
+}
+expect {
+}
+
+# ---------------------------------------------------------------------
+# Bug 4: VACUUM schema name comparison is case-sensitive.
+# "MAIN", "Main", quoted "main" should all be equivalent to "main".
+# ---------------------------------------------------------------------
+@backend rust
+test vacuum-bug4-main-uppercase {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    VACUUM MAIN;
+    SELECT * FROM t;
+}
+expect {
+    1
+}
+
+@backend rust
+test vacuum-bug4-main-mixedcase {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    VACUUM Main;
+    SELECT * FROM t;
+}
+expect {
+    1
+}
+
+# ---------------------------------------------------------------------
+# Bug 6: VACUUM clobbers sqlite_sequence.seq when the user-set value is
+# lower than max(rowid). SQLite preserves the user's value via a
+# "disable AUTOINCREMENT during VACUUM" flag that Turso lacks
+# (see core/vdbe/vacuum.rs:725 `todo`).
+# ---------------------------------------------------------------------
+@backend rust
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+test vacuum-bug6-sqlite_sequence-manual-seq-preserved {
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val);
+    INSERT INTO t(val) VALUES ('a');
+    INSERT INTO t(id, val) VALUES (100, 'b');
+    UPDATE sqlite_sequence SET seq = 50 WHERE name = 't';
+    VACUUM;
+    SELECT seq FROM sqlite_sequence WHERE name = 't';
+}
+expect {
+    50
+}
+
+# Bug 6 extension: sqlite_sequence.seq = NULL (or non-numeric) should
+# survive VACUUM unchanged. Turso currently clobbers it with max(rowid).
+@backend rust
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+test vacuum-bug6-sqlite_sequence-null-seq-preserved {
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t(id) VALUES (50);
+    UPDATE sqlite_sequence SET seq = NULL WHERE name = 't';
+    VACUUM;
+    SELECT typeof(seq), seq FROM sqlite_sequence WHERE name = 't';
+}
+expect {
+    null|
+}
+
+# ---------------------------------------------------------------------
+# Bug 8: VACUUM INTO parser rejects any expression other than a bare
+# string literal or identifier. SQLite accepts parameter binding and
+# string concatenation.
+# ---------------------------------------------------------------------
+@backend rust
+test vacuum-bug8-vacuum-into-concatenation {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    VACUUM INTO '/tmp/limbo_' || 'bug8.db';
+}
+expect {
+}
+
+@backend rust
+test vacuum-bug8-vacuum-into-function-result {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    VACUUM INTO printf('/tmp/limbo_%s.db', 'bug8b');
+}
+expect {
+}
+
+# ---------------------------------------------------------------------
+# Bug 10: VACUUM should renumber rowids for tables without INTEGER
+# PRIMARY KEY (SQLite-documented behaviour). Turso preserves the source
+# rowids instead of tight-packing.
+# ---------------------------------------------------------------------
+@backend rust
+test vacuum-bug10-rowid-renumbering {
+    CREATE TABLE t (a TEXT);
+    INSERT INTO t (rowid, a) VALUES (10, 'first');
+    INSERT INTO t (rowid, a) VALUES (50, 'second');
+    INSERT INTO t (rowid, a) VALUES (1000, 'third');
+    VACUUM;
+    SELECT rowid, a FROM t ORDER BY a;
+}
+expect {
+    1|first
+    2|second
+    3|third
+}
+
+# ---------------------------------------------------------------------
+# Bug 11: VACUUM fails when a row violates a CHECK constraint, even if
+# the row was legally inserted via PRAGMA ignore_check_constraints.
+# SQLite's page-level xfer preserves such rows.
+# ---------------------------------------------------------------------
+@backend rust
+test vacuum-bug11-check-constraint-violating-row-preserved {
+    CREATE TABLE t (a INTEGER CHECK (a > 0));
+    PRAGMA ignore_check_constraints = 1;
+    INSERT INTO t VALUES (-5);
+    PRAGMA ignore_check_constraints = 0;
+    VACUUM;
+    SELECT a FROM t;
+}
+expect {
+    -5
+}
+
+# ---------------------------------------------------------------------
+# Bug 15: In-place VACUUM on an MVCC source demotes journal_mode to
+# WAL silently. A fresh connection post-VACUUM should still see mvcc.
+# ---------------------------------------------------------------------
+@backend rust
+@skip-if sqlite "journal_mode=mvcc is a Turso-only feature"
+test vacuum-bug15-mvcc-not-demoted {
+    PRAGMA journal_mode = mvcc;
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    VACUUM;
+    PRAGMA journal_mode;
+}
+expect {
+    mvcc
+    0|0|0
+    mvcc
+}
+
+# ---------------------------------------------------------------------
+# Bug 16: VACUUM INTO emits a spurious CDC commit marker on the source.
+# A read-only maintenance operation must not mutate the CDC log.
+# ---------------------------------------------------------------------
+@backend rust
+@skip-if sqlite "unstable_capture_data_changes_conn is Turso-specific"
+@skip-if mvcc "CDC wiring differs in MVCC mode"
+test vacuum-bug16-vacuum-into-no-spurious-cdc-commit {
+    CREATE TABLE t (a);
+    PRAGMA unstable_capture_data_changes_conn = 'full';
+    INSERT INTO t VALUES (1);
+    SELECT count(*) FROM turso_cdc;
+    VACUUM INTO '/tmp/limbo_bug16_out.db';
+    SELECT count(*) FROM turso_cdc;
+}
+expect {
+    2
+    2
+}
+
+# ---------------------------------------------------------------------
+# Bug 23: The spurious CDC commit marker from Bug 16 is *not durable*.
+# The same-connection view diverges from what other connections/tools
+# observe after a checkpoint. Post-checkpoint the count should match
+# what a fresh connection sees.
+# ---------------------------------------------------------------------
+@backend rust
+@skip-if sqlite "unstable_capture_data_changes_conn is Turso-specific"
+@skip-if mvcc "CDC wiring differs in MVCC mode"
+test vacuum-bug23-phantom-cdc-commit-marker-durable {
+    CREATE TABLE t (a);
+    PRAGMA unstable_capture_data_changes_conn = 'full';
+    INSERT INTO t VALUES (1);
+    VACUUM INTO '/tmp/limbo_bug23_out.db';
+    SELECT count(*) FROM turso_cdc;
+    PRAGMA wal_checkpoint(FULL);
+    SELECT count(*) FROM turso_cdc;
+}
+expect {
+    2
+    0|0|0
+    2
+}
+
+# ---------------------------------------------------------------------
+# Bug 24: VACUUM fails after ALTER TABLE RENAME COLUMN on an expression
+# index or a COLLATE-clause index (the stored CREATE INDEX SQL is not
+# rewritten). SQLite correctly rewrites the stored SQL so VACUUM works.
+# ---------------------------------------------------------------------
+@backend rust
+test vacuum-bug24-rename-column-expression-index-then-vacuum {
+    CREATE TABLE t (old_col INTEGER, b TEXT);
+    CREATE INDEX ix_expr ON t(old_col * 2);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t RENAME COLUMN old_col TO new_col;
+    VACUUM;
+    SELECT sql FROM sqlite_master WHERE name = 'ix_expr';
+}
+expect {
+    CREATE INDEX ix_expr ON t (new_col * 2)
+}
+
+@backend rust
+test vacuum-bug24-rename-column-collate-index-then-vacuum {
+    CREATE TABLE t (old_col TEXT, b TEXT);
+    CREATE INDEX ix_collate ON t(old_col COLLATE BINARY);
+    INSERT INTO t VALUES ('hello', 'x');
+    ALTER TABLE t RENAME COLUMN old_col TO new_col;
+    VACUUM;
+    SELECT sql FROM sqlite_master WHERE name = 'ix_collate';
+}
+expect {
+    CREATE INDEX ix_collate ON t (new_col COLLATE BINARY)
+}
+
+# ---------------------------------------------------------------------
+# Bug 29: In-place VACUUM panics with "must not already hold a read
+# lock" after SELECT from a pragma_* virtual table. Must return a
+# normal SQL result instead of a process-level panic.
+# ---------------------------------------------------------------------
+@backend rust
+test vacuum-bug29-pragma-foreign_keys-vt-then-vacuum {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT * FROM pragma_foreign_keys;
+    VACUUM;
+    SELECT a FROM t;
+}
+expect {
+    0
+    1
+}
+
+@backend rust
+test vacuum-bug29-pragma-table_info-vt-then-vacuum {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1);
+    SELECT name FROM pragma_table_info('t');
+    VACUUM;
+    SELECT a FROM t;
+}
+expect {
+    a
+    1
+}
+
+@backend rust
+test vacuum-bug29-pragma-function_list-vt-then-vacuum {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT count(*) > 0 FROM pragma_function_list;
+    VACUUM;
+    SELECT a FROM t;
+}
+expect {
+    1
+    1
+}
+
+# ---------------------------------------------------------------------
+# Bug 31: Same-session UPDATE sqlite_sequence.name gets clobbered by
+# the AUTOINCREMENT cache during VACUUM copy. The user's UPDATE must
+# survive a subsequent VACUUM.
+# ---------------------------------------------------------------------
+@backend rust
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+test vacuum-bug31-update-name-null-preserved {
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t DEFAULT VALUES;
+    UPDATE sqlite_sequence SET name = NULL WHERE name = 't';
+    VACUUM;
+    SELECT typeof(name) FROM sqlite_sequence;
+}
+expect {
+    null
+}
+
+@backend rust
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+test vacuum-bug31-update-name-rename-single-row {
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t DEFAULT VALUES;
+    UPDATE sqlite_sequence SET name = 'renamed' WHERE name = 't';
+    VACUUM;
+    SELECT count(*), name, seq FROM sqlite_sequence;
+}
+expect {
+    1|renamed|1
+}
+
+# ---------------------------------------------------------------------
+# Bug 33: CDC-enabled source causes VACUUM to add a turso_cdc row to
+# sqlite_sequence that wasn't there before. VACUUM of a CDC source must
+# leave sqlite_sequence untouched by the internal AUTOINCREMENT counter.
+# ---------------------------------------------------------------------
+@backend rust
+@skip-if sqlite "unstable_capture_data_changes_conn is Turso-specific"
+@skip-if mvcc "CDC wiring differs in MVCC mode"
+test vacuum-bug33-cdc-no-turso_cdc-row-in-sqlite_sequence {
+    CREATE TABLE t (a);
+    PRAGMA unstable_capture_data_changes_conn = 'full';
+    INSERT INTO t VALUES (1);
+    VACUUM;
+    SELECT count(*) FROM sqlite_sequence WHERE name = 'turso_cdc';
+}
+expect {
+    0
+}

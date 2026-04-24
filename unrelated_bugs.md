@@ -345,3 +345,69 @@ broader than this one table. Every UPDATE against `turso_cdc_version`
 or similar CDC-tracked internal tables risks the same panic whenever
 the emitter path expects a before-register state that the
 non-regular-INSERT source never populated.
+
+## U19: Turso normalizes `IS [NOT] DISTINCT FROM` to `IS [NOT]` in stored CREATE SQL
+
+Turso's parser-then-stringify path rewrites the SQL-standard
+`IS [NOT] DISTINCT FROM` operators to their shorter `IS [NOT]` synonyms
+when re-stringifying. This happens at CREATE time (not at VACUUM time),
+so it is a general parser behavior — not a VACUUM bug. VACUUM still
+makes the divergence visible on SQLite-sourced databases because it
+re-stores the CREATE SQL.
+
+```
+$ tursodb /tmp/x.db 'CREATE TABLE t(a); CREATE TRIGGER tr AFTER INSERT ON t
+    WHEN NEW.a IS NOT DISTINCT FROM 5 BEGIN SELECT 1; END;
+    SELECT sql FROM sqlite_master WHERE name="tr";'
+CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.a IS 5 BEGIN SELECT 1; END
+# Expected: `IS NOT DISTINCT FROM 5`
+```
+
+The operators are semantically equivalent (both handle NULL the same
+way), but the on-disk CREATE text diverges from what the user wrote and
+from what SQLite preserves. Schema-diff tools and dump/restore pipelines
+see different text for the same logical trigger.
+
+
+## U20: Turso re-interprets `DEFAULT "false"` / `"true"` as boolean keywords at CREATE TABLE time
+
+SQLite's DDL parser preserves `"false"` as a double-quoted string literal
+in `CREATE TABLE t(a DEFAULT "false")`. Turso's parser treats the same
+text as the boolean keyword `FALSE`, so both the stored CREATE SQL and
+future `INSERT DEFAULT VALUES` statements use the boolean instead.
+
+```
+$ tursodb /tmp/x.db '
+    CREATE TABLE t(a DEFAULT "false");
+    SELECT sql FROM sqlite_master WHERE name="t";
+    INSERT INTO t DEFAULT VALUES;
+    SELECT typeof(a), a FROM t;'
+CREATE TABLE t (a DEFAULT FALSE)      ← stored as keyword, not string
+integer|0                              ← insert is boolean 0, not text "false"
+```
+
+Same for `DEFAULT "true"` → `DEFAULT TRUE`, case-insensitive. `DEFAULT
+"NULL"` is NOT affected — stored as string `"NULL"`. This is a Turso
+parser issue, not a VACUUM issue, though VACUUM will cement the
+divergence by rewriting the stored CREATE SQL on a SQLite-sourced DB.
+
+
+## U21: Turso cannot open a SQLite-created DB that contains any STORED generated column
+
+Turso rejects `GENERATED ALWAYS AS (...) STORED` at parse time, so even
+opening a SQLite database containing such a column fails with "Stored
+generated columns are not supported". The `VIRTUAL` form is supported;
+only `STORED` is blocked.
+
+```
+$ sqlite3 /tmp/x.db 'CREATE TABLE t(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) STORED);'
+$ tursodb /tmp/x.db --experimental-generated-columns 'SELECT 1;'
+Error: Parse error: Stored generated columns are not supported
+$ tursodb /tmp/x.db --experimental-generated-columns 'SELECT name FROM sqlite_master;'
+Error: Parse error: Stored generated columns are not supported
+```
+
+SELECT, INSERT, and VACUUM all fail the same way — the database is
+effectively unopenable in Turso. Not a VACUUM-specific issue; VACUUM is
+just one operation among many that can't reach the database.
+
