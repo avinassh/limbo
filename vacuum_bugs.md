@@ -1519,3 +1519,191 @@ their WHERE clause. The stored sqlite_master SQL is unchanged by a
 failed VACUUM, but VACUUM INTO leaks a 4-KB partial destination (Bug 14
 family).
 
+
+## Bug 36: VACUUM lowercases `sqlite_master.name` for SQLite-created tables/indexes/views/triggers
+
+**Location**: `core/util.rs:121` `normalize_ident` converts every identifier
+to lowercase before it lands in the target's `sqlite_schema.name` column.
+VACUUM's schema replay goes through the normal `CREATE TABLE/INDEX/VIEW/TRIGGER`
+paths, so every user-visible object name gets downcased at replay.
+
+**Root cause**: Turso stores object names in `sqlite_master.name` in their
+lowercased form regardless of the original case in `CREATE ...` SQL. U9
+already documents this for newly-created schemas. VACUUM extends the
+effect to SQLite-authored databases: before VACUUM the `name` column
+still carries the source's mixed case (Turso reads the bytes SQLite
+wrote); after VACUUM the replayed entries overwrite those bytes with
+lowercase.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db "
+    CREATE TABLE MyTable(A INT);
+    CREATE INDEX MyIdx ON MyTable(A);
+    CREATE VIEW MyView AS SELECT * FROM MyTable;
+    CREATE TRIGGER MyTrig AFTER INSERT ON MyTable BEGIN SELECT 1; END;
+"
+
+$ tursodb /tmp/x.db -q -m list 'SELECT type, name FROM sqlite_master;'
+table|MyTable            <-- pre-VACUUM: SQLite's original case preserved
+index|MyIdx
+view|MyView
+trigger|MyTrig
+
+$ tursodb /tmp/x.db -q -m list 'VACUUM; SELECT type, name FROM sqlite_master;'
+table|mytable            <-- post-VACUUM: lowercased
+index|myidx
+view|myview
+trigger|mytrig
+
+$ sqlite3 /tmp/x.db "SELECT name FROM sqlite_master WHERE name='MyTable';"
+                     (empty — the row no longer matches the original name)
+```
+
+The `sql` column still retains the original case (`CREATE TABLE MyTable (...)`),
+so a VACUUMed database becomes internally inconsistent: `sqlite_master.name`
+says `mytable` but `sqlite_master.sql` says `MyTable`. Tools that
+case-sensitively filter by `name` break across VACUUM.
+
+`VACUUM INTO` has the same effect — the destination file's `sqlite_master`
+has lowercased names.
+
+**Impact**: SQLite preserves the exact case of every object name across
+VACUUM. Turso silently rewrites `sqlite_master.name` to lowercase for
+every storage-backed table, every index, every view, and every trigger
+in a SQLite-origin database. Migrations/tooling that depend on case-
+sensitive lookup against `sqlite_master.name` (sync layers, schema
+checksums, ORM introspection, etc.) work on the original file and stop
+working after a Turso VACUUM. Column names inside `PRAGMA table_info`
+are not affected — only the top-level object names in `sqlite_schema`.
+
+
+## Bug 37: VACUUM fails on SQLite-created DBs with `PRIMARY KEY (col COLLATE X)` or `UNIQUE (col COLLATE X)` table constraints
+
+**Location**: `translate_create_table` / table-constraint indexed-columns
+parser in `core/translate/schema.rs`. The indexed-column list inside a
+table-level `PRIMARY KEY(...)` or `UNIQUE(...)` rejects `COLLATE` suffixes
+with `"unsupported primary key expression"` / `"unsupported unique key
+expression"`. SQLite accepts the suffix and writes it into the stored
+DDL verbatim.
+
+**Reproduction** (PRIMARY KEY):
+```
+$ sqlite3 /tmp/x.db "
+    CREATE TABLE t(a INT, b TEXT, PRIMARY KEY(a, b COLLATE NOCASE));
+    INSERT INTO t VALUES(1, 'Apple');
+"
+
+$ tursodb /tmp/x.db -q -m list 'VACUUM;'
+Error: Parse error: unsupported primary key expression: b COLLATE NOCASE
+```
+
+**Reproduction** (UNIQUE, including CONSTRAINT-named variants):
+```
+$ sqlite3 /tmp/x.db "CREATE TABLE t(a INT, b TEXT, UNIQUE(a, b COLLATE NOCASE));"
+$ tursodb /tmp/x.db -q -m list 'VACUUM;'
+Error: Parse error: unsupported unique key expression: b COLLATE NOCASE
+
+$ sqlite3 /tmp/x.db "
+    CREATE TABLE t(a INT, b TEXT,
+      CONSTRAINT my_u UNIQUE(a, b COLLATE NOCASE));
+"
+$ tursodb /tmp/x.db -q -m list 'VACUUM;'
+Error: Parse error: unsupported unique key expression: b COLLATE NOCASE
+```
+
+Scope of the rejection:
+- Inline column-level `b TEXT COLLATE NOCASE PRIMARY KEY` — **accepted**
+- Inline column-level `b TEXT COLLATE NOCASE UNIQUE` — **accepted**
+- `CREATE INDEX ... ON t(b COLLATE NOCASE)` — **accepted**
+- `PRIMARY KEY(b DESC)` / `UNIQUE(b DESC)` — **accepted** (only COLLATE
+  trips the rejection; ASC/DESC in the same position is fine)
+- Table-level `PRIMARY KEY(..., col COLLATE X)` — **rejected**
+- Table-level `UNIQUE(..., col COLLATE X)` — **rejected**
+- Table-level `CONSTRAINT name UNIQUE(..., col COLLATE X)` — **rejected**
+
+**Impact**: The rejection fires at schema-parse time, so Turso cannot
+even `SELECT` from such a database — opening the connection succeeds
+but the first statement that consults the schema (including VACUUM)
+hits the parse error. From a VACUUM perspective this means any
+SQLite-origin database with a COLLATE clause in a PK/UNIQUE table
+constraint becomes unmaintainable through Turso: no VACUUM in-place,
+no VACUUM INTO, and no way to read data out to migrate. VACUUM INTO
+additionally does not leak the destination file here because the
+failure happens at schema open, before any writes.
+
+The Turso parser inconsistency is the root cause (the column-level
+equivalents work) and surfaces identically whether the PK/UNIQUE is
+unnamed or uses a `CONSTRAINT name` prefix.
+
+
+## Bug 38: VACUUM writes the SQLite library version into the `version-valid-for number` header field
+
+**Location**: `core/vdbe/vacuum.rs::finalize_vacuum_target_header` (both
+in-place and VACUUM INTO reach this). The code populates a new header
+via `header_meta.apply_to(header)` but does not update byte offsets
+92–95 (`version-valid-for number`) to the current change_counter value
+— the pager's header-writer copies the stored `SQLITE_VERSION_NUMBER`
+(e.g. 3047000 for Turso's SQLite-compat version 3.47.0) into both bytes
+92–95 *and* bytes 96–99, instead of storing the change-counter value at
+offset 92–95.
+
+Per the [SQLite file format spec](https://sqlite.org/fileformat2.html):
+
+> The 4-byte big-endian integer at offset 92 is the value of the change
+> counter when the version number was stored. The integer at offset 92
+> indicates which transaction the version number is valid for and is
+> sometimes called the "version-valid-for number".
+
+So byte 92–95 **must** equal the `change_counter` value (bytes 24–27)
+as of the moment the version number was recorded. Turso writes the
+sqlite_version literal instead, so after a VACUUM the two fields are
+always mismatched on the output database.
+
+**Reproduction** (VACUUM INTO):
+```
+$ sqlite3 /tmp/x.db "CREATE TABLE t(a); INSERT INTO t VALUES(1); INSERT INTO t VALUES(2);"
+$ tursodb /tmp/x.db -q -m list "VACUUM INTO '/tmp/out.db';"
+
+$ python3 - <<'EOF'
+import struct
+with open('/tmp/out.db', 'rb') as f:
+    f.seek(24); cc = struct.unpack('>I', f.read(4))[0]
+    f.seek(92); vvf = struct.unpack('>I', f.read(4))[0]
+    f.seek(96); svn = struct.unpack('>I', f.read(4))[0]
+print(f'change_counter={cc} version_valid_for={vvf} sqlite_version={svn}')
+EOF
+change_counter=1 version_valid_for=3047000 sqlite_version=3047000
+
+# SQLite's VACUUM INTO on the same source:
+$ sqlite3 /tmp/x.db "VACUUM INTO '/tmp/out2.db';"
+# change_counter=1 version_valid_for=1 sqlite_version=3045001
+```
+
+**Reproduction** (in-place VACUUM):
+```
+$ sqlite3 /tmp/x.db "CREATE TABLE t(a); INSERT INTO t VALUES(1); INSERT INTO t VALUES(2);"
+# Source: change_counter=3, version_valid_for=3 (in sync)
+
+$ tursodb /tmp/x.db -q -m list "VACUUM;"
+# After Turso VACUUM: change_counter=1, version_valid_for=3047000 (out of sync)
+
+# SQLite VACUUM on equivalent source:
+# After SQLite VACUUM: change_counter=4, version_valid_for=4 (in sync, bumped together)
+```
+
+**Impact**: The version-valid-for field is one of the handful of header
+integrity signals that external tooling (integrity checkers, recovery
+tools, `sqlite3_analyzer`, file-format inspectors) reads to judge
+whether the cached `SQLITE_VERSION_NUMBER` is trustworthy. On a
+Turso-vacuumed file, every such tool sees "the sqlite_version was
+stored when change_counter was 3047000" — but change_counter is 1 —
+which is either nonsense or will be interpreted as "the version
+metadata is stale and must be re-read." Mirroring, replication, and
+CDC pipelines that hash the header will also see a byte pattern that
+never occurs in a SQLite-written file. The bug is distinct from
+Bug 17 (change_counter is reset to 1 instead of incremented): Bug 17
+is about the change_counter itself being wrong, Bug 38 is about the
+`version-valid-for` pointer that is *supposed to track* the
+change_counter being wrong. Neither bug corrupts user data.
+

@@ -943,3 +943,125 @@ DB only when the DDL uses single-quoted strings. Logged as Bug 34.
 - VACUUM + page 1 corrupted via manual patch of byte 28 (in-header db size) —
   VACUUM successfully rebuilds, correcting the page count
 
+
+## Session 10
+
+### 42. SQLite-origin DBs with MixedCase object names get lowercased by VACUUM
+Tried a handful of shapes:
+- Table, index, view, trigger names (MyTable, MyIdx, MyView, MyTrig)
+- `PRAGMA table_info` vs `sqlite_master.name` vs `sqlite_master.sql`
+- Verified SQLite reads back the Turso-VACUUMed DB with the same
+  lowercased names
+- Checked `tbl_name` column too (also lowercased)
+- Column names inside tables are NOT affected — only the top-level
+  object name in `sqlite_schema`
+
+Logged as Bug 36.
+
+### 43. Parser rejections for `PRIMARY KEY(col COLLATE X)` / `UNIQUE(col COLLATE X)`
+Explored the scope of Turso's schema-constraint parser:
+- Column-level COLLATE with PRIMARY KEY / UNIQUE / combined — all OK
+- CREATE INDEX with COLLATE in column list — OK
+- CREATE INDEX WHERE clause with COLLATE — Bug 35 (already logged)
+- Table-level PRIMARY KEY(a, b COLLATE X) — FAILS with
+  "unsupported primary key expression"
+- Table-level UNIQUE(a, b COLLATE X) — FAILS with
+  "unsupported unique key expression"
+- CONSTRAINT-named variants (`CONSTRAINT c UNIQUE(...COLLATE...)`) —
+  same failure
+- ASC/DESC in the same position is fine; only COLLATE trips the
+  rejection
+
+Logged as Bug 37. Note: surfaces at schema-open, not just VACUUM, so
+SELECT/INSERT also fail — listed as VACUUM-related since VACUUM is a
+common user-visible path.
+
+### 44. `version-valid-for number` (bytes 92-95) is wrong after VACUUM
+Read the output header bytes from Turso's VACUUM and VACUUM INTO
+outputs and compared to SQLite's. Turso writes the
+`SQLITE_VERSION_NUMBER` (3047000) into both bytes 92-95 and bytes 96-99.
+SQLite writes the change_counter value at byte 92-95, and the actual
+SQLite version number at bytes 96-99 — the former is the "version is
+valid when change_counter == X" pointer.
+
+Verified the mismatch holds for both in-place VACUUM and VACUUM INTO.
+SQLite keeps change_counter and version-valid-for in sync (both bump
+together). Turso's output is always out-of-sync.
+
+Logged as Bug 38.
+
+### 45. Other things tried, no new bug
+- VACUUM INTO to path with trailing slash — Turso fails with
+  "not a directory"; SQLite strips the slash and creates a file at
+  that path. Cosmetic difference, logged as a note.
+- VACUUM + source has PRAGMA user_version / application_id / page_size
+  — all preserved correctly through in-place + VACUUM INTO
+- VACUUM + various CREATE TRIGGER constructs (recursive CTE, nested
+  SELECT, BEFORE/AFTER/WHEN with subquery, UPSERT/UPDATE OR REPLACE,
+  multi-statement BEGIN blocks, RAISE with all conflict actions,
+  ORDER BY in UPDATE/DELETE inside trigger, JOIN/USING in SELECT body)
+  — all round-trip correctly
+- VACUUM + source has CREATE VIEW with WINDOW function, UNION ALL,
+  EXCEPT, INTERSECT, CROSS JOIN, NATURAL JOIN, correlated subquery,
+  FILTER clause, CTE, column alias list — all preserved
+- VACUUM + source has rowid-shadowing column (rowid/oid/_rowid_ as
+  actual columns, in various cases) — preserved
+- VACUUM + source has DEFAULT expression with all built-in functions
+  (sqlite_version, sqlite_source_id, current_timestamp, random,
+  abs, strftime, julianday, CAST, unlikely, likely, CASE) — preserved
+- VACUUM + source has very large BLOB (up to 10MB single cell, and 1MB
+  row) requiring many overflow pages — preserved, integrity_check ok
+- VACUUM + source has CHECK constraints with BETWEEN, IS NULL, IS TRUE,
+  LIKE ... ESCAPE, CASE, subqueryless complex boolean — preserved
+- VACUUM + source has FOREIGN KEY with every clause combination
+  (MATCH FULL/PARTIAL/SIMPLE, ON DELETE/UPDATE CASCADE/SET NULL/SET
+  DEFAULT/RESTRICT/NO ACTION, DEFERRABLE INITIALLY DEFERRED/IMMEDIATE,
+  composite, circular) — preserved
+- VACUUM + source has REFERENCES without column list (implicit PK
+  lookup) — preserved
+- VACUUM + source has DEFAULT with ranging types (i64 MIN/MAX, INF,
+  REAL with many digits, large hex integer, negative literal) — preserved
+- VACUUM + source has column types with any number of parens/commas
+  (NUMERIC(10,2), CHARACTER VARYING(255), NATIONAL CHARACTER, etc.) —
+  preserved
+- VACUUM + source has specifically AUTOINCREMENT+seq combinations
+  (seq < max(rowid), seq = NULL, multiple rows in sqlite_sequence,
+  orphan name, very large seq) — Bug 6 family, no new cases
+- VACUUM + source has sqlite_stat1 rows for nonexistent tables/indexes,
+  NULL rows, garbage stat strings — preserved verbatim
+- VACUUM + source has columns with every flavor of reserved-keyword
+  name (check/create/select/from/where/order/group/having/cast/
+  excluded/raise/without/generated/always/stored/virtual/type/NULL/TRUE
+  etc.) — names survive (quoted at store time)
+- VACUUM + very large schemas (1999 columns, 200 tables, 500 triggers,
+  100 views) — all replay correctly
+- VACUUM + source has UNICODE characters in table/column names
+  (CJK, emoji, BOM-prefixed) — preserved
+- VACUUM + source has stored DDL that SQLite normalized into a
+  multi-line form (e.g. after RENAME or DROP COLUMN) — Turso
+  re-serializes into one-line form (U3 family)
+- VACUUM + `MATCH FULL` clause — Turso wraps FULL in double quotes
+  in the stored DDL (cosmetic, still parses)
+- VACUUM INTO to /dev/shm (tmpfs) — works; relative path with `..`
+  works; hardlink as dest file is rejected; symlink to existing file
+  is rejected
+- VACUUM INTO source has -shm (WAL shared mem) garbage — no effect,
+  VACUUM proceeds
+- VACUUM INTO dest pre-existing `.db-wal` sidecar (garbage contents) —
+  Turso zeros it out and writes fresh (Bug 19 already logged)
+- VACUUM INTO + --readonly source — works
+- VACUUM on MVCC db (`PRAGMA journal_mode=experimental_mvcc`) — works
+  after checkpoint, but demotes source to WAL (Bug 15)
+- VACUUM on a DB with `PRAGMA journal_mode=DELETE` — output gets WAL
+  header bytes 18/19 (Bug 21)
+- VACUUM + source has ALTER TABLE RENAME TO + preserves old sqlite_
+  stored form — SQLite stores `CREATE TABLE IF NOT EXISTS "new"` with
+  IF NOT EXISTS; Turso drops the IF NOT EXISTS on replay. Minor.
+- VACUUM + source has CHECK(expr) ON CONFLICT FAIL — SQLite accepts;
+  Turso cannot PARSE at open time (not VACUUM-specific). U22.
+- PRAGMA default_cache_size not a valid pragma name in Turso. U24.
+- PRAGMA schema_version prints unsigned in Turso, signed in SQLite when
+  top bit is set. U23.
+- VACUUM panics with `unreachable!()` on writable-schema-corrupted
+  `sql=' '` entry (also affects SELECT). U25.
+

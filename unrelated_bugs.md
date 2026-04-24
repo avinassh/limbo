@@ -411,3 +411,90 @@ SELECT, INSERT, and VACUUM all fail the same way — the database is
 effectively unopenable in Turso. Not a VACUUM-specific issue; VACUUM is
 just one operation among many that can't reach the database.
 
+
+## U22: Parser rejects CHECK(expr) ON CONFLICT <action> table constraint
+
+SQLite accepts `CHECK(expr) ON CONFLICT FAIL` as a table-level constraint.
+Turso's parser rejects it outright with `near "ON": syntax error`, making
+any SQLite-origin database that uses this construct unreadable:
+
+```
+$ sqlite3 /tmp/x.db "CREATE TABLE t(a INT, CHECK(a > 0) ON CONFLICT FAIL);"
+$ tursodb /tmp/x.db 'SELECT * FROM t;'
+Error: near "ON": syntax error
+$ tursodb /tmp/x.db 'VACUUM;'
+Error: near "ON": syntax error
+```
+
+`ON CONFLICT <action>` is accepted in other positions:
+- `INTEGER PRIMARY KEY ON CONFLICT FAIL` — works
+- `a TEXT NOT NULL ON CONFLICT FAIL` — works
+- `a TEXT UNIQUE ON CONFLICT ROLLBACK` — works (column-level)
+
+Only table-level `CHECK(...) ON CONFLICT ...` (and probably table-level
+`CHECK CONSTRAINT name CHECK(...)` + ON CONFLICT) trips the parser.
+VACUUM surfaces this because replayed DDL hits the same parser, but the
+root cause is schema-open parsing.
+
+
+## U23: `PRAGMA schema_version` displays unsigned, SQLite displays signed
+
+When the stored `schema_cookie` in the header has the top bit set (so a
+value >= 0x80000000), SQLite's `PRAGMA schema_version` prints it as a
+negative int32 while Turso prints the unsigned 32-bit value:
+
+```
+$ python3 -c "
+with open('/tmp/x.db', 'r+b') as f: f.seek(40); f.write(b'\\x80\\x00\\x00\\x00')
+"
+$ sqlite3 /tmp/x.db 'PRAGMA schema_version;'
+-2147483648
+$ tursodb /tmp/x.db 'PRAGMA schema_version;'
+2147483648
+```
+
+Cosmetic display difference, but tools that feed the value back into a
+comparison (`WHERE schema_version < 0`) get different results.
+
+
+## U24: `PRAGMA default_cache_size` rejected as "Not a valid pragma name"
+
+Turso's pragma table doesn't include `default_cache_size`. SQLite accepts
+it both as a setter and a getter (the value is stored in bytes 48-51 of
+the database header). Turso rejects the pragma name:
+
+```
+$ tursodb :memory: 'PRAGMA default_cache_size;'
+Error: Parse error: Not a valid pragma name
+```
+
+Turso can still *read* the cache-size bytes from a SQLite-written header
+during VACUUM — the value is preserved on VACUUM INTO — but users cannot
+set or inspect it from the CLI.
+
+
+## U25: Turso VACUUM panics when `sqlite_master.sql` is whitespace-only (also affects SELECT)
+
+When a SQLite database's `sqlite_master.sql` for a table has been
+scribbled to whitespace via `PRAGMA writable_schema=1` (a kind of
+corruption), Turso panics instead of returning a parse error:
+
+```
+$ python3 - <<'EOF'
+import sqlite3
+c = sqlite3.connect('/tmp/x.db')
+c.execute("CREATE TABLE t(a)")
+c.execute("PRAGMA writable_schema=1")
+c.execute("UPDATE sqlite_schema SET sql = '   \n\t\n   ' WHERE name='t'")
+c.commit(); c.close()
+EOF
+$ tursodb /tmp/x.db 'VACUUM;'
+thread 'main' panicked at core/schema.rs:2646:18:
+internal error: entered unreachable code: Expected CREATE TABLE statement
+```
+
+SQLite rejects with `malformed database schema (t)`. Turso's schema
+parser should return a structured error instead of reaching
+`unreachable!()`. Surfaces on VACUUM (and any SELECT on the same DB),
+so not strictly a VACUUM bug — recorded here because fuzzing-style
+corruption is a common hardening target.
