@@ -1707,3 +1707,266 @@ is about the change_counter itself being wrong, Bug 38 is about the
 `version-valid-for` pointer that is *supposed to track* the
 change_counter being wrong. Neither bug corrupts user data.
 
+
+## Bug 39: VACUUM INTO fails on a read-only source file where SQLite succeeds
+
+**Location**: Source-database open path. `VACUUM INTO` only needs to
+*read* from the source, so a read-only (mode 0444) source file should
+work — SQLite opens such files read-only automatically and produces a
+correct destination copy. Turso's default open path tries to upgrade
+the source database to WAL journal mode, which requires write access,
+and the upgrade fails with `I/O error (open): permission denied` —
+aborting `VACUUM INTO` before any bytes are read.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db "CREATE TABLE t(a INT); INSERT INTO t VALUES(1);"
+$ chmod 444 /tmp/x.db
+
+$ sqlite3 /tmp/x.db "VACUUM INTO '/tmp/out.db';"
+$ ls -la /tmp/out.db
+-rw-r--r-- 1 ubuntu ubuntu 8192 … /tmp/out.db
+$ sqlite3 /tmp/out.db "SELECT * FROM t;"
+1
+
+$ rm /tmp/out.db
+$ tursodb /tmp/x.db -q -m list "VACUUM INTO '/tmp/out.db';"
+Error: I/O error (open): permission denied
+$ ls -la /tmp/out.db
+ls: cannot access '/tmp/out.db': No such file or directory
+```
+
+Passing `--readonly` to the Turso CLI does make `VACUUM INTO` succeed:
+```
+$ tursodb /tmp/x.db --readonly -q -m list "VACUUM INTO '/tmp/out.db';"
+WARN turso_core: Database /tmp/x.db is opened in readonly mode,
+     cannot convert Legacy mode to WAL. Running in Legacy mode.
+$ sqlite3 /tmp/out.db "SELECT * FROM t;"
+1
+```
+
+…which reveals the root cause: Turso's default open mode always
+attempts the WAL upgrade even for a `VACUUM INTO` workload that writes
+nothing to the source. SQLite detects the source's read-only status at
+open time and silently skips any upgrade that would require write
+access.
+
+**Impact**: any `VACUUM INTO` on a read-only SQLite-created database —
+whether for backup, migration, or shipping a trimmed copy — fails on
+Turso unless the user knows to add `--readonly`. The error message
+("permission denied") also does not hint at the cause or the fix.
+Scripts/tools that wrap `tursodb` as a drop-in replacement for
+`sqlite3` see VACUUM INTO break on read-only backup sources.
+
+
+## Bug 40: VACUUM INTO from an `auto_vacuum=FULL` source produces an output whose header claims FULL but whose ptrmap pages are empty/missing
+
+**Location**: `core/vdbe/vacuum.rs` — VACUUM INTO preserves the source
+header's `auto_vacuum` field (bytes 52–55) in the target header, but
+the per-page-copy loop never materializes the pointer-map (ptrmap)
+pages that an auto_vacuum database requires. Output files therefore
+claim auto_vacuum=FULL in the header yet contain no ptrmap data past
+page 1.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db "
+    PRAGMA auto_vacuum=FULL;
+    CREATE TABLE t(a TEXT);
+    INSERT INTO t SELECT printf('%.1000c','x') FROM generate_series(1,5);
+"
+$ sqlite3 /tmp/x.db "PRAGMA integrity_check;"
+ok
+
+$ tursodb /tmp/x.db -q -m list "VACUUM INTO '/tmp/out.db';"
+$ sqlite3 /tmp/out.db "PRAGMA auto_vacuum; PRAGMA integrity_check;"
+1
+*** in database main ***
+Tree 3 page 3 right child: Failed to read ptrmap key=5
+Tree 3 page 3 right child: Failed to read ptrmap key=4
+
+# SQLite on the same source produces a correct auto_vacuum=FULL file:
+$ sqlite3 /tmp/x.db "VACUUM INTO '/tmp/out2.db';"
+$ sqlite3 /tmp/out2.db "PRAGMA auto_vacuum; PRAGMA integrity_check;"
+1
+ok
+```
+
+Inspection of page 2 (which should be the first ptrmap page in an
+auto_vacuum file) confirms Turso's output has all-zero contents:
+```
+# Turso's /tmp/out.db, bytes at offset 4096 (start of page 2):
+0100 0000 0000 0000 0000 0000 0000 0000  ................
+# SQLite's /tmp/out2.db, same range (ptrmap entries):
+0100 0000 0005 0000 0003 0500 0000 0300  ................
+```
+
+**Impact**: Any SQLite tool run against the Turso-produced output
+(including `sqlite3_analyzer`, `PRAGMA integrity_check`, and
+recovery/forensic tooling) will flag the file as corrupt. Data rows
+are still readable in SQLite (SELECTs succeed), but
+`sqlite3_integrity_check` is exactly the sanity signal operators use
+to validate a `VACUUM INTO` backup — so Turso's output will fail
+deploy-gating checks across a replication or backup pipeline. The
+file is also no longer a portable auto_vacuum=FULL database because
+ptrmap-aware tools can't use the pointer map to relocate pages. This
+is distinct from Bug 22 (which is about `PRAGMA auto_vacuum=MODE;
+VACUUM` not applying a mode *change*); here the mode is already FULL
+in the source and the format-level ptrmap invariant is violated.
+
+
+## Bug 41: VACUUM INTO from an MVCC source produces an output that SQLite cannot open
+
+**Location**: `core/vdbe/vacuum.rs` — when the source database has
+`PRAGMA journal_mode=experimental_mvcc` enabled, the output of
+`VACUUM INTO` is written using the MVCC file format (file format
+read/write version bytes 18–19 = `0xFF 0xFF`, a Turso-internal
+sentinel) rather than the standard SQLite rollback (`0x01 0x01`) or
+WAL (`0x02 0x02`) format.
+
+Other SQLite implementations reject the file at open time:
+```
+$ sqlite3 /tmp/out.db "SELECT * FROM t;"
+Error: in prepare, file is not a database (26)
+```
+
+**Reproduction**:
+```
+$ rm -f /tmp/x.db /tmp/x.db-log /tmp/x.db-wal /tmp/out.db
+$ tursodb /tmp/x.db -q -m list "
+    PRAGMA journal_mode=experimental_mvcc;
+    CREATE TABLE t(a INT);
+    INSERT INTO t VALUES(1),(2);
+    VACUUM INTO '/tmp/out.db';
+"
+mvcc
+
+# Turso can still read its own output:
+$ tursodb /tmp/out.db -q -m list "SELECT * FROM t;"
+1
+2
+
+# But no SQLite-compatible consumer can:
+$ sqlite3 /tmp/out.db "SELECT * FROM t;"
+Error: in prepare, file is not a database (26)
+
+# The file format version bytes are 0xFFFF 0xFFFF:
+$ xxd -s 16 -l 6 /tmp/out.db
+00000010: 1000 ffff 0040                           .....@
+```
+
+**Impact**: Users who configure MVCC for in-database concurrency and
+then run `VACUUM INTO` for backup, mirroring, or migration get a file
+that is byte-level unreadable by every SQLite-compatible tool
+(sqlite3 CLI, sqlite3_analyzer, libsqlite3, bindings in other
+languages, cloud backup validators). The operation silently produces
+an MVCC-formatted image — VACUUM INTO should either refuse to run
+against an MVCC source, or emit a portable SQLite-format copy with
+the MVCC metadata stripped. This is more severe than Bug 15
+(which only demotes the source to WAL in-place): here the output
+*file* carries the MVCC sentinel and is useless outside Turso.
+
+
+## Bug 42: VACUUM INTO ignores `PRAGMA page_size=N` set on the connection before VACUUM INTO
+
+**Location**: VACUUM INTO target-database construction. SQLite's
+documented behavior is that a `PRAGMA page_size` set on the
+connection before `VACUUM INTO` chooses the destination page size.
+Turso always uses the source's page size for the destination,
+regardless of the pending PRAGMA value.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db "CREATE TABLE t(a INT); INSERT INTO t VALUES(1);"
+$ sqlite3 /tmp/x.db "PRAGMA page_size;"
+4096
+
+# SQLite applies the pending page_size:
+$ sqlite3 /tmp/x.db "PRAGMA page_size=8192; VACUUM INTO '/tmp/sq.db';"
+$ sqlite3 /tmp/sq.db "PRAGMA page_size;"
+8192
+
+# Turso ignores it:
+$ tursodb /tmp/x.db -q -m list \
+    "PRAGMA page_size=8192; VACUUM INTO '/tmp/turso.db';"
+$ sqlite3 /tmp/turso.db "PRAGMA page_size;"
+4096
+
+# Same with shrink (1024):
+$ sqlite3 /tmp/x.db "PRAGMA page_size=1024; VACUUM INTO '/tmp/sq2.db';"
+$ sqlite3 /tmp/sq2.db "PRAGMA page_size;"
+1024
+
+$ tursodb /tmp/x.db -q -m list \
+    "PRAGMA page_size=1024; VACUUM INTO '/tmp/turso2.db';"
+$ sqlite3 /tmp/turso2.db "PRAGMA page_size;"
+4096
+```
+
+**Impact**: Distinct from Bug 7 — Bug 7 is about *in-place* `VACUUM`
+not applying a pending `PRAGMA page_size` (SQLite does apply it to
+in-place VACUUM too; Turso does not). Bug 42 is the `VACUUM INTO`
+variant: it is the *only* way to change a database's page size while
+keeping the original file intact, and the SQLite documentation
+specifically names it as the supported resize path. Turso silently
+ignores the pending PRAGMA, so `page_size=8192; VACUUM INTO` produces
+a 4096-byte-page copy — breaking any migration or optimization
+workflow that depends on the resize.
+
+
+## Bug 43: VACUUM re-materializes a `sqlite_sequence` row that the user deleted to reset an AUTOINCREMENT counter
+
+**Location**: `core/vdbe/vacuum.rs` — after VACUUM replays the source
+schema into the target, the `sqlite_sequence` data is copied with
+`INSERT OR REPLACE` (by design, per the in-source comment). But the
+schema replay's `CREATE TABLE … AUTOINCREMENT` step *also* auto-creates
+an `sqlite_sequence` entry for the new table as a side effect, and
+that auto-created entry is never rolled back when the source has no
+matching row.
+
+Result: a source that deliberately has *zero* rows in
+`sqlite_sequence` (the way a user resets the AUTOINCREMENT counter for
+a table back to "unused") gains a freshly-synthesized `<table>|<max
+rowid>` row after Turso VACUUM.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db "
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);
+    INSERT INTO t(b) VALUES('a'),('b'),('c');
+    DELETE FROM sqlite_sequence;
+"
+$ sqlite3 /tmp/x.db "SELECT COUNT(*) FROM sqlite_sequence;"
+0
+
+# SQLite's VACUUM preserves the 0-row state:
+$ sqlite3 /tmp/x.db "VACUUM; SELECT COUNT(*) FROM sqlite_sequence;"
+0
+
+# Turso's VACUUM synthesizes a row:
+$ rm /tmp/x.db
+$ sqlite3 /tmp/x.db "
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);
+    INSERT INTO t(b) VALUES('a'),('b'),('c');
+    DELETE FROM sqlite_sequence;
+"
+$ tursodb /tmp/x.db -q -m list "VACUUM;"
+$ sqlite3 /tmp/x.db "SELECT * FROM sqlite_sequence;"
+t|3
+```
+
+**Impact**: Applications that use `DELETE FROM sqlite_sequence WHERE
+name = 't'` (or wholesale `DELETE FROM sqlite_sequence`) as the
+canonical "reset AUTOINCREMENT counter" idiom will see the reset
+undone the next time the file is VACUUMed through Turso. The seq
+value Turso writes (`max(rowid) = 3`) happens to match what SQLite
+*computes at INSERT time* when the row is absent, so the first post-
+VACUUM INSERT into `t` yields the same id (`4`) in both databases —
+but the observable row in `sqlite_sequence` differs, and tools that
+mirror that table, hash it for replication, or inspect it for "was
+this counter reset" telemetry will disagree between SQLite and Turso
+copies of the same source. Distinct from Bug 6 (which is about seq
+being clobbered when lower than max rowid) and from Bug 30 (duplicate
+sqlite_sequence rows when the source has rowid != 1) — those fire
+when an entry exists; this fires specifically when one does not.
+

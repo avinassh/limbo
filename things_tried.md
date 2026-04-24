@@ -1065,3 +1065,124 @@ Logged as Bug 38.
 - VACUUM panics with `unreachable!()` on writable-schema-corrupted
   `sql=' '` entry (also affects SELECT). U25.
 
+### 46. VACUUM INTO on a chmod-444 source is rejected with "permission denied"
+Set up `sqlite3 /tmp/x.db …` then `chmod 444 /tmp/x.db`. `sqlite3 …
+VACUUM INTO '/tmp/out.db'` succeeds; `tursodb … VACUUM INTO …` fails
+with `I/O error (open): permission denied`. Passing `--readonly` to
+Turso makes it succeed (with a "cannot convert Legacy to WAL, running
+in Legacy mode" warning), which pinpoints the cause: Turso's default
+open path always tries to upgrade the source to WAL and that write
+fails on a read-only file, even though VACUUM INTO only reads from the
+source. Logged as Bug 39.
+
+### 47. VACUUM INTO from auto_vacuum=FULL source produces a corrupted (ptrmap-missing) output
+Created a SQLite source with `PRAGMA auto_vacuum=FULL` and ~5
+data-heavy rows, ran `tursodb … VACUUM INTO '/tmp/out.db'` (Turso
+warns about readonly-mode, but the file is created). Output claims
+auto_vacuum=FULL in its header (bytes 52–55 == 3) but page 2 — which
+must be the first ptrmap page — is all zeros. SQLite's
+`PRAGMA integrity_check` on the output fails:
+```
+*** in database main ***
+Tree 3 page 3 right child: Failed to read ptrmap key=5
+Tree 3 page 3 right child: Failed to read ptrmap key=4
+```
+SQLite's own VACUUM INTO on the same source produces a valid output
+whose page 2 has proper ptrmap entries (`01 00 00 00 00 05 00 00 00
+03 …`). Logged as Bug 40.
+
+### 48. VACUUM INTO from an MVCC source produces a file SQLite can't open
+Built an MVCC source via
+`PRAGMA journal_mode=experimental_mvcc;`, ran VACUUM INTO. Output file
+has format version bytes 18–19 = `0xFF 0xFF` (Turso-MVCC sentinel);
+`sqlite3` reports "file is not a database (26)". Turso can still read
+its own output. Same issue confirmed for VACUUM INTO (source stays
+MVCC; destination is forbidden format). Logged as Bug 41.
+
+### 49. VACUUM INTO ignores PRAGMA page_size pending on the connection
+`PRAGMA page_size=N; VACUUM INTO 'path';` is the supported SQLite idiom
+for changing a database's page size. Tested 1024, 8192 (both smaller
+and larger than the source's 4096): SQLite honors the pending PRAGMA
+value, Turso writes the output at the *source's* page size regardless
+of the pending PRAGMA. Distinct from Bug 7 (in-place VACUUM). Logged
+as Bug 42.
+
+### 50. VACUUM re-materializes a deleted sqlite_sequence row
+If the source has `DELETE FROM sqlite_sequence` (deliberately empty,
+as a counter-reset idiom) but the table is AUTOINCREMENT, Turso's
+VACUUM adds a row back (`<tbl>|<max(rowid)>`). SQLite's VACUUM leaves
+the 0-row state alone. Verified with a 3-row AUTOINCREMENT table:
+source has 0 rows in sqlite_sequence, Turso produces `t|3` after
+VACUUM. The functional next-insert id (`4`) is the same in both
+engines — but the observable `sqlite_sequence` row differs, and tools
+that replicate, hash, or inspect that table see drift. Logged as Bug
+43. Distinct from Bug 6 (clobbers seq when < max rowid) and Bug 30
+(duplicate sqlite_sequence rows for rowid != 1) — those fire when an
+entry *exists*.
+
+### 51. Other things tried, no new bug
+- VACUUM INTO to relative path "./out.db" (from cwd=/tmp) — works
+- VACUUM INTO to path via symlink to existing dir — works
+- VACUUM INTO to `file:///tmp/out.db` URI — Turso fails (SQLite
+  succeeds) — but this is a general path-handling limitation (U11);
+  not new
+- VACUUM INTO to `/tmp/foo/../out.db` — Turso fails ("not a
+  directory") even though path resolves to `/tmp/out.db`; SQLite
+  succeeds. Path canonicalization difference (U11 family)
+- VACUUM on DB with `CAST(x'ffff' AS TEXT)` — Turso errors "Invalid
+  UTF-8 in TEXT serial type"; cannot VACUUM such databases. SQLite
+  tolerates non-UTF-8 TEXT bytes. Side-effect: VACUUM INTO leaks a
+  4KB partial file (Bug 14/20 family). General Turso limitation, not
+  logged as a new VACUUM bug since the same failure fires on SELECT
+- VACUUM on DB with CHECK constraint containing 100 ANDed clauses
+  (source SQL ~1.2KB) — Turso's VACUUM crashes with stack overflow
+  (`thread 'main' has overflowed its stack`) and aborts. Same class
+  of bug as U8 (INSERT path); note that VACUUM is a user-visible
+  path for operators working on a database that was created via
+  SQLite with a deep CHECK expression. Also leaks a 4KB partial
+  file on VACUUM INTO when this fires
+- VACUUM INTO to a path whose parent dir is unreadable (chmod 444) —
+  Turso errors; SQLite errors. Same class of failure; not new
+- VACUUM with legacy_file_format via hacked schema_format byte = 1 —
+  Turso bumps to 4 (modern); SQLite does the same
+- VACUUM with corrupted schema_cookie = 0xFFFFFFFF — both Turso and
+  SQLite wrap to 0 (no bug)
+- VACUUM with changing PRAGMA temp_store=2 — no effect on VACUUM
+- VACUUM with TEMP TABLE created in session — VACUUM leaves temp
+  table intact (as expected)
+- VACUUM with CREATE TEMP VIEW/TRIGGER — U15 (persisted as main
+  schema) already noted
+- VACUUM with INSERT-trigger that RAISE(ABORT) — both Turso and
+  SQLite skip trigger firing during VACUUM's internal INSERT
+- VACUUM with cross-table trigger (INSERT to log on INSERT to t) —
+  triggers do not fire during VACUUM internal copy in either engine
+- VACUUM with CROSS JOIN, UNION, INTERSECT, EXCEPT, FILTER, WINDOW
+  in trigger bodies — all preserved
+- VACUUM with data types at boundaries (i64 MIN/MAX, REAL Inf/-Inf,
+  subnormal, 1e-324) — all preserved
+- VACUUM with BLOB DEFAULT x'deadbeef' — preserved (X'deadbeef')
+- VACUUM with very long table name (1024 chars) — preserved
+- VACUUM with tbl_name containing backticks / brackets — Turso
+  normalizes to "quoted" form (cosmetic)
+- VACUUM with trigger body containing nested CTE — preserved
+- VACUUM with ON CONFLICT REPLACE/IGNORE in PK — preserved
+- VACUUM with STRICT tables + ANY + BLOB/TEXT/INTEGER/REAL — preserved
+- VACUUM with sqlite_stat1 rows for dropped indexes — preserved
+  verbatim (both engines don't clean up)
+- VACUUM on DB with WAL mode, unchecked WAL frames — VACUUM truncates
+  WAL but otherwise works fine
+- VACUUM behavior when PRAGMA schema_version is manipulated — no
+  effect (PRAGMA schema_version isn't writable without
+  writable_schema)
+- VACUUM + INDEX with json_extract / coalesce / lower / abs
+  expressions — preserved
+- VACUUM stress test with 100k rows (deleting every 3rd) — works,
+  takes ~10s
+- VACUUM on a DB with 200 empty tables — works, takes ~0.5s
+- VACUUM with VIEW chain (v1 → v2 → v3 → v4 → v5) — preserved
+- VACUUM INTO to path without .db extension — works
+- VACUUM INTO to path with Unicode name `/tmp/🌟.db` — works
+- VACUUM INTO to path with spaces — works
+- VACUUM preserves `file_format_write_version` byte 18 = 2 always
+  (WAL). Bug 21 already logged.
+
