@@ -4,7 +4,7 @@ use crate::common::{
 };
 use crate::queued_io::{QueuedIo, QueuedIoEvent, QueuedIoOpKind};
 use rusqlite::Connection as SqliteConnection;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
 use turso_core::{Connection, Database, DatabaseOpts, LimboError, StepResult, Value, IO};
 
@@ -102,6 +102,22 @@ fn run_vacuum_into_and_assert_round_trip(
     Ok((dest_db, dest_conn))
 }
 
+fn checkpoint_if_mvcc(tmp_db: &TempDatabase, conn: &Arc<Connection>) -> anyhow::Result<()> {
+    if tmp_db.enable_mvcc {
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+    Ok(())
+}
+
+fn connect_existing_with_opts(
+    path: &Path,
+    db_opts: DatabaseOpts,
+) -> (TempDatabase, Arc<Connection>) {
+    let db = TempDatabase::new_with_existent_with_opts(path, db_opts);
+    let conn = db.connect_limbo();
+    (db, conn)
+}
+
 fn escape_sqlite_string_literal(text: &str) -> String {
     text.replace('\'', "''")
 }
@@ -115,6 +131,30 @@ fn scalar_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
 fn sqlite_scalar_i64(conn: &SqliteConnection, sql: &str) -> i64 {
     conn.query_row(sql, [], |row| row.get(0))
         .unwrap_or_else(|err| panic!("expected one row for {sql}: {err}"))
+}
+
+fn create_employees_with_check_constraints(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.execute(
+        "CREATE TABLE employees (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL CHECK(length(name) > 0),
+            age INTEGER CHECK(age >= 18 AND age <= 120),
+            salary REAL CHECK(salary > 0),
+            status TEXT CHECK(status IN ('active', 'inactive', 'pending'))
+        )",
+    )?;
+    Ok(())
+}
+
+fn insert_valid_employee_rows(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.execute("INSERT INTO employees VALUES (1, 'Alice', 30, 50000.0, 'active')")?;
+    conn.execute("INSERT INTO employees VALUES (2, 'Bob', 45, 75000.0, 'inactive')")?;
+    conn.execute("INSERT INTO employees VALUES (3, 'Charlie', 18, 35000.0, 'pending')")?;
+    Ok(())
+}
+
+fn employee_rows(conn: &Arc<Connection>) -> Vec<(i64, String, i64, f64, String)> {
+    conn.exec_rows("SELECT id, name, age, salary, status FROM employees ORDER BY id")
 }
 
 fn wal_file_size(tmp_db: &TempDatabase) -> u64 {
@@ -250,7 +290,7 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
 
-    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, tmp_db.db_opts);
     let dest_conn = dest_db.connect_limbo();
 
     let integrity_result = run_integrity_check(&dest_conn);
@@ -2396,31 +2436,14 @@ fn test_vacuum_into_from_memory_database() -> anyhow::Result<()> {
 // 2. WITHOUT ROWID tables
 // 3. table without any columns (which sqlite does kek)
 
-/// Test VACUUM INTO with CHECK constraints
-/// Skips if CHECK constraints are not supported.
+/// Test VACUUM INTO with CHECK constraints.
 #[turso_macros::test(mvcc)]
 fn test_vacuum_into_with_check_constraints(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
-    // Skip if CHECK constraints are not supported
-    if conn
-        .execute(
-            "CREATE TABLE employees (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL CHECK(length(name) > 0),
-            age INTEGER CHECK(age >= 18 AND age <= 120),
-            salary REAL CHECK(salary > 0),
-            status TEXT CHECK(status IN ('active', 'inactive', 'pending'))
-        )",
-        )
-        .is_err()
-    {
-        return Ok(());
-    }
-
-    conn.execute("INSERT INTO employees VALUES (1, 'Alice', 30, 50000.0, 'active')")?;
-    conn.execute("INSERT INTO employees VALUES (2, 'Bob', 45, 75000.0, 'inactive')")?;
-    conn.execute("INSERT INTO employees VALUES (3, 'Charlie', 18, 35000.0, 'pending')")?;
+    create_employees_with_check_constraints(&conn)?;
+    insert_valid_employee_rows(&conn)?;
+    checkpoint_if_mvcc(&tmp_db, &conn)?;
 
     let source_hash = compute_dbhash(&tmp_db);
 
@@ -2462,6 +2485,167 @@ fn test_vacuum_into_with_check_constraints(tmp_db: TempDatabase) -> anyhow::Resu
             .execute("INSERT INTO employees VALUES (4, 'Dan', 10, 40000.0, 'active')")
             .is_err(),
         "CHECK constraint on age should reject value < 18"
+    );
+
+    Ok(())
+}
+
+/// Plain VACUUM must preserve CHECK-constrained tables and keep those
+/// constraints enforced after the rewrite.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(mvcc)]
+fn test_plain_vacuum_with_check_constraints(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    create_employees_with_check_constraints(&conn)?;
+    insert_valid_employee_rows(&conn)?;
+    checkpoint_if_mvcc(&tmp_db, &conn)?;
+    let before_hash = compute_plain_vacuum_dbhash(&tmp_db);
+
+    conn.execute("VACUUM")?;
+
+    assert_plain_vacuum_integrity_and_hash(&tmp_db, &conn, &before_hash);
+
+    let employees_sql: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'employees'");
+    assert!(
+        employees_sql[0].0.contains("CHECK"),
+        "CHECK constraints should be preserved"
+    );
+
+    assert_eq!(
+        employee_rows(&conn),
+        vec![
+            (1, "Alice".to_string(), 30, 50000.0, "active".to_string()),
+            (2, "Bob".to_string(), 45, 75000.0, "inactive".to_string()),
+            (3, "Charlie".to_string(), 18, 35000.0, "pending".to_string()),
+        ]
+    );
+
+    assert!(
+        conn.execute("INSERT INTO employees VALUES (4, 'Dan', 10, 40000.0, 'active')")
+            .is_err(),
+        "CHECK constraint on age should reject value < 18"
+    );
+
+    Ok(())
+}
+
+/// Rows inserted while CHECK constraints are ignored must survive a plain
+/// VACUUM unchanged. The rewrite should preserve the data as-is without
+/// re-validating historical rows, while still keeping constraints enabled for
+/// future writes.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(mvcc)]
+fn test_plain_vacuum_with_ignored_check_constraint_rows(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    create_employees_with_check_constraints(&conn)?;
+    insert_valid_employee_rows(&conn)?;
+    conn.execute("PRAGMA ignore_check_constraints = ON")?;
+    conn.execute("INSERT INTO employees VALUES (4, '', 16, -10.0, 'ghost')")?;
+    conn.execute("INSERT INTO employees VALUES (5, 'Eve', 130, 12345.0, 'active')")?;
+    conn.execute("PRAGMA ignore_check_constraints = OFF")?;
+    checkpoint_if_mvcc(&tmp_db, &conn)?;
+
+    let (_before_db, before_conn) = connect_existing_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let before_integrity = run_integrity_check(&before_conn);
+    let before_hash = compute_plain_vacuum_dbhash(&tmp_db);
+
+    conn.execute("VACUUM")?;
+
+    let (_after_db, after_conn) = connect_existing_with_opts(&tmp_db.path, tmp_db.db_opts);
+    assert_eq!(
+        run_integrity_check(&after_conn),
+        before_integrity,
+        "plain VACUUM must preserve the existing integrity_check result"
+    );
+    assert_eq!(
+        compute_plain_vacuum_dbhash(&tmp_db),
+        before_hash,
+        "plain VACUUM must preserve logical content even for rows inserted with ignored CHECK constraints"
+    );
+    assert_eq!(
+        employee_rows(&after_conn),
+        vec![
+            (1, "Alice".to_string(), 30, 50000.0, "active".to_string()),
+            (2, "Bob".to_string(), 45, 75000.0, "inactive".to_string()),
+            (3, "Charlie".to_string(), 18, 35000.0, "pending".to_string()),
+            (4, "".to_string(), 16, -10.0, "ghost".to_string()),
+            (5, "Eve".to_string(), 130, 12345.0, "active".to_string()),
+        ]
+    );
+    assert!(
+        after_conn
+            .execute("INSERT INTO employees VALUES (6, '', 16, -10.0, 'ghost')")
+            .is_err(),
+        "future violating inserts should still fail once CHECK constraints are re-enabled"
+    );
+
+    Ok(())
+}
+
+/// VACUUM INTO must also preserve rows that were inserted while CHECK
+/// constraints were ignored, without re-validating them during the copy.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_with_ignored_check_constraint_rows(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    create_employees_with_check_constraints(&conn)?;
+    insert_valid_employee_rows(&conn)?;
+    conn.execute("PRAGMA ignore_check_constraints = ON")?;
+    conn.execute("INSERT INTO employees VALUES (4, '', 16, -10.0, 'ghost')")?;
+    conn.execute("INSERT INTO employees VALUES (5, 'Eve', 130, 12345.0, 'active')")?;
+    conn.execute("PRAGMA ignore_check_constraints = OFF")?;
+    checkpoint_if_mvcc(&tmp_db, &conn)?;
+
+    let (_source_db, source_conn) = connect_existing_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let source_integrity = run_integrity_check(&source_conn);
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_ignored_check.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, tmp_db.db_opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(
+        run_integrity_check(&dest_conn),
+        source_integrity,
+        "VACUUM INTO must preserve the existing integrity_check result"
+    );
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash,
+            compute_dbhash(&dest_db).hash,
+            "VACUUM INTO must preserve logical content even for rows inserted with ignored CHECK constraints"
+        );
+    }
+
+    let employees_sql: Vec<(String,)> =
+        dest_conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'employees'");
+    assert!(
+        employees_sql[0].0.contains("CHECK"),
+        "CHECK constraints should be preserved in the destination schema"
+    );
+    assert_eq!(
+        employee_rows(&dest_conn),
+        vec![
+            (1, "Alice".to_string(), 30, 50000.0, "active".to_string()),
+            (2, "Bob".to_string(), 45, 75000.0, "inactive".to_string()),
+            (3, "Charlie".to_string(), 18, 35000.0, "pending".to_string()),
+            (4, "".to_string(), 16, -10.0, "ghost".to_string()),
+            (5, "Eve".to_string(), 130, 12345.0, "active".to_string()),
+        ]
+    );
+    assert!(
+        dest_conn
+            .execute("INSERT INTO employees VALUES (6, '', 16, -10.0, 'ghost')")
+            .is_err(),
+        "future violating inserts should still fail in the destination"
     );
 
     Ok(())
