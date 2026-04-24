@@ -1408,3 +1408,234 @@ the root cause, and every internal Turso table that uses
 AUTOINCREMENT (turso_cdc plus any future internal feature) becomes
 a vector for unwanted sqlite_sequence pollution.
 
+
+## Bug 34: VACUUM fails on SQLite-created DB with CHECK constraint or generated column using double-quoted string literal
+
+**Summary**: SQLite historically accepts `CHECK(a <> "banned")` and treats
+the double-quoted `"banned"` as a string literal (the "double-quoted string
+literals" backwards-compatibility mode, controlled by dqs_ddl/dqs_dml in
+SQLite). Turso can OPEN, SELECT, and INSERT on such a database, but VACUUM
+(and VACUUM INTO) fail during the schema replay because Turso's CREATE TABLE
+compile treats `"banned"` as a column reference, emitting `no such column:
+banned`.
+
+**Root cause**: Turso does not honor the double-quoted-string-as-literal
+legacy that SQLite preserves for DDL contexts. The mismatch is quiet during
+normal operation (the DB can be read and written in Turso via the parsed
+sqlite_master), but VACUUM's CREATE TABLE replay path hits strict identifier
+resolution, which fails.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db '
+  CREATE TABLE t(a TEXT CHECK(a <> "banned"));
+  INSERT INTO t VALUES("ok");
+'
+
+$ tursodb /tmp/x.db -q -m list 'SELECT * FROM t;'
+ok
+
+$ tursodb /tmp/x.db -q -m list 'VACUUM;'
+Error: Parse error: no such column: banned
+
+$ tursodb /tmp/x.db -q -m list "VACUUM INTO '/tmp/out.db';"
+Error: Parse error: no such column: banned
+# /tmp/out.db leaked as a 4KB partial file (Bug 14/20 family)
+```
+
+Also affects GENERATED VIRTUAL columns with double-quoted strings in
+expression:
+```
+$ sqlite3 /tmp/y.db '
+  CREATE TABLE t(a INTEGER,
+    b TEXT AS (CASE WHEN a > 0 THEN "positive" ELSE "non-positive" END) VIRTUAL);
+  INSERT INTO t(a) VALUES(5),(-3);
+'
+
+$ tursodb /tmp/y.db --experimental-generated-columns -q -m list 'VACUUM;'
+Error: Parse error: no such column: positive
+```
+
+Also affects CHECK constraints with double-quoted string operands in
+`GLOB`, `LIKE`, and plain `=` comparisons:
+```
+$ sqlite3 /tmp/z.db 'CREATE TABLE t(a TEXT CHECK(a GLOB "abc*"));'
+$ tursodb /tmp/z.db -q -m list 'VACUUM;'
+Error: Parse error: no such column: abc*
+```
+
+**Impact**: Any SQLite database created with the (still widely used)
+double-quoted-string literal style in CHECK constraints or GENERATED
+column expressions cannot be VACUUMed by Turso. The source connection
+remains usable for normal DML — only VACUUM hits the strict parser,
+making this a silent "VACUUM times bomb" for Turso users who inherit
+SQLite databases from other tools or older codebases. VACUUM INTO
+additionally leaks the 4-KB partial destination file per Bug 14.
+
+The DEFAULT clause has different grammar and does NOT hit this issue:
+`DEFAULT "hello"` succeeds because the parser expects a literal there.
+The error only surfaces for expressions in CHECK / GENERATED ALWAYS AS.
+
+The triggered failure mode is distinct from Bug 28 (non-deterministic
+functions in CREATE INDEX WHERE), though both are cases where Turso's
+strict CREATE-*-replay parser rejects SQL that SQLite stored on disk.
+
+
+## Bug 35: VACUUM rewrites `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` to `IS NOT` / `IS` in stored SQL
+
+**Summary**: Turso's parser-then-stringify path normalizes the SQL standard
+`IS [NOT] DISTINCT FROM` operators to their shorter synonyms `IS NOT` /
+`IS`. VACUUM triggers this rewrite because it re-stores the CREATE SQL for
+every schema object. The semantics are equivalent but the on-disk CREATE
+text diverges from what the user wrote and from what SQLite preserves.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db '
+  CREATE TABLE t(a);
+  CREATE TRIGGER tr1 AFTER INSERT ON t
+    WHEN NEW.a IS DISTINCT FROM 5 BEGIN SELECT 1; END;
+  CREATE TRIGGER tr2 AFTER INSERT ON t
+    WHEN NEW.a IS NOT DISTINCT FROM 5 BEGIN SELECT 2; END;
+'
+
+$ sqlite3 /tmp/x.db 'SELECT sql FROM sqlite_master;'
+CREATE TABLE t(a)
+CREATE TRIGGER tr1 AFTER INSERT ON t WHEN NEW.a IS DISTINCT FROM 5 BEGIN SELECT 1; END
+CREATE TRIGGER tr2 AFTER INSERT ON t WHEN NEW.a IS NOT DISTINCT FROM 5 BEGIN SELECT 2; END
+
+$ tursodb /tmp/x.db -q -m list 'VACUUM; SELECT sql FROM sqlite_master;'
+CREATE TABLE t (a)
+CREATE TRIGGER tr1 AFTER INSERT ON t WHEN NEW.a IS NOT 5 BEGIN SELECT 1; END
+CREATE TRIGGER tr2 AFTER INSERT ON t WHEN NEW.a IS 5 BEGIN SELECT 2; END
+```
+
+**Impact**: Turso-wide parser behavior (a fresh `CREATE TRIGGER ... IS NOT
+DISTINCT FROM ...` in Turso is stored the same way immediately). VACUUM
+makes the divergence visible and permanent for SQLite-sourced databases
+that round-trip through Turso. Schema-diff tools, migration verifiers,
+and "dump-and-compare" workflows see a different on-disk CREATE SQL after
+VACUUM than before. Same pattern applies to `IS [NOT] DISTINCT FROM` in
+CHECK constraints and view WHERE clauses.
+
+
+## Bug 36: VACUUM re-interprets `DEFAULT "false"` / `DEFAULT "true"` as boolean keywords, changing future INSERT DEFAULT semantics
+
+**Summary**: SQLite's DDL parser preserves `"false"` as a double-quoted
+string literal in `CREATE TABLE t(a DEFAULT "false")`. Turso's parser
+treats the same text as the boolean keyword `FALSE`, so the stored CREATE
+SQL is re-written and — more importantly — future `INSERT DEFAULT VALUES`
+statements insert the integer `0` rather than the text `"false"`.
+
+The bug has two components:
+- Turso-wide: `CREATE TABLE t(a DEFAULT "false")` in Turso always stores
+  the integer-false default, regardless of VACUUM.
+- VACUUM-visible: on a SQLite-created database whose sqlite_master SQL
+  still reads `DEFAULT "false"`, Turso's VACUUM rewrites the stored SQL
+  to `DEFAULT FALSE`, locking in the keyword interpretation.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db '
+  CREATE TABLE t(a DEFAULT "false");
+  INSERT INTO t DEFAULT VALUES;
+  SELECT typeof(a), a FROM t;
+  SELECT sql FROM sqlite_master;
+'
+text|false
+CREATE TABLE t(a DEFAULT "false")
+
+# Turso pre-VACUUM: stored SQL preserved but new insert gives boolean 0
+$ tursodb /tmp/x.db -q -m list '
+  INSERT INTO t DEFAULT VALUES;
+  SELECT typeof(a), a FROM t;
+'
+text|false            ← SQLite-inserted row
+integer|0             ← Turso's new row (silently flipped from text "false")
+
+# Turso post-VACUUM: stored SQL rewritten, matches Turso's interpretation
+$ tursodb /tmp/x.db -q -m list 'VACUUM; SELECT sql FROM sqlite_master;'
+CREATE TABLE t (a DEFAULT FALSE)
+```
+
+Same problem affects `DEFAULT "true"` → `DEFAULT TRUE` (integer 1),
+`DEFAULT "TRUE"`, `DEFAULT "FALSE"`, `DEFAULT "True"` (case-insensitive).
+`DEFAULT "NULL"` is NOT affected — stored as string `"NULL"`.
+
+**Impact**: A SQLite database that uses `DEFAULT "false"` (a pattern
+that was common in applications written before SQLite's stricter DQS
+modes existed) has silently different DEFAULT semantics when opened in
+Turso. VACUUM cements the divergence by rewriting the stored CREATE SQL,
+so even a subsequent SQLite reader sees `DEFAULT FALSE` instead of
+`DEFAULT "false"`. Schemas that depended on the text `"false"` as a
+DEFAULT value are silently corrupted by the VACUUM round-trip.
+
+
+## Bug 37: VACUUM cannot open a SQLite-created DB that has any STORED generated column, even with `--experimental-generated-columns`
+
+**Summary**: Turso rejects `GENERATED ALWAYS AS (...) STORED` at parse
+time, so even opening a SQLite database containing such a column fails
+with "Stored generated columns are not supported". VACUUM therefore
+cannot run, and the database is effectively unopenable in Turso. The
+VIRTUAL form is supported; STORED is not.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db '
+  CREATE TABLE t(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) STORED);
+  INSERT INTO t(a) VALUES(1),(2),(3);
+'
+
+$ tursodb /tmp/x.db --experimental-generated-columns -q -m list 'SELECT 1;'
+Error: Parse error: Stored generated columns are not supported
+
+$ tursodb /tmp/x.db --experimental-generated-columns -q -m list 'VACUUM;'
+Error: Parse error: Stored generated columns are not supported
+```
+
+**Impact**: Distinct from Bug 18 (WITHOUT ROWID tables), where Turso can
+at least read sqlite_master and fails only at VACUUM's replay step.
+STORED generated columns block the DB from opening at all, so there is
+no recovery path in Turso — not even SELECT can run. Any SQLite database
+with a STORED generated column is completely unusable in Turso, and
+VACUUM is specifically unreachable for such databases.
+
+
+## Bug 38: VACUUM fails on SQLite-created DB where CREATE INDEX WHERE clause contains any `COLLATE` subclause
+
+**Summary**: Extension of Bug 28. Turso's CREATE INDEX parser rejects
+WHERE-clause expressions that contain a `COLLATE` suffix, even for
+built-in collations like `BINARY` and `NOCASE`. SQLite accepts them. A
+SQLite-created database with such an index can be opened and queried in
+Turso, but VACUUM replay fails at the CREATE INDEX step.
+
+**Reproduction**:
+```
+$ sqlite3 /tmp/x.db '
+  CREATE TABLE t(a);
+  CREATE INDEX ix ON t(a) WHERE a COLLATE NOCASE > "m";
+  INSERT INTO t VALUES("apple"),("Zebra");
+'
+
+$ tursodb /tmp/x.db -q -m list 'SELECT * FROM t;'
+apple
+Zebra
+
+$ tursodb /tmp/x.db -q -m list 'VACUUM;'
+Error: Parse error: Error: cannot use aggregate, window functions or
+reference other tables in WHERE clause of CREATE INDEX:
+ a COLLATE NOCASE > "m"
+```
+
+The error message incorrectly mentions "aggregate, window functions or
+reference other tables" — the actual cause is the `COLLATE` suffix. Same
+result for `COLLATE BINARY`, `COLLATE RTRIM`, etc. Without the `COLLATE`
+clause, VACUUM succeeds.
+
+**Impact**: Same shape as Bug 28 (non-deterministic functions in WHERE).
+A narrower class of partial-index declarations cannot round-trip through
+Turso's VACUUM — specifically those that use explicit collations in
+their WHERE clause. The stored sqlite_master SQL is unchanged by a
+failed VACUUM, but VACUUM INTO leaks a 4-KB partial destination (Bug 14
+family).
+
