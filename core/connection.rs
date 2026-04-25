@@ -983,7 +983,7 @@ impl Connection {
                 *schema = fresh.clone();
             });
             let load_result: Result<()> = (|| {
-                let type_sqls = self.query_stored_type_definitions()?;
+                let type_sqls = self.query_stored_type_definitions_for_reparse()?;
                 fresh.load_type_definitions(&type_sqls)?;
                 Ok(())
             })();
@@ -1245,6 +1245,47 @@ impl Connection {
     /// that `prepare` can resolve the table name. Returns an empty Vec if the
     /// types table does not exist.
     pub(crate) fn query_stored_type_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
+        self.query_stored_type_definitions_with_origin(StatementOrigin::Root)
+    }
+
+    fn query_stored_type_definitions_for_reparse(self: &Arc<Connection>) -> Result<Vec<String>> {
+        // The initial sqlite_schema scan may finish its read transaction before
+        // custom types are loaded. Keep this helper in a transaction so prepare
+        // cannot reinstall a stale shared Database schema via maybe_update_schema.
+        let opened_read_tx = self.get_tx_state() == TransactionState::None;
+        let pager = self.pager.load().clone();
+        if opened_read_tx {
+            pager.begin_read_tx()?;
+            self.set_tx_state(TransactionState::Read);
+        }
+
+        let previous_auto_commit = self.auto_commit.load(Ordering::SeqCst);
+        self.auto_commit.store(false, Ordering::SeqCst);
+
+        let result =
+            self.query_stored_type_definitions_with_origin(StatementOrigin::InternalHelper);
+
+        self.auto_commit
+            .store(previous_auto_commit, Ordering::SeqCst);
+
+        if opened_read_tx {
+            let previous = self.transaction_state.swap(TransactionState::None);
+            turso_assert!(
+                matches!(previous, TransactionState::None | TransactionState::Read),
+                "unexpected end transaction state"
+            );
+            if previous == TransactionState::Read {
+                pager.end_read_tx();
+            }
+        }
+
+        result
+    }
+
+    fn query_stored_type_definitions_with_origin(
+        self: &Arc<Connection>,
+        origin: StatementOrigin,
+    ) -> Result<Vec<String>> {
         let has_types_table = {
             let s = self.schema.read();
             s.tables.contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
@@ -1252,10 +1293,13 @@ impl Connection {
         if !has_types_table {
             return Ok(Vec::new());
         }
-        let mut type_stmt = self.prepare(format!(
-            "SELECT name, sql FROM {}",
-            crate::schema::TURSO_TYPES_TABLE_NAME
-        ))?;
+        let mut type_stmt = self.prepare_with_origin(
+            format!(
+                "SELECT name, sql FROM {}",
+                crate::schema::TURSO_TYPES_TABLE_NAME
+            ),
+            origin,
+        )?;
         let mut type_rows = Vec::new();
         type_stmt.run_with_row_callback(|row| {
             type_rows.push(row.get::<&str>(1)?.to_string());

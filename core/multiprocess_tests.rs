@@ -14,6 +14,8 @@ const MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_hold_read_tx_child_process";
 const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_schema_child_process";
+const MULTIPROCESS_SHM_CUSTOM_TYPE_REPARSE_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_shm_custom_type_reparse_child_process";
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_insert_and_close_child_process";
 const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
@@ -113,12 +115,26 @@ fn multiprocess_wal_db_opts() -> DatabaseOpts {
     DatabaseOpts::new().with_multiprocess_wal(true)
 }
 
+fn multiprocess_wal_custom_types_db_opts() -> DatabaseOpts {
+    multiprocess_wal_db_opts().with_custom_types(true)
+}
+
 fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
     Database::open_file_with_flags(
         io,
         path,
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
+        None,
+    )
+}
+
+fn open_multiprocess_custom_types_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
+    Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        multiprocess_wal_custom_types_db_opts(),
         None,
     )
 }
@@ -869,6 +885,26 @@ fn multiprocess_shm_schema_child_process() {
 }
 
 #[test]
+fn multiprocess_shm_custom_type_reparse_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_custom_types_db(io, db_path.to_str().unwrap()).unwrap();
+    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let wal = db
+        .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
+        .unwrap();
+    let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
+    assert_eq!(wal_file.coordination_backend_name(), "tshm");
+    assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
+
+    let conn = db.connect().unwrap();
+    conn.execute("create table bump(x integer)").unwrap();
+}
+
+#[test]
 fn subprocess_database_open_selects_multiprocess_shm_backend() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-subprocess.db");
@@ -918,6 +954,44 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
         String::from_utf8_lossy(&count_output.stdout),
         String::from_utf8_lossy(&count_output.stderr)
     );
+}
+
+#[test]
+fn subprocess_custom_type_schema_reparse_after_cross_process_ddl() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-custom-type-reparse.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_custom_types_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create type cents base integer encode value * 100 decode value / 100")
+        .unwrap();
+    conn.execute("create table t1(id integer primary key, amount cents) strict")
+        .unwrap();
+    conn.execute("insert into t1 values (1, 42)").unwrap();
+
+    let rows = get_rows_without_schema_retry(&conn, "select amount from t1");
+    assert_eq!(rows[0][0].as_int().unwrap(), 42);
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_CUSTOM_TYPE_REPARSE_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "custom-type child should run cross-process DDL: status={:?}; stdout={}; stderr={}",
+        child_output.status,
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+
+    let rows = get_rows_without_schema_retry(&conn, "select amount from t1");
+    assert_eq!(rows[0][0].as_int().unwrap(), 42);
 }
 
 #[test]
