@@ -10086,3 +10086,152 @@ fn test_phantom_delete_after_stale_ckpt_max_keeps_tombstone() {
         "expected 'MVCC delete: rowid … not found' but got: {s}"
     );
 }
+
+/// **Engineered race repro using yield injection.**
+///
+/// Uses the `CommitYieldPoint::BeforeLastCommittedTsStore` yield point
+/// (added between `unlock_commit_lock_if_held` and
+/// `last_committed_tx_ts.store(end_ts)` in `CommitEnd`) to deterministically
+/// trigger the non-monotonic store race that produces the antithesis bug.
+///
+/// Sequence:
+///   1. `conn_a` commits an UPDATE that creates a tombstone v_tomb on
+///      `(8.43, 788)`. Yield injector pauses conn_a in `CommitEnd` AFTER
+///      `unlock_commit_lock_if_held` (line 1945) but BEFORE
+///      `last_committed_tx_ts.store(ts_a)` (line 1953).
+///   2. `conn_b` (started AFTER conn_a's `Initial` so its end_ts > ts_a)
+///      runs its full commit on a separate thread, including its own
+///      `last_committed_tx_ts.store(ts_b)`.
+///   3. conn_a resumes; its `store(ts_a)` overwrites conn_b's `ts_b`.
+///      `last_committed_tx_ts` is now regressed to `ts_a < ts_b`.
+///   4. The next checkpoint reads the regressed value, computes
+///      `ckpt_max < ts_b`, and `gc_version_chain` Rule 2 retains v_tomb
+///      whose DELETE was just persisted to the btree.
+///   5. The checkpoint after that hits the phantom DELETE and crashes
+///      with the antithesis-shape `Corrupt("MVCC delete: rowid … not found")`.
+///
+/// On main (with `.store`): test FAILS at step 5 with the Corrupt error.
+/// With the fix (`.fetch_max`): test PASSES — `last_committed_tx_ts`
+/// stays at `ts_b`, ckpt_max >= ts_b, v_tomb is GC'd correctly.
+#[test]
+fn test_engineered_race_regresses_last_committed_tx_ts() {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    conn0
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v REAL UNIQUE)")
+        .unwrap();
+    // Persist (8.43, 788) and (1, 0.1) to the btree, then GC the chains.
+    conn0
+        .execute("INSERT INTO t(id, v) VALUES (788, 8.43), (1, 0.1)")
+        .unwrap();
+    conn0.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+
+    // conn_a: UPDATE 788 → creates v_tomb with btree_resident=true.
+    let conn_a = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a
+        .execute("UPDATE t SET v = 2.9 WHERE id = 788")
+        .unwrap();
+
+    // Pause conn_a's COMMIT at the new yield point.
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeLastCommittedTsStore.point(),
+    ])));
+
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    let mut yielded = false;
+    for _ in 0..200 {
+        match commit_a.step().unwrap() {
+            crate::vdbe::StepResult::IO => {
+                yielded = true;
+                break;
+            }
+            crate::vdbe::StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        yielded,
+        "conn_a's COMMIT should yield at BeforeLastCommittedTsStore"
+    );
+
+    let last_committed_before_b = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
+
+    // conn_b runs its full commit on a separate thread (started AFTER conn_a's
+    // Initial assigned ts_a, so conn_b's end_ts > ts_a). Its store(ts_b)
+    // happens while conn_a is paused.
+    let db_arc = db.get_db();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let conn_b_handle = thread::spawn(move || {
+        let conn_b = db_arc.connect().unwrap();
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b
+            .execute("UPDATE t SET v = 0.05 WHERE id = 1")
+            .unwrap();
+        conn_b.execute("COMMIT").unwrap();
+        done_tx.send(()).unwrap();
+        conn_b.close().unwrap();
+    });
+
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("conn_b's COMMIT should complete while conn_a is paused");
+    conn_b_handle.join().unwrap();
+
+    let last_committed_after_b = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
+    assert!(
+        last_committed_after_b > last_committed_before_b,
+        "conn_b's COMMIT should advance last_committed_tx_ts"
+    );
+
+    // Resume conn_a; its store(ts_a) lands AFTER conn_b's store(ts_b),
+    // regressing the watermark.
+    commit_a.run_collect_rows().unwrap();
+    drop(commit_a);
+
+    let last_committed_after_a = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
+    eprintln!(
+        "before b={last_committed_before_b}, after b={last_committed_after_b}, after a={last_committed_after_a}"
+    );
+
+    // With .store (broken): regression visible. With .fetch_max (fixed): no regression.
+    // We don't assert here — both scenarios should let the rest of the test run,
+    // and the corruption assertion at the end is what differentiates them.
+
+    // Force a checkpoint so v_tomb is processed; then a second one. With
+    // regression, v_tomb is retained at the first; the second hits the
+    // phantom DELETE.
+    conn0.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn0
+        .execute("INSERT INTO t(id, v) VALUES (2, 0.2)")
+        .unwrap();
+    let result = conn0.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+
+    // This is a regression test for the fix at mod.rs:1953. With `.store`,
+    // result is Err with the antithesis-shape Corrupt error; with `.fetch_max`,
+    // result is Ok and the watermark is monotonic.
+    if let Err(e) = result {
+        let s = format!("{e:?}");
+        if s.contains("MVCC delete") && s.contains("not found") {
+            panic!(
+                "REPRODUCED the antithesis bug. last_committed_tx_ts regressed from \
+                 {last_committed_after_b} to {last_committed_after_a}. \
+                 Fix at mod.rs:1953 (s/store/fetch_max/) is missing. Error: {e}"
+            );
+        }
+        panic!("unexpected checkpoint error: {e}");
+    }
+    assert_eq!(
+        last_committed_after_a, last_committed_after_b,
+        "with fetch_max fix, last_committed_tx_ts should stay monotonic but went \
+         from {last_committed_after_b} to {last_committed_after_a}"
+    );
+
+    conn_a.close().unwrap();
+}

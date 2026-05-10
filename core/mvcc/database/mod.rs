@@ -939,6 +939,13 @@ pub(crate) enum CommitYieldPoint {
     /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
     /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
     AfterRemoveTx,
+    /// Boundary in `CommitEnd` AFTER `unlock_commit_lock_if_held` and the
+    /// `global_header.write()` but BEFORE `last_committed_tx_ts.store(end_ts)`.
+    /// Used to reproduce the non-monotonic-store race: a slower commit can
+    /// be parked here while a faster (larger-end_ts) commit completes its
+    /// own store, then resume and overwrite the watermark with its smaller
+    /// end_ts.
+    BeforeLastCommittedTsStore,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -1949,7 +1956,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .write()
                     .replace(*tx_unlocked.header.read());
 
-                // Use fetch_max instead of store: concurrent commits' CommitEnd
+                inject_transition_yield!(self, CommitYieldPoint::BeforeLastCommittedTsStore);
+                // fetch_max instead of store: concurrent commits' CommitEnd
                 // bodies can interleave between unlock_commit_lock_if_held above
                 // and this point, so an unconditional store can regress the value
                 // when a smaller-end_ts tx's store lands after a larger-end_ts
