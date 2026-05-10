@@ -1949,13 +1949,21 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .write()
                     .replace(*tx_unlocked.header.read());
 
+                // Use fetch_max instead of store: concurrent commits' CommitEnd
+                // bodies can interleave between unlock_commit_lock_if_held above
+                // and this point, so an unconditional store can regress the value
+                // when a smaller-end_ts tx's store lands after a larger-end_ts
+                // tx's. The downstream watermark (durable_txid_max_new at
+                // checkpoint AcquireLock, gc_version_chain Rule 2's tombstone
+                // guard, maybe_stage_mvcc_metadata_write's `new > old` gate) all
+                // require monotonicity. fetch_max enforces it directly.
                 mvcc_store
                     .last_committed_tx_ts
-                    .store(*end_ts, Ordering::Release);
+                    .fetch_max(*end_ts, Ordering::Release);
                 if self.did_commit_schema_change {
                     mvcc_store
                         .last_committed_schema_change_ts
-                        .store(*end_ts, Ordering::Release);
+                        .fetch_max(*end_ts, Ordering::Release);
                 }
 
                 // We have now updated all the versions with a reference to the

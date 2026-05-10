@@ -9922,3 +9922,167 @@ fn test_read_lock_leak_deferred_then_concurrent() {
     let rows = get_rows(&conn1, "SELECT * FROM t1");
     assert_eq!(rows.len(), 1);
 }
+
+/// Reproduces the antithesis "Corrupt: MVCC delete: rowid SortableIndexKey
+/// {…} not found" failure (antithesis run id `tmp90BpGv`).
+///
+/// **Mechanism**, end-to-end (verified against the on-disk artifacts and the
+/// code paths exercised):
+///
+/// 1. Tx-A inserts (v=8.43, id=788). `v1` is created in MVCC.
+/// 2. A checkpoint persists `(8.43, 788)` to the btree; `gc_version_chain`
+///    Rule 3 clears `v1` (sole-survivor with `b<=ckpt_max && b<lwm`).
+/// 3. Tx-B updates id=788 v=8.43→2.9. `IdxDelete (8.43, 788)`: the cursor
+///    finds no MVCC version (was just GC'd), so `cursor.delete` falls
+///    through to `insert_tombstone_to_table_or_index` (`core/mvcc/cursor.rs:1507`).
+///    A `v_tomb (begin=None, end=TxID(B), btree_resident=true)` is created.
+///    On commit, `rewrite_live_versions_to_timestamps` (`core/mvcc/database/mod.rs:1502`)
+///    promotes `end` to `Timestamp(ts_b)`.
+/// 4. Checkpoint **N**: `collect_committed_index_row_versions` pushes
+///    `v_tomb` to `index_write_set` as a DELETE (`btree_resident=true` →
+///    `exists_in_db_file=true`; `end > durable_old` → no reset). The pager
+///    commit writes "DELETE `(8.43, 788)`" to the WAL and `CheckpointWal`
+///    backfills it. **The on-disk btree no longer has `(8.43, 788)`.**
+/// 5. `gc_checkpointed_versions` then calls
+///    `gc_version_chain(versions, lwm, ckpt_max)` with
+///    `ckpt_max = self.durable_txid_max_new = max(durable_old, last_committed_tx_ts at AcquireLock)`.
+///    Rule 2's tombstone guard:
+///    ```ignore
+///    Some(Timestamp(e)) if *e <= lwm => !has_current && *e > ckpt_max
+///    ```
+///    retains the tombstone whenever `e > ckpt_max`.
+/// 6. **The race**: `CommitEnd` (`core/mvcc/database/mod.rs:1889-1985`)
+///    releases `pager_commit_lock` at step 5 then runs steps 6-8 (write
+///    `global_header`, `last_committed_tx_ts.store(*end_ts)`, `finish_committed_tx`)
+///    inside the same `step()` body. **Steps 5 and 7 are not atomic w.r.t.
+///    other commit pipelines**, especially because `WaitForDependencies`
+///    yields when `commit_dep_counter > 0` (Hekaton speculative-read
+///    dependencies, common with concurrent `BEGIN CONCURRENT`). A delayed
+///    Tx-A (smaller `end_ts`) can land its `store` AFTER Tx-B (larger
+///    `end_ts`), regressing `last_committed_tx_ts` to Tx-A's value.
+/// 7. If checkpoint #N reads the regressed `last_committed_tx_ts <
+///    ts_b`, then `ckpt_max < ts_b`, so `v_tomb` is RETAINED at the end of
+///    the very same checkpoint that just wrote its DELETE to the btree.
+/// 8. `mvstore.durable_txid_max` is also set to `ckpt_max < ts_b`
+///    (lines 1404, 1607). The metadata table's `persistent_tx_ts_max` may
+///    not be bumped (`maybe_stage_mvcc_metadata_write` at line 773 returns
+///    early when `new <= old`).
+/// 9. Checkpoint **N+1** sees `v_tomb` still in MVCC. `durable_txid_max_old`
+///    is the stale value from #N, so `end > durable_old` → `exists=true` →
+///    `v_tomb` is pushed as a DELETE again. This time the seek inside
+///    `delete_row_from_pager` returns `NotFound` (the entry was removed at #N).
+///    `bail_corrupt_error!` fires:
+///    `Corrupt("MVCC delete: rowid SortableIndexKey {…} not found")` — the
+///    exact key payload from the antithesis crash:
+///    `[3, 7, 2, 64, 32, 220, 40, 245, 194, 143, 92, 3, 20]`.
+///
+/// **What this test simulates vs what the real run does.** Engineering
+/// the step-5/step-7 race deterministically without modifying production
+/// code is hard: there is no `CommitYieldPoint` between
+/// `unlock_commit_lock_if_held` (line 1945) and `last_committed_tx_ts.store`
+/// (line 1953). On a normal Linux scheduler with two threads, my 200-iteration
+/// concurrent stress did not reproduce the race in finite time. So this test
+/// stamps `mvstore.last_committed_tx_ts` to a stale value before checkpoint
+/// #N — which is exactly the post-race observation — and verifies that the
+/// chain of consequences from there matches the antithesis crash byte-for-byte.
+///
+/// **Fix:** make the store at `core/mvcc/database/mod.rs:1953` monotonic via
+/// `fetch_max(*end_ts, Ordering::Release)`. This is a 1-line change that
+/// preserves correctness under any interleaving of `CommitEnd` bodies. (A
+/// proper regression test would additionally need a new yield point between
+/// lines 1945 and 1953 plus a `FixedYieldInjector` driver — also small, but
+/// touches production code.)
+#[test]
+fn test_phantom_delete_after_stale_ckpt_max_keeps_tombstone() {
+    use std::sync::atomic::Ordering;
+
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v REAL UNIQUE)")
+        .unwrap();
+
+    // (1) INSERT (8.43, 788).
+    db.conn
+        .execute("INSERT INTO t(id, v) VALUES (788, 8.43)")
+        .unwrap();
+    // (2) Checkpoint → btree has (8.43, 788), v1 GC'd from MVCC.
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let durable_after_first_ckpt = db.mvcc_store.durable_txid_max.load(Ordering::SeqCst);
+
+    // (3) UPDATE creates v_tomb on (8.43, 788), with btree_resident=true.
+    db.conn
+        .execute("UPDATE t SET v = 2.9 WHERE id = 788")
+        .unwrap();
+
+    // Read v_tomb's end_ts from the chain.
+    let mut tomb_end_ts: Option<u64> = None;
+    for outer in db.mvcc_store.index_rows.iter() {
+        for inner in outer.value().iter() {
+            let versions = inner.value().read();
+            for v in versions.iter() {
+                if inner.key().key.get_payload()
+                    == [
+                        3u8, 7, 2, 64, 32, 220, 40, 245, 194, 143, 92, 3, 20,
+                    ]
+                    .as_slice()
+                {
+                    if let Some(TxTimestampOrID::Timestamp(t)) = v.end {
+                        tomb_end_ts = Some(t);
+                    }
+                }
+            }
+        }
+    }
+    let tomb_end_ts = tomb_end_ts.expect("v_tomb should exist after UPDATE");
+
+    // (5+6) Simulate the regression race: `last_committed_tx_ts` is observed
+    // strictly less than v_tomb's end_ts at the next checkpoint's AcquireLock.
+    // We do NOT touch durable_txid_max — it is already < ts_b naturally because
+    // v_tomb was committed AFTER the previous checkpoint advanced durable_old.
+    let stale = tomb_end_ts.saturating_sub(2).max(durable_after_first_ckpt);
+    db.mvcc_store
+        .last_committed_tx_ts
+        .store(stale, Ordering::SeqCst);
+
+    // (4) Second checkpoint: pushes v_tomb's DELETE to btree (succeeds —
+    // btree had (8.43, 788) from the first checkpoint), then gc_version_chain
+    // runs with ckpt_max=stale<ts_b → Rule 2 RETAINS v_tomb.
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Confirm v_tomb is still in MVCC after the second checkpoint.
+    let mut tomb_still_there = false;
+    for outer in db.mvcc_store.index_rows.iter() {
+        for inner in outer.value().iter() {
+            let versions = inner.value().read();
+            if !versions.is_empty()
+                && inner.key().key.get_payload()
+                    == [
+                        3u8, 7, 2, 64, 32, 220, 40, 245, 194, 143, 92, 3, 20,
+                    ]
+                    .as_slice()
+            {
+                tomb_still_there = true;
+            }
+        }
+    }
+    assert!(
+        tomb_still_there,
+        "v_tomb should be retained after 2nd ckpt due to stale ckpt_max"
+    );
+
+    // Need a fresh commit so the third checkpoint has work to do.
+    db.conn
+        .execute("INSERT INTO t(id, v) VALUES (1, 0.5)")
+        .unwrap();
+
+    // (7) Third checkpoint sees v_tomb. Tries DELETE (8.43, 788) from btree,
+    // which the second checkpoint already removed → "Corrupt: MVCC delete:
+    // rowid SortableIndexKey {…} not found".
+    let result = db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    let err = result.expect_err("third checkpoint must fail with Corrupt");
+    let s = format!("{err:?}");
+    assert!(
+        s.contains("MVCC delete") && s.contains("not found"),
+        "expected 'MVCC delete: rowid … not found' but got: {s}"
+    );
+}
