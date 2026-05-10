@@ -5121,7 +5121,7 @@ fn test_plain_vacuum_empty_schema_physical_contract() -> anyhow::Result<()> {
         .expect_err("VACUUM on an uninitialized database should return an error");
     assert_eq!(
         err.to_string(),
-        "Internal error: begin_blocking_tx can be done on an initialized database (page 1 must already be allocated)",
+        "Internal error: begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)",
         "expected initialization error, got: {err}"
     );
     Ok(())

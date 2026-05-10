@@ -36,15 +36,15 @@ pub fn translate_vacuum(
             Ok(())
         }
         None => {
+            if connection.experimental_multiprocess_wal_enabled() {
+                return Err(LimboError::ParseError(
+                    "VACUUM is incompatible with experimental multiprocess WAL".to_string(),
+                ));
+            }
             if !connection.experimental_vacuum_enabled() {
                 return Err(LimboError::ParseError(
                     "VACUUM is an experimental feature. Enable with --experimental-vacuum flag"
                         .to_string(),
-                ));
-            }
-            if connection.experimental_multiprocess_wal_enabled() {
-                return Err(LimboError::ParseError(
-                    "VACUUM is incompatible with experimental multiprocess WAL".to_string(),
                 ));
             }
 

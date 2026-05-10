@@ -1551,10 +1551,11 @@ fn capture_target_metadata(temp_db: &VacuumTempDb) -> Result<VacuumCommittedImag
         let header = temp_pager
             .io
             .block(|| temp_pager.with_header(|header| *header))?;
-        temp_conn.reparse_schema_with_cookie(header.schema_cookie.get())?;
+        let mut schema = temp_conn.schema.read().as_ref().clone();
+        schema.schema_version = header.schema_cookie.get();
         Ok(VacuumCommittedImageMeta {
             header,
-            schema: temp_conn.schema.read().clone(),
+            schema: Arc::new(schema),
         })
     })();
 
@@ -2725,7 +2726,7 @@ mod tests {
             io,
             source_path,
             OpenFlags::Create,
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_vacuum(true),
             None,
         )?;
         let source_conn = source_db.connect()?;
@@ -2831,7 +2832,7 @@ mod tests {
             io_dyn,
             "vacuum-source.db",
             OpenFlags::Create,
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_vacuum(true),
             None,
         )?;
         let conn = db.connect()?;
@@ -2872,7 +2873,7 @@ mod tests {
             io_dyn,
             "vacuum-source-full.db",
             OpenFlags::Create,
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_vacuum(true),
             None,
         )?;
         let conn = db.connect()?;
