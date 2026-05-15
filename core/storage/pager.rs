@@ -2818,6 +2818,15 @@ impl Pager {
         };
         let (is_write, schema_did_change) = match connection.get_tx_state() {
             TransactionState::Write { schema_did_change } => (true, schema_did_change),
+            // An MVCC auto-checkpoint (driven from CommitState::Checkpoint and
+            // created with update_transaction_state == false) holds a pager
+            // *write* transaction but never moves the connection into the Write
+            // tx state. If such a checkpoint is abandoned, we must still perform
+            // a full write rollback: clear the dirty page cache, roll back the
+            // WAL frames, and release the write lock. Misclassifying it as a
+            // read rollback leaks the pages it allocated (committed later as
+            // orphaned "never used" pages) and strands the WAL write lock.
+            _ if wal.holds_write_lock() => (true, false),
             _ => (false, false),
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);

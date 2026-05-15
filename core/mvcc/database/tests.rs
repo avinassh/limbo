@@ -2628,10 +2628,165 @@ fn test_checkpoint_resamples_boundary_before_starting() {
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
+/// What this test checks: when an MVCC *auto*-checkpoint (the kind triggered from
+/// `CommitState::Checkpoint`, created with `update_transaction_state = false`) is
+/// abandoned after it has begun its pager write transaction and allocated B-tree
+/// pages, the cleanup path must roll back those page allocations. Otherwise the
+/// grown `database_size` and the freshly-allocated (still-zeroed) pages leak into
+/// the next pager commit, producing orphaned pages that `PRAGMA integrity_check`
+/// reports as "never used" (the exact failure seen in the antithesis run).
+///
+/// Why this matters: `pager.rollback_tx()` decides whether to clear the dirty
+/// page cache / roll back WAL frames from `connection.get_tx_state()`. The
+/// auto-checkpoint holds a pager *write* transaction (`pager_write_tx == true`)
+/// but never sets the connection's tx state to `Write` (only the
+/// `update_transaction_state == true` path does). So on abandon the write tx is
+/// misclassified as a read tx and its allocated pages are never reclaimed.
+#[test]
+fn test_abandoned_auto_checkpoint_does_not_leak_allocated_pages() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    // Drive checkpoints manually so scheduling is deterministic.
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE t (
+            k INTEGER PRIMARY KEY,
+            u INTEGER UNIQUE,
+            blob_col BLOB NOT NULL
+        )",
+    )
+    .unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+    let read_db_size = |p: &Arc<Pager>| -> u32 {
+        p.io.block(|| p.with_header(|h| h.database_size.get()))
+            .unwrap()
+    };
+
+    // Seed some rows and do one clean checkpoint so the table B-tree exists
+    // on disk and the freelist/db-size are in a consistent committed state.
+    for i in 0..150 {
+        conn.execute(&format!(
+            "INSERT INTO t (k, u, blob_col) VALUES ({i}, {i}, zeroblob(2048))"
+        ))
+        .unwrap();
+    }
+    {
+        let sync_mode = conn.get_sync_mode();
+        let mut clean = CheckpointStateMachine::new(
+            pager.clone(),
+            mvcc_store.clone(),
+            conn.clone(),
+            true,
+            sync_mode,
+        );
+        run_checkpoint_to_done(&mut clean, &pager);
+    }
+    let integrity = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(&integrity[0][0].to_string(), "ok", "baseline must be clean");
+    let db_size_before = read_db_size(&pager);
+
+    // More rows so the next checkpoint must allocate fresh B-tree/overflow pages.
+    for i in 150..400 {
+        conn.execute(&format!(
+            "INSERT INTO t (k, u, blob_col) VALUES ({i}, {i}, zeroblob(2048))"
+        ))
+        .unwrap();
+    }
+
+    // Mimic the production auto-checkpoint exactly: a connection that has NOT
+    // started a write statement, and update_transaction_state = false.
+    let bad_conn = db.connect();
+    assert!(
+        !matches!(
+            bad_conn.get_tx_state(),
+            crate::connection::TransactionState::Write { .. }
+        ),
+        "precondition: the auto-checkpoint connection is not in a Write tx state"
+    );
+    let bad_pager = bad_conn.pager.load().clone();
+    let sync_mode = bad_conn.get_sync_mode();
+    let mut interrupted = CheckpointStateMachine::new(
+        bad_pager.clone(),
+        mvcc_store.clone(),
+        bad_conn.clone(),
+        false, // <-- auto-checkpoint mode: does NOT set connection tx state to Write
+        sync_mode,
+    );
+
+    // Step until the checkpoint has allocated pages (db_size grew) but well
+    // before it commits the pager transaction.
+    let mut allocated = false;
+    for _ in 0..200_000 {
+        if read_db_size(&bad_pager) > db_size_before
+            && interrupted.state_for_test() != CheckpointState::CommitPagerTxn
+        {
+            allocated = true;
+            break;
+        }
+        match interrupted.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(bad_pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => panic!("checkpoint finished before we could abandon it"),
+        }
+    }
+    assert!(
+        allocated,
+        "expected the checkpoint to allocate pages (db_size to grow past {db_size_before})"
+    );
+
+    // Abandon the checkpoint exactly the way production does on error/abort
+    // (Program::abort -> cleanup_mvcc_checkpoint_state ->
+    // cleanup_after_external_io_error).
+    interrupted.cleanup_after_external_io_error();
+
+    // The allocated-but-unlinked pages must have been rolled back: db_size must
+    // return to its pre-checkpoint value and a subsequent clean checkpoint must
+    // leave the database internally consistent.
+    let db_size_after = read_db_size(&bad_pager);
+    assert_eq!(
+        db_size_after, db_size_before,
+        "abandoned auto-checkpoint leaked allocated pages: db_size went {db_size_before} -> {db_size_after} and was not rolled back"
+    );
+
+    let sync_mode = conn.get_sync_mode();
+    let mut finalize = CheckpointStateMachine::new(
+        pager.clone(),
+        mvcc_store.clone(),
+        conn.clone(),
+        true,
+        sync_mode,
+    );
+    run_checkpoint_to_done(&mut finalize, &pager);
+
+    let integrity = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(
+        &integrity[0][0].to_string(),
+        "ok",
+        "integrity_check found leaked pages after an abandoned MVCC auto-checkpoint"
+    );
+}
+
+fn run_checkpoint_to_done(sm: &mut CheckpointStateMachine<MvccClock>, pager: &Arc<Pager>) {
+    for _ in 0..500_000 {
+        match sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => return,
+        }
+    }
+    panic!("checkpoint did not finish in bounded steps");
+}
+
 /// What this test checks: a checkpoint state machine created before another checkpoint
 /// advances the durable boundary must resample that boundary after taking the checkpoint lock.
 /// Why this matters: otherwise a delayed checkpoint can replay an already-durable unique-index
 /// delete and fail.
+///
+/// (See also test_abandoned_auto_checkpoint_does_not_leak_allocated_pages above.)
 #[test]
 fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
     let db = MvccTestDbNoConn::new_with_random_db();
