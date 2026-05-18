@@ -218,9 +218,7 @@ impl RustDatabaseInstance {
 #[async_trait]
 impl DatabaseInstance for RustDatabaseInstance {
     async fn execute_setup(&mut self, sql: &str) -> Result<(), BackendError> {
-        // Use execute_batch for setup SQL (may contain multiple statements)
-        self.conn
-            .execute_batch(sql)
+        self.execute_query(sql)
             .await
             .map_err(|e| BackendError::Execute(e.to_string()))?;
         Ok(())
