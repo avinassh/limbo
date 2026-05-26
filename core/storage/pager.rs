@@ -1420,8 +1420,8 @@ enum AllocatePage1State {
 #[derive(Debug, Clone)]
 enum FreePageState {
     Start,
-    AddToTrunk { page: Arc<Page>, page_id: usize },
-    NewTrunk { page: Arc<Page>, page_id: usize },
+    AddToTrunk { page: Arc<Page> },
+    NewTrunk { page: Arc<Page> },
 }
 
 /// State machine for async cache spilling.
@@ -1961,8 +1961,6 @@ impl Pager {
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
     ) -> Result<()> {
-        self.reset_internal_states();
-
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
             return Ok(());
@@ -4600,15 +4598,17 @@ impl Pager {
                         }
                         None => self.read_page(page_id as i64)?,
                     };
+                    header.freelist_pages = (header.freelist_pages.get() + 1).into();
+
                     let trunk_page_id = header.freelist_trunk_page.get();
 
                     // Pin page to prevent eviction while stored in state machine
                     page.pin();
 
                     if trunk_page_id != 0 {
-                        *state = FreePageState::AddToTrunk { page, page_id };
+                        *state = FreePageState::AddToTrunk { page };
                     } else {
-                        *state = FreePageState::NewTrunk { page, page_id };
+                        *state = FreePageState::NewTrunk { page };
                     }
                     if let Some(c) = c {
                         if !c.succeeded() {
@@ -4616,16 +4616,7 @@ impl Pager {
                         }
                     }
                 }
-                FreePageState::AddToTrunk {
-                    page,
-                    page_id: pending_page_id,
-                } => {
-                    turso_assert_eq!(
-                        page.get().id,
-                        *pending_page_id,
-                        "free_page pending page id mismatch",
-                        { "expected": *pending_page_id, "actual": page.get().id }
-                    );
+                FreePageState::AddToTrunk { page } => {
                     let trunk_page_id = header.freelist_trunk_page.get();
                     let (trunk_page, c) = self.read_page(trunk_page_id as i64)?;
                     if let Some(c) = c {
@@ -4656,27 +4647,20 @@ impl Pager {
                         trunk_page_contents.write_u32_no_offset(
                             FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR
                                 + (number_of_leaf_pages as usize * FREELIST_LEAF_PTR_SIZE),
-                            *pending_page_id as u32,
+                            page_id as u32,
                         );
-                        header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
                         // Unpin page before finishing - it's added to freelist
                         page.unpin();
                         break;
                     }
                     // page remains pinned as it transitions to NewTrunk state
-                    *state = FreePageState::NewTrunk {
-                        page: page.clone(),
-                        page_id: *pending_page_id,
-                    };
+                    *state = FreePageState::NewTrunk { page: page.clone() };
                 }
-                FreePageState::NewTrunk {
-                    page,
-                    page_id: pending_page_id,
-                } => {
+                FreePageState::NewTrunk { page } => {
                     turso_assert!(page.is_loaded(), "page should be loaded");
                     // If we get here, need to make this page a new trunk
-                    turso_assert!(page.get().id == *pending_page_id, "page has unexpected id");
+                    turso_assert!(page.get().id == page_id, "page has unexpected id");
                     self.add_dirty(page)?;
 
                     let trunk_page_id = header.freelist_trunk_page.get();
@@ -4688,8 +4672,7 @@ impl Pager {
                     // Zero leaf count
                     contents.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, 0);
                     // Update page 1 to point to new trunk
-                    header.freelist_trunk_page = (*pending_page_id as u32).into();
-                    header.freelist_pages = (header.freelist_pages.get() + 1).into();
+                    header.freelist_trunk_page = (page_id as u32).into();
                     // Unpin page before finishing - it's now a trunk page
                     page.unpin();
                     break;
@@ -5101,12 +5084,12 @@ impl Pager {
         }
     }
 
-    pub(crate) fn reset_internal_states(&self) {
+    fn reset_internal_states(&self) {
         *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
-        self.reset_allocate_page_state();
-        self.reset_free_page_state();
+        *self.allocate_page_state.write() = AllocatePageState::Start;
+        *self.free_page_state.write() = FreePageState::Start;
         *self.spill_state.write() = SpillState::Idle;
         #[cfg(not(feature = "omit_autovacuum"))]
         {
@@ -5117,40 +5100,6 @@ impl Pager {
         }
 
         *self.header_ref_state.write() = HeaderRefState::Start;
-    }
-
-    fn reset_allocate_page_state(&self) {
-        let state = {
-            let mut state = self.allocate_page_state.write();
-            std::mem::replace(&mut *state, AllocatePageState::Start)
-        };
-        match state {
-            AllocatePageState::SearchAvailableFreeListLeaf { trunk_page } => {
-                trunk_page.unpin();
-            }
-            AllocatePageState::ReuseFreelistLeaf {
-                trunk_page,
-                leaf_page,
-                ..
-            } => {
-                trunk_page.unpin();
-                leaf_page.unpin();
-            }
-            AllocatePageState::Start | AllocatePageState::AllocateNewPage { .. } => {}
-        }
-    }
-
-    fn reset_free_page_state(&self) {
-        let state = {
-            let mut state = self.free_page_state.write();
-            std::mem::replace(&mut *state, FreePageState::Start)
-        };
-        match state {
-            FreePageState::AddToTrunk { page, .. } | FreePageState::NewTrunk { page, .. } => {
-                page.unpin();
-            }
-            FreePageState::Start => {}
-        }
     }
 
     pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<IOResult<T>> {
