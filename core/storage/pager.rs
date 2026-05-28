@@ -1961,7 +1961,7 @@ impl Pager {
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
     ) -> Result<()> {
-        self.reset_internal_states();
+        self.reset_page_mutation_states();
 
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
@@ -5101,12 +5101,11 @@ impl Pager {
         }
     }
 
-    pub(crate) fn reset_internal_states(&self) {
+    fn reset_internal_states(&self) {
         *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
-        self.reset_allocate_page_state();
-        self.reset_free_page_state();
+        self.reset_page_mutation_states();
         *self.spill_state.write() = SpillState::Idle;
         #[cfg(not(feature = "omit_autovacuum"))]
         {
@@ -5117,6 +5116,11 @@ impl Pager {
         }
 
         *self.header_ref_state.write() = HeaderRefState::Start;
+    }
+
+    fn reset_page_mutation_states(&self) {
+        self.reset_allocate_page_state();
+        self.reset_free_page_state();
     }
 
     fn reset_allocate_page_state(&self) {
