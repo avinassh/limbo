@@ -13233,3 +13233,83 @@ fn test_global_header_regression_would_lose_committed_user_version() {
         "older out-of-order FinalizeCommit regressed committed PRAGMA user_version"
     );
 }
+
+#[test]
+fn test_create_index_exclusive_acquire_race_reproduces_incomplete_index() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    let mut read = ddl.prepare("SELECT COUNT(*) FROM t").unwrap();
+    read.run_ignore_rows().unwrap();
+    drop(read);
+
+    let mvcc_store = db.get_mvcc_store();
+    let ddl_tx_id = ddl
+        .get_mv_tx_id()
+        .expect("DDL connection should have an active MVCC transaction");
+    let ddl_begin_ts = mvcc_store
+        .txs
+        .get(&ddl_tx_id)
+        .expect("DDL transaction should be tracked")
+        .value()
+        .begin_ts;
+
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+    let mut writer_commit = writer.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(writer_commit.step().unwrap(), StepResult::IO),
+        "writer should yield before publishing last_committed_tx_ts"
+    );
+
+    let writer_tx_id = writer
+        .get_mv_tx_id()
+        .expect("writer transaction should still be tracked while commit is yielded");
+    let writer_end_ts = match mvcc_store
+        .txs
+        .get(&writer_tx_id)
+        .expect("writer transaction should still be in txs")
+        .value()
+        .state
+        .load()
+    {
+        TransactionState::Committed(end_ts) => end_ts,
+        state => panic!("expected yielded writer to be Committed, got {state:?}"),
+    };
+    assert!(
+        ddl_begin_ts < writer_end_ts,
+        "DDL transaction should have begun before the writer committed"
+    );
+    assert!(
+        mvcc_store.last_committed_tx_ts.load(Ordering::Acquire) < writer_end_ts,
+        "writer should not have published last_committed_tx_ts yet"
+    );
+
+    ddl.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    ddl.execute("COMMIT").unwrap();
+
+    writer.set_yield_injector(None);
+    writer_commit.run_ignore_rows().unwrap();
+    drop(writer_commit);
+
+    let observer = db.connect();
+    let result = observer.execute("DELETE FROM t WHERE id = 2");
+    match &result {
+        Err(crate::LimboError::Corrupt(msg)) if msg.contains("IdxDelete") => {}
+        Ok(_) => panic!("DELETE should have failed due to incomplete index"),
+        Err(err) => panic!("unexpected error: {err:?}"),
+    }
+}
