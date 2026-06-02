@@ -3033,8 +3033,8 @@ fn test_checkpoint_stale_unique_index_delete_with_out_of_order_commit_yield() {
 /// Steps:
 /// 1. Disable automatic checkpoints and create a baseline table.
 /// 2. Checkpoint the baseline state so the durable boundary is non-zero.
-/// 3. Start an older concurrent transaction and yield it after it commits, releases the
-///    commit lock, and is just about to update the committed timestamp watermark.
+/// 3. Start an older concurrent transaction and yield it after it commits and
+///    publishes the committed timestamp watermark, before final tx cleanup.
 /// 4. Commit a newer `CREATE TABLE` plus row insert through ordinary SQL.
 /// 5. Resume the older transaction; without a monotonic committed watermark this regresses
 ///    the checkpoint boundary source.
@@ -3065,7 +3065,7 @@ fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_afte
         let mut older_commit = older.prepare("COMMIT").unwrap();
         assert!(
             matches!(older_commit.step().unwrap(), StepResult::IO),
-            "older commit should yield before updating the committed timestamp watermark"
+            "older commit should yield after updating the committed timestamp watermark"
         );
 
         let creator = db.connect();
@@ -13058,8 +13058,8 @@ fn test_auto_rowid_after_negative_explicit_rowid_uses_next_negative() {
 /// Regression: out-of-order MVCC commit finalization must not let an older
 /// transaction replace `global_header` with a stale header.
 ///
-/// tx_a is paused in FinalizeCommit after it has been marked Committed but
-/// before publishing its header/watermark. tx_b then commits newer DDL and
+/// tx_a is paused in FinalizeCommit after it has published its header/watermark
+/// but before final tx cleanup. tx_b then commits newer DDL and
 /// publishes a bumped schema cookie. When tx_a resumes, its older header must
 /// not move `global_header.schema_cookie` backward.
 #[test]
@@ -13084,10 +13084,8 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
     let conn_b = db.connect();
 
     // tx_a: CONCURRENT update. Pin its commit inside FinalizeCommit, after
-    // CommitEnd has already marked the tx Committed but before the
-    // watermark / global_header writes. tx_a is no longer Preparing at the
-    // yield, so `acquire_exclusive_tx`'s `has_preparing_tx_other_than` check
-    // lets tx_b take the slot.
+    // CommitEnd has already marked the tx Committed and published the
+    // watermark / global_header.
     conn_a.execute("BEGIN CONCURRENT").unwrap();
     conn_a
         .execute("UPDATE t SET v = 'a-mod' WHERE id = 1")
@@ -13111,7 +13109,7 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
     }
     assert!(
         yielded,
-        "tx_a's COMMIT should yield before publishing global_header"
+        "tx_a's COMMIT should yield after publishing global_header"
     );
     assert!(
         matches!(
@@ -13127,9 +13125,8 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
         "tx_a should be Committed (set by CommitEnd) by the time we yield in FinalizeCommit"
     );
 
-    // tx_b: exclusive DDL. tx_a is Committed so `acquire_exclusive_tx`
-    // does not see a Preparing other-than. tx_b runs end-to-end and its
-    // FinalizeCommit writes the bumped cookie into global_header.
+    // tx_b: exclusive DDL. It begins after tx_a has allocated its commit
+    // timestamp, so its snapshot includes tx_a and it can run end-to-end.
     conn_b.execute("BEGIN").unwrap();
     conn_b.execute("CREATE TABLE foo(x INTEGER)").unwrap();
     conn_b.execute("COMMIT").unwrap();
@@ -13206,7 +13203,7 @@ fn test_global_header_regression_would_lose_committed_user_version() {
     }
     assert!(
         yielded_older,
-        "older COMMIT should yield before publishing global_header"
+        "older COMMIT should yield after publishing global_header"
     );
 
     header_writer.execute("BEGIN").unwrap();
@@ -13235,7 +13232,7 @@ fn test_global_header_regression_would_lose_committed_user_version() {
 }
 
 #[test]
-fn test_create_index_exclusive_acquire_race_reproduces_incomplete_index() {
+fn test_create_index_exclusive_acquire_race_returns_busy_before_incomplete_index() {
     let db = MvccTestDbNoConn::new_with_random_db();
 
     let setup = db.connect();
@@ -13272,7 +13269,7 @@ fn test_create_index_exclusive_acquire_race_reproduces_incomplete_index() {
     let mut writer_commit = writer.prepare("COMMIT").unwrap();
     assert!(
         matches!(writer_commit.step().unwrap(), StepResult::IO),
-        "writer should yield before publishing last_committed_tx_ts"
+        "writer should yield after publishing last_committed_tx_ts"
     );
 
     let writer_tx_id = writer
@@ -13294,22 +13291,28 @@ fn test_create_index_exclusive_acquire_race_reproduces_incomplete_index() {
         "DDL transaction should have begun before the writer committed"
     );
     assert!(
-        mvcc_store.last_committed_tx_ts.load(Ordering::Acquire) < writer_end_ts,
-        "writer should not have published last_committed_tx_ts yet"
+        mvcc_store.last_committed_tx_ts.load(Ordering::Acquire) >= writer_end_ts,
+        "writer should publish last_committed_tx_ts before releasing the commit lock"
     );
 
-    ddl.execute("CREATE INDEX idx_v ON t(v)").unwrap();
-    ddl.execute("COMMIT").unwrap();
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    assert!(
+        matches!(result, Err(crate::LimboError::Busy)),
+        "stale DDL transaction should not acquire exclusive lock: {result:?}"
+    );
+    if ddl.get_mv_tx_id().is_some() {
+        ddl.execute("ROLLBACK").unwrap();
+    }
 
     writer.set_yield_injector(None);
     writer_commit.run_ignore_rows().unwrap();
     drop(writer_commit);
 
     let observer = db.connect();
-    let result = observer.execute("DELETE FROM t WHERE id = 2");
-    match &result {
-        Err(crate::LimboError::Corrupt(msg)) if msg.contains("IdxDelete") => {}
-        Ok(_) => panic!("DELETE should have failed due to incomplete index"),
-        Err(err) => panic!("unexpected error: {err:?}"),
-    }
+    observer.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    observer.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+    let integrity = get_rows(&observer, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(integrity[0][0].to_string(), "ok");
 }

@@ -1104,9 +1104,9 @@ pub(crate) enum CommitYieldPoint {
     /// `LogRecordPrepared` to bracket the BuildLogRecord chunked yields.
     BuildLogRecordStart,
     LogRecordPrepared,
-    /// Fires after commit dependencies are released and the commit lock is
-    /// dropped, but before publishing the cached global header / committed
-    /// timestamp watermark.
+    /// Historical name retained for stable yield ordinals. Fires after
+    /// publishing the cached global header / committed timestamp watermark and
+    /// releasing the commit lock, but before final tx cleanup.
     BeforeGlobalHeaderUpdate,
     BeforeFinishCommittedTx,
     /// Boundary right after `remove_tx` runs but before the connection cache
@@ -2516,10 +2516,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                 }
 
-                mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
-
-                inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
-
                 let tx_header = *tx_unlocked.header.read();
                 {
                     // Hold the header lock across the watermark update and header
@@ -2542,6 +2538,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .last_committed_schema_change_ts
                         .fetch_max(*end_ts, Ordering::AcqRel);
                 }
+
+                mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
+
+                inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
@@ -4750,6 +4750,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         })
     }
 
+    fn has_committed_tx_after_begin(&self, tx_id: &TxID) -> bool {
+        self.txs.get(tx_id).is_some_and(|tx| {
+            tx.value().begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
+        })
+    }
+
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
         if self.exclusive_tx.load(Ordering::Acquire) == *tx_id {
@@ -4759,13 +4765,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if self.has_preparing_tx_other_than(*tx_id) {
             return Err(LimboError::Busy);
         }
-        if let Some(tx) = self.txs.get(tx_id) {
-            let tx = tx.value();
-            if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
-                // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
-                // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
-                return Err(LimboError::Busy);
-            }
+        if self.has_committed_tx_after_begin(tx_id) {
+            // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
+            // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
+            return Err(LimboError::Busy);
         }
         match self.exclusive_tx.compare_exchange(
             NO_EXCLUSIVE_TX,
@@ -4774,7 +4777,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                if self.has_preparing_tx_other_than(*tx_id) {
+                if self.has_preparing_tx_other_than(*tx_id)
+                    || self.has_committed_tx_after_begin(tx_id)
+                {
                     self.release_exclusive_tx(tx_id);
                     return Err(LimboError::Busy);
                 }
