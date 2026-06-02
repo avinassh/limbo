@@ -4602,7 +4602,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let already_exclusive = self.is_exclusive_tx(&tx_id);
         if !already_exclusive {
-            self.acquire_exclusive_tx(&tx_id, exclusive_yield_context)
+            self.acquire_exclusive_tx(&tx_id, begin_ts, exclusive_yield_context)
                 .inspect_err(|_| unlock_checkpoint_guard())?;
         }
 
@@ -5257,17 +5257,33 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.exclusive_tx.load(Ordering::Acquire) != NO_EXCLUSIVE_TX
     }
 
-    fn has_preparing_tx_other_than(&self, tx_id: TxID) -> bool {
+    fn has_conflicting_commit_tx_other_than(&self, tx_id: TxID, begin_ts: u64) -> bool {
         self.txs.iter().any(|entry| {
-            *entry.key() != tx_id
-                && matches!(entry.value().state.load(), TransactionState::Preparing(_))
+            if *entry.key() == tx_id {
+                return false;
+            }
+            match entry.value().state.load() {
+                // Preparing may still commit; Committed is already logical time
+                // but may not have reached last_committed_tx_ts yet.
+                TransactionState::Preparing(_) => true,
+                TransactionState::Committed(commit_ts) => commit_ts > begin_ts,
+                TransactionState::Active
+                | TransactionState::Aborted
+                | TransactionState::Terminated => false,
+            }
         })
+    }
+
+    fn exclusive_snapshot_is_stale_or_blocked(&self, tx_id: TxID, begin_ts: u64) -> bool {
+        begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
+            || self.has_conflicting_commit_tx_other_than(tx_id, begin_ts)
     }
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(
         &self,
         tx_id: &TxID,
+        begin_ts: u64,
         yield_context: Option<&YieldContext>,
     ) -> Result<()> {
         #[cfg(not(any(test, injected_yields)))]
@@ -5278,7 +5294,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
         let mut result = Ok(());
         self.get_commit_timestamp(|_| {
-            result = self.acquire_exclusive_tx_locked(tx_id, yield_context);
+            result = self.acquire_exclusive_tx_locked(tx_id, begin_ts, yield_context);
         });
         result
     }
@@ -5286,27 +5302,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn acquire_exclusive_tx_locked(
         &self,
         tx_id: &TxID,
+        begin_ts: u64,
         yield_context: Option<&YieldContext>,
     ) -> Result<()> {
         #[cfg(not(any(test, injected_yields)))]
         let _ = yield_context;
-        // if some other transaction is in preparing state, then we cannot let this tx to
-        // continue, as the preparing txn will eventually commit
-        if self.has_preparing_tx_other_than(*tx_id) {
+        if self.exclusive_snapshot_is_stale_or_blocked(*tx_id, begin_ts) {
             return Err(LimboError::Busy);
-        }
-        // after we acquired begin_ts, we will check if some other txn committed in the meantime.
-        // If so, no point in letting this txn to progress as it's begin_ts is less than
-        // other txn's commit ts.
-        // do note that this is an optimistic / early check. We need to check this again after this
-        // txn gets exclusive txn status. check below after the CAS
-        if let Some(tx) = self.txs.get(tx_id) {
-            let tx = tx.value();
-            if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
-                // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
-                // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
-                return Err(LimboError::Busy);
-            }
         }
         #[cfg(any(test, injected_yields))]
         if let Some(yield_context) = yield_context {
@@ -5330,33 +5332,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                if self.has_preparing_tx_other_than(*tx_id) {
+                if self.exclusive_snapshot_is_stale_or_blocked(*tx_id, begin_ts) {
                     self.release_exclusive_tx(tx_id);
                     return Err(LimboError::Busy);
-                }
-                // we will check again, if some other txn committed in the meantime.
-                // we did this check previously too, but we will have to do this again.
-                // consider this timeline of events:
-                //
-                // t0 - no txn is preparing, and last_committed_ts is smaller than begin_ts
-                //      we proceed to do CAS
-                // t1 - we are yet to do CAS, but another txn comes in, goes into
-                //      preparing state, and commits with commit_ts greater than our begin_ts
-                // t3 - we proceed with CAS and get exclusive txn status
-                //
-                // at this point, we have got exclusive txn but last_committed_tx_ts is greater than
-                // our begin_ts, violating the isolation guarantee.
-                //
-                // we want to prevent this. so we acquire the exclusive txn and then check again.
-                // we can also be sure that once we get the exclusive txn status, no other txn can sneak in and commit,
-                // because to commit, we make sure that there is no other exclusive txn. Check
-                // `CommitState::Initial`.
-                if let Some(tx) = self.txs.get(tx_id) {
-                    let tx = tx.value();
-                    if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
-                        self.release_exclusive_tx(tx_id);
-                        return Err(LimboError::Busy);
-                    }
                 }
                 Ok(())
             }

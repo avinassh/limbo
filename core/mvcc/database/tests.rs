@@ -5512,6 +5512,12 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     let exclusive_conn = db.connect();
     exclusive_conn.execute("BEGIN CONCURRENT").unwrap();
     let exclusive_tx_id = exclusive_conn.get_mv_tx_id().unwrap();
+    let exclusive_begin_ts = mvcc_store
+        .txs
+        .get(&exclusive_tx_id)
+        .expect("exclusive tx should be tracked")
+        .value()
+        .begin_ts;
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
@@ -5566,7 +5572,8 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     // Now try to acquire exclusive lock for the tx that started before the
     // read-only dependent committed. Should succeed because the read-only tx
     // did not advance last_committed_tx_ts.
-    let acquire_result = mvcc_store.acquire_exclusive_tx(&exclusive_tx_id, None);
+    let acquire_result =
+        mvcc_store.acquire_exclusive_tx(&exclusive_tx_id, exclusive_begin_ts, None);
     assert!(
         acquire_result.is_ok(),
         "acquire_exclusive_tx should not return Busy after a read-only dependent committed: {acquire_result:?}",
@@ -14327,9 +14334,8 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
 
     // tx_a: CONCURRENT update. Pin its commit inside FinalizeCommit, after
     // CommitEnd has already marked the tx Committed but before the
-    // watermark / global_header writes. tx_a is no longer Preparing at the
-    // yield, so `acquire_exclusive_tx`'s `has_preparing_tx_other_than` check
-    // lets tx_b take the slot.
+    // watermark / global_header writes. This exercises the gap where tx_a is
+    // no longer Preparing but is not yet reflected in last_committed_tx_ts.
     conn_a.execute("BEGIN CONCURRENT").unwrap();
     conn_a
         .execute("UPDATE t SET v = 'a-mod' WHERE id = 1")
