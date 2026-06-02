@@ -4602,7 +4602,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let already_exclusive = self.is_exclusive_tx(&tx_id);
         if !already_exclusive {
-            self.acquire_exclusive_tx(&tx_id, begin_ts, exclusive_yield_context)
+            self.acquire_exclusive_tx(&tx_id, exclusive_yield_context)
                 .inspect_err(|_| unlock_checkpoint_guard())?;
         }
 
@@ -5278,7 +5278,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn acquire_exclusive_tx(
         &self,
         tx_id: &TxID,
-        begin_ts: u64,
         yield_context: Option<&YieldContext>,
     ) -> Result<()> {
         #[cfg(not(any(test, injected_yields)))]
@@ -5289,7 +5288,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
         let mut result = Ok(());
         self.get_commit_timestamp(|_| {
-            result = self.acquire_exclusive_tx_locked(tx_id, begin_ts, yield_context);
+            result = self.acquire_exclusive_tx_locked(tx_id, yield_context);
         });
         result
     }
@@ -5297,7 +5296,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn acquire_exclusive_tx_locked(
         &self,
         tx_id: &TxID,
-        begin_ts: u64,
         yield_context: Option<&YieldContext>,
     ) -> Result<()> {
         #[cfg(not(any(test, injected_yields)))]
@@ -5312,13 +5310,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // other txn's commit ts.
         // do note that this is an optimistic / early check. We need to check this again after this
         // txn gets exclusive txn status. check below after the CAS
-        if begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
-            // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
-            // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
-            return Err(LimboError::Busy);
-        }
-        if self.has_committed_tx_after(*tx_id, begin_ts) {
-            return Err(LimboError::Busy);
+        if let Some(tx) = self.txs.get(tx_id) {
+            let tx = tx.value();
+            if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
+                || self.has_committed_tx_after(*tx_id, tx.begin_ts)
+            {
+                // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
+                // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
+                return Err(LimboError::Busy);
+            }
         }
         #[cfg(any(test, injected_yields))]
         if let Some(yield_context) = yield_context {
@@ -5363,11 +5363,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 // we can also be sure that once we get the exclusive txn status, no other txn can sneak in and commit,
                 // because to commit, we make sure that there is no other exclusive txn. Check
                 // `CommitState::Initial`.
-                if begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
-                    || self.has_committed_tx_after(*tx_id, begin_ts)
-                {
-                    self.release_exclusive_tx(tx_id);
-                    return Err(LimboError::Busy);
+                if let Some(tx) = self.txs.get(tx_id) {
+                    let tx = tx.value();
+                    if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
+                        || self.has_committed_tx_after(*tx_id, tx.begin_ts)
+                    {
+                        self.release_exclusive_tx(tx_id);
+                        return Err(LimboError::Busy);
+                    }
                 }
                 Ok(())
             }

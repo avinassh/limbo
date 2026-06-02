@@ -5512,12 +5512,6 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     let exclusive_conn = db.connect();
     exclusive_conn.execute("BEGIN CONCURRENT").unwrap();
     let exclusive_tx_id = exclusive_conn.get_mv_tx_id().unwrap();
-    let exclusive_begin_ts = mvcc_store
-        .txs
-        .get(&exclusive_tx_id)
-        .expect("exclusive tx should be tracked")
-        .value()
-        .begin_ts;
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
 
@@ -5572,8 +5566,7 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     // Now try to acquire exclusive lock for the tx that started before the
     // read-only dependent committed. Should succeed because the read-only tx
     // did not advance last_committed_tx_ts.
-    let acquire_result =
-        mvcc_store.acquire_exclusive_tx(&exclusive_tx_id, exclusive_begin_ts, None);
+    let acquire_result = mvcc_store.acquire_exclusive_tx(&exclusive_tx_id, None);
     assert!(
         acquire_result.is_ok(),
         "acquire_exclusive_tx should not return Busy after a read-only dependent committed: {acquire_result:?}",
