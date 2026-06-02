@@ -5257,26 +5257,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.exclusive_tx.load(Ordering::Acquire) != NO_EXCLUSIVE_TX
     }
 
-    fn has_conflicting_commit_tx_other_than(&self, tx_id: TxID, begin_ts: u64) -> bool {
+    fn has_preparing_tx_other_than(&self, tx_id: TxID) -> bool {
         self.txs.iter().any(|entry| {
-            if *entry.key() == tx_id {
-                return false;
-            }
-            match entry.value().state.load() {
-                // Preparing may still commit; Committed is already logical time
-                // but may not have reached last_committed_tx_ts yet.
-                TransactionState::Preparing(_) => true,
-                TransactionState::Committed(commit_ts) => commit_ts > begin_ts,
-                TransactionState::Active
-                | TransactionState::Aborted
-                | TransactionState::Terminated => false,
-            }
+            *entry.key() != tx_id
+                && matches!(entry.value().state.load(), TransactionState::Preparing(_))
         })
     }
 
-    fn exclusive_snapshot_is_stale_or_blocked(&self, tx_id: TxID, begin_ts: u64) -> bool {
-        begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
-            || self.has_conflicting_commit_tx_other_than(tx_id, begin_ts)
+    fn has_committed_tx_after(&self, tx_id: TxID, begin_ts: u64) -> bool {
+        self.txs.iter().any(|entry| {
+            *entry.key() != tx_id
+                && matches!(
+                    entry.value().state.load(),
+                    TransactionState::Committed(commit_ts) if commit_ts > begin_ts
+                )
+        })
     }
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
@@ -5307,7 +5302,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ) -> Result<()> {
         #[cfg(not(any(test, injected_yields)))]
         let _ = yield_context;
-        if self.exclusive_snapshot_is_stale_or_blocked(*tx_id, begin_ts) {
+        if self.has_preparing_tx_other_than(*tx_id)
+            || begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
+            || self.has_committed_tx_after(*tx_id, begin_ts)
+        {
             return Err(LimboError::Busy);
         }
         #[cfg(any(test, injected_yields))]
@@ -5332,7 +5330,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                if self.exclusive_snapshot_is_stale_or_blocked(*tx_id, begin_ts) {
+                if self.has_preparing_tx_other_than(*tx_id)
+                    || begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
+                    || self.has_committed_tx_after(*tx_id, begin_ts)
+                {
                     self.release_exclusive_tx(tx_id);
                     return Err(LimboError::Busy);
                 }
