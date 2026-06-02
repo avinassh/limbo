@@ -5276,6 +5276,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             // Re-entrant upgrade attempt for the same transaction.
             return Ok(());
         }
+        let mut result = Ok(());
+        self.get_commit_timestamp(|_| {
+            result = self.acquire_exclusive_tx_locked(tx_id, yield_context);
+        });
+        result
+    }
+
+    fn acquire_exclusive_tx_locked(
+        &self,
+        tx_id: &TxID,
+        yield_context: Option<&YieldContext>,
+    ) -> Result<()> {
+        #[cfg(not(any(test, injected_yields)))]
+        let _ = yield_context;
         // if some other transaction is in preparing state, then we cannot let this tx to
         // continue, as the preparing txn will eventually commit
         if self.has_preparing_tx_other_than(*tx_id) {

@@ -78,7 +78,7 @@ struct CommitWriterOnExclusiveAcquireInjector {
     point: YieldPoint,
     selection_key: u64,
     writer: Arc<Connection>,
-    fired: AtomicBool,
+    result: Arc<AtomicU8>,
 }
 
 impl CommitWriterOnExclusiveAcquireInjector {
@@ -87,12 +87,16 @@ impl CommitWriterOnExclusiveAcquireInjector {
             point,
             selection_key,
             writer,
-            fired: AtomicBool::new(false),
+            result: Arc::new(AtomicU8::new(COMMIT_NOT_FIRED)),
         })
     }
 
     fn fired(&self) -> bool {
-        self.fired.load(Ordering::Acquire)
+        self.result.load(Ordering::Acquire) != COMMIT_NOT_FIRED
+    }
+
+    fn result(&self) -> u8 {
+        self.result.load(Ordering::Acquire)
     }
 }
 
@@ -101,7 +105,7 @@ impl std::fmt::Debug for CommitWriterOnExclusiveAcquireInjector {
         f.debug_struct("CommitWriterOnExclusiveAcquireInjector")
             .field("point", &self.point)
             .field("selection_key", &self.selection_key)
-            .field("fired", &self.fired())
+            .field("result", &self.result())
             .finish_non_exhaustive()
     }
 }
@@ -110,24 +114,70 @@ impl YieldInjector for CommitWriterOnExclusiveAcquireInjector {
     fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
         if point != self.point
             || selection_key != self.selection_key
-            || self.fired.swap(true, Ordering::AcqRel)
+            || self
+                .result
+                .compare_exchange(
+                    COMMIT_NOT_FIRED,
+                    COMMIT_PENDING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
         {
             return false;
         }
-        self.writer.execute("COMMIT").unwrap();
+
+        let writer = self.writer.clone();
+        let result = self.result.clone();
+        std::thread::spawn(move || {
+            let outcome = match writer.execute("COMMIT") {
+                Ok(()) => COMMIT_OK,
+                Err(LimboError::WriteWriteConflict) => COMMIT_WRITE_WRITE_CONFLICT,
+                Err(_) => COMMIT_UNEXPECTED,
+            };
+            result.store(outcome, Ordering::Release);
+        });
+
+        for _ in 0..100 {
+            match self.result() {
+                COMMIT_PENDING => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                _ => break,
+            }
+        }
         true
     }
 }
 
+const COMMIT_NOT_FIRED: u8 = 0;
+const COMMIT_PENDING: u8 = 1;
+const COMMIT_OK: u8 = 2;
+const COMMIT_WRITE_WRITE_CONFLICT: u8 = 3;
+const COMMIT_UNEXPECTED: u8 = 4;
+
+fn wait_for_commit_result(injector: &CommitWriterOnExclusiveAcquireInjector) -> u8 {
+    for _ in 0..1000 {
+        let result = injector.result();
+        if !matches!(result, COMMIT_NOT_FIRED | COMMIT_PENDING) {
+            return result;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    injector.result()
+}
+
 const CREATE_INDEX_NOT_FIRED: u8 = 0;
-const CREATE_INDEX_OK: u8 = 1;
-const CREATE_INDEX_BUSY: u8 = 2;
+const CREATE_INDEX_PENDING: u8 = 1;
+const CREATE_INDEX_OK: u8 = 2;
+const CREATE_INDEX_BUSY: u8 = 3;
+const CREATE_INDEX_UNEXPECTED: u8 = 4;
 
 struct CreateIndexOnCommitConflictChecksInjector {
     point: YieldPoint,
     selection_key: u64,
     ddl: Arc<Connection>,
-    result: AtomicU8,
+    result: Arc<AtomicU8>,
 }
 
 impl CreateIndexOnCommitConflictChecksInjector {
@@ -136,7 +186,7 @@ impl CreateIndexOnCommitConflictChecksInjector {
             point,
             selection_key,
             ddl,
-            result: AtomicU8::new(CREATE_INDEX_NOT_FIRED),
+            result: Arc::new(AtomicU8::new(CREATE_INDEX_NOT_FIRED)),
         })
     }
 
@@ -163,7 +213,7 @@ impl YieldInjector for CreateIndexOnCommitConflictChecksInjector {
                 .result
                 .compare_exchange(
                     CREATE_INDEX_NOT_FIRED,
-                    CREATE_INDEX_OK,
+                    CREATE_INDEX_PENDING,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -172,15 +222,38 @@ impl YieldInjector for CreateIndexOnCommitConflictChecksInjector {
             return false;
         }
 
-        match self.ddl.execute("CREATE INDEX idx_v ON t(v)") {
-            Ok(()) => {}
-            Err(LimboError::Busy) => {
-                self.result.store(CREATE_INDEX_BUSY, Ordering::Release);
+        let ddl = self.ddl.clone();
+        let result = self.result.clone();
+        std::thread::spawn(move || {
+            let outcome = match ddl.execute("CREATE INDEX idx_v ON t(v)") {
+                Ok(()) => CREATE_INDEX_OK,
+                Err(LimboError::Busy) => CREATE_INDEX_BUSY,
+                Err(_) => CREATE_INDEX_UNEXPECTED,
+            };
+            result.store(outcome, Ordering::Release);
+        });
+
+        for _ in 0..100 {
+            match self.result() {
+                CREATE_INDEX_PENDING => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                _ => break,
             }
-            Err(err) => panic!("unexpected injected CREATE INDEX result: {err:?}"),
         }
         true
     }
+}
+
+fn wait_for_create_index_result(injector: &CreateIndexOnCommitConflictChecksInjector) -> u8 {
+    for _ in 0..1000 {
+        let result = injector.result();
+        if !matches!(result, CREATE_INDEX_NOT_FIRED | CREATE_INDEX_PENDING) {
+            return result;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    injector.result()
 }
 
 #[derive(Debug)]
@@ -14449,15 +14522,20 @@ fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
     let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
     assert!(
         injector.fired(),
-        "writer should commit in the exclusive-acquire CAS window"
+        "writer should attempt to commit in the exclusive-acquire CAS window"
     );
     assert!(
-        matches!(result, Err(crate::LimboError::Busy)),
-        "stale DDL transaction should release exclusive and return Busy after post-CAS recheck: {result:?}"
+        result.is_ok(),
+        "clock-serialized DDL should acquire exclusive_tx before the injected writer commit: {result:?}"
+    );
+    let writer_commit_result = wait_for_commit_result(&injector);
+    assert_eq!(
+        writer_commit_result, COMMIT_WRITE_WRITE_CONFLICT,
+        "injected writer commit should conflict with the acquired exclusive_tx"
     );
     assert!(
-        !mvcc_store.is_exclusive_tx(&ddl_tx_id),
-        "failed stale DDL should not keep the exclusive slot"
+        mvcc_store.is_exclusive_tx(&ddl_tx_id),
+        "successful DDL should hold the exclusive slot until rollback"
     );
     ddl.set_yield_injector(None);
     if ddl.get_mv_tx_id().is_some() {
@@ -14506,8 +14584,9 @@ fn test_create_index_exclusive_acquire_waits_for_commit_before_preparing() {
 
     let mut writer_commit = writer.prepare("COMMIT").unwrap();
     let first_step = writer_commit.step();
+    let ddl_result = wait_for_create_index_result(&injector);
     assert_eq!(
-        injector.result(),
+        ddl_result,
         CREATE_INDEX_BUSY,
         "DDL must not acquire exclusive_tx while writer is between commit conflict checks and Preparing"
     );
