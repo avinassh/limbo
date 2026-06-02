@@ -14612,3 +14612,99 @@ fn test_create_index_exclusive_acquire_waits_for_commit_before_preparing() {
     assert_eq!(integrity.len(), 1);
     assert_eq!(integrity[0][0].to_string(), "ok");
 }
+
+#[test]
+fn test_create_index_exclusive_acquire_blocks_committed_before_watermark() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+    let writer_tx_id = writer
+        .get_mv_tx_id()
+        .expect("writer should have an active MVCC transaction");
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    let mut read = ddl.prepare("SELECT COUNT(*) FROM t").unwrap();
+    read.run_ignore_rows().unwrap();
+    drop(read);
+
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+    let mvcc_store = db.get_mvcc_store();
+    let mut writer_commit = writer.prepare("COMMIT").unwrap();
+    let mut yielded_after_committed = false;
+    for _ in 0..200 {
+        match writer_commit.step().unwrap() {
+            StepResult::IO => {
+                let writer_state = mvcc_store
+                    .txs
+                    .get(&writer_tx_id)
+                    .expect("writer should still be tracked")
+                    .value()
+                    .state
+                    .load();
+                if matches!(writer_state, TransactionState::Committed(_)) {
+                    yielded_after_committed = true;
+                    break;
+                }
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected writer COMMIT step result: {other:?}"),
+        }
+    }
+    assert!(
+        yielded_after_committed,
+        "writer COMMIT should yield after Committed(ts) and before last_committed_tx_ts advances"
+    );
+    let writer_commit_ts = match mvcc_store
+        .txs
+        .get(&writer_tx_id)
+        .expect("writer should still be tracked")
+        .value()
+        .state
+        .load()
+    {
+        TransactionState::Committed(ts) => ts,
+        state => panic!("writer should be Committed at the yield, got {state:?}"),
+    };
+    assert!(
+        mvcc_store.last_committed_tx_ts.load(Ordering::Acquire) < writer_commit_ts,
+        "watermark should still be older than the yielded writer commit"
+    );
+
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    let blocked = matches!(&result, Err(LimboError::Busy));
+    if ddl.get_mv_tx_id().is_some() {
+        ddl.execute("ROLLBACK").unwrap();
+    }
+
+    writer.set_yield_injector(None);
+    writer_commit.run_ignore_rows().unwrap();
+    drop(writer_commit);
+
+    assert!(
+        blocked,
+        "DDL must not acquire exclusive_tx from an old snapshot while a writer is Committed \
+         but has not advanced last_committed_tx_ts: {result:?}"
+    );
+
+    let observer = db.connect();
+    observer.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    let rows = get_rows(&observer, "SELECT id FROM t INDEXED BY idx_v WHERE v = 200");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    let integrity = get_rows(&observer, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(integrity[0][0].to_string(), "ok");
+}
