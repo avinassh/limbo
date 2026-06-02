@@ -5264,16 +5264,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         })
     }
 
-    fn has_committed_tx_after(&self, tx_id: TxID, begin_ts: u64) -> bool {
-        self.txs.iter().any(|entry| {
-            *entry.key() != tx_id
-                && matches!(
-                    entry.value().state.load(),
-                    TransactionState::Committed(commit_ts) if commit_ts > begin_ts
-                )
-        })
-    }
-
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(
         &self,
@@ -5313,7 +5303,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if let Some(tx) = self.txs.get(tx_id) {
             let tx = tx.value();
             if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
-                || self.has_committed_tx_after(*tx_id, tx.begin_ts)
+                || self.txs.iter().any(|entry| {
+                    *entry.key() != *tx_id
+                        && matches!(
+                            entry.value().state.load(),
+                            TransactionState::Committed(commit_ts) if commit_ts > tx.begin_ts
+                        )
+                })
             {
                 // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
                 // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
@@ -5366,7 +5362,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 if let Some(tx) = self.txs.get(tx_id) {
                     let tx = tx.value();
                     if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
-                        || self.has_committed_tx_after(*tx_id, tx.begin_ts)
+                        || self.txs.iter().any(|entry| {
+                            *entry.key() != *tx_id
+                                && matches!(
+                                    entry.value().state.load(),
+                                    TransactionState::Committed(commit_ts) if commit_ts > tx.begin_ts
+                                )
+                        })
                     {
                         self.release_exclusive_tx(tx_id);
                         return Err(LimboError::Busy);
