@@ -20,7 +20,7 @@ use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
     WAL_HEADER_SIZE,
 };
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
 use crate::types::ImmutableRecordRef;
@@ -115,6 +115,70 @@ impl YieldInjector for CommitWriterOnExclusiveAcquireInjector {
             return false;
         }
         self.writer.execute("COMMIT").unwrap();
+        true
+    }
+}
+
+const CREATE_INDEX_NOT_FIRED: u8 = 0;
+const CREATE_INDEX_OK: u8 = 1;
+const CREATE_INDEX_BUSY: u8 = 2;
+
+struct CreateIndexOnCommitConflictChecksInjector {
+    point: YieldPoint,
+    selection_key: u64,
+    ddl: Arc<Connection>,
+    result: AtomicU8,
+}
+
+impl CreateIndexOnCommitConflictChecksInjector {
+    fn new(point: YieldPoint, selection_key: u64, ddl: Arc<Connection>) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            selection_key,
+            ddl,
+            result: AtomicU8::new(CREATE_INDEX_NOT_FIRED),
+        })
+    }
+
+    fn result(&self) -> u8 {
+        self.result.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for CreateIndexOnCommitConflictChecksInjector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateIndexOnCommitConflictChecksInjector")
+            .field("point", &self.point)
+            .field("selection_key", &self.selection_key)
+            .field("result", &self.result())
+            .finish_non_exhaustive()
+    }
+}
+
+impl YieldInjector for CreateIndexOnCommitConflictChecksInjector {
+    fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
+        if point != self.point
+            || selection_key != self.selection_key
+            || self
+                .result
+                .compare_exchange(
+                    CREATE_INDEX_NOT_FIRED,
+                    CREATE_INDEX_OK,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return false;
+        }
+
+        match self.ddl.execute("CREATE INDEX idx_v ON t(v)") {
+            Ok(()) => {}
+            Err(LimboError::Busy) => {
+                self.result.store(CREATE_INDEX_BUSY, Ordering::Release);
+            }
+            Err(err) => panic!("unexpected injected CREATE INDEX result: {err:?}"),
+        }
         true
     }
 }
@@ -14403,6 +14467,67 @@ fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
     let observer = db.connect();
     observer.execute("CREATE INDEX idx_v ON t(v)").unwrap();
     observer.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+    let integrity = get_rows(&observer, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(integrity[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_create_index_exclusive_acquire_waits_for_commit_before_preparing() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+    let writer_tx_id = writer
+        .get_mv_tx_id()
+        .expect("writer should have an active MVCC transaction");
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    let mut read = ddl.prepare("SELECT COUNT(*) FROM t").unwrap();
+    read.run_ignore_rows().unwrap();
+    drop(read);
+
+    let injector = CreateIndexOnCommitConflictChecksInjector::new(
+        CommitYieldPoint::AfterCommitConflictChecksBeforePreparing.point(),
+        commit_yield_key(writer_tx_id),
+        ddl.clone(),
+    );
+    writer.set_yield_injector(Some(injector.clone()));
+
+    let mut writer_commit = writer.prepare("COMMIT").unwrap();
+    let first_step = writer_commit.step();
+    assert_eq!(
+        injector.result(),
+        CREATE_INDEX_BUSY,
+        "DDL must not acquire exclusive_tx while writer is between commit conflict checks and Preparing"
+    );
+    match first_step.unwrap() {
+        StepResult::Done => {}
+        StepResult::IO => writer_commit.run_ignore_rows().unwrap(),
+        other => panic!("unexpected writer COMMIT step result: {other:?}"),
+    }
+    drop(writer_commit);
+    writer.set_yield_injector(None);
+
+    if ddl.get_mv_tx_id().is_some() {
+        ddl.execute("ROLLBACK").unwrap();
+    }
+
+    let observer = db.connect();
+    observer.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    let rows = get_rows(&observer, "SELECT id FROM t INDEXED BY idx_v WHERE v = 200");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
 
     let integrity = get_rows(&observer, "PRAGMA integrity_check");
     assert_eq!(integrity.len(), 1);
