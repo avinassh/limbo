@@ -1116,6 +1116,22 @@ pub(crate) enum CommitYieldPoint {
 }
 
 #[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
+#[repr(u8)]
+pub(crate) enum ExclusiveTxYieldPoint {
+    AfterTimestampCheckBeforeCas,
+}
+
+#[cfg(any(test, injected_yields))]
+impl YieldPointMarker for ExclusiveTxYieldPoint {
+    const POINT_COUNT: u8 = Self::COUNT as u8;
+
+    fn ordinal(self) -> u8 {
+        self as u8
+    }
+}
+
+#[cfg(any(test, injected_yields))]
 impl YieldPointMarker for CommitYieldPoint {
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
@@ -4062,7 +4078,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
+        connection: &Connection,
     ) -> Result<TxID> {
+        #[cfg(not(any(test, injected_yields)))]
+        let _ = connection;
         // Existing transactions already hold one blocking-checkpoint read guard
         // from begin_tx(). When upgrading read->write, do not acquire another one.
         let acquires_checkpoint_guard = maybe_existing_tx_id.is_none();
@@ -4085,11 +4104,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         } else {
             self.get_begin_timestamp()
         };
+        #[cfg(any(test, injected_yields))]
+        let exclusive_yield_context = YieldContext::new(
+            connection.yield_injector(),
+            None,
+            connection.next_yield_instance_id(),
+            tx_id,
+        );
 
         let already_exclusive = self.is_exclusive_tx(&tx_id);
         if !already_exclusive {
-            self.acquire_exclusive_tx(&tx_id)
-                .inspect_err(|_| unlock_checkpoint_guard())?;
+            self.acquire_exclusive_tx(
+                &tx_id,
+                #[cfg(any(test, injected_yields))]
+                Some(&exclusive_yield_context),
+            )
+            .inspect_err(|_| unlock_checkpoint_guard())?;
         }
 
         // Hoist: validate the existing tx still exists and snapshot the
@@ -4757,7 +4787,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
-    fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
+    fn acquire_exclusive_tx(
+        &self,
+        tx_id: &TxID,
+        #[cfg(any(test, injected_yields))] yield_context: Option<&YieldContext>,
+    ) -> Result<()> {
         if self.exclusive_tx.load(Ordering::Acquire) == *tx_id {
             // Re-entrant upgrade attempt for the same transaction.
             return Ok(());
@@ -4769,6 +4803,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
             // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
             return Err(LimboError::Busy);
+        }
+        #[cfg(any(test, injected_yields))]
+        if let Some(yield_context) = yield_context {
+            if yield_context.injector.as_ref().is_some_and(|injector| {
+                injector.should_yield(
+                    yield_context.instance_id,
+                    yield_context.selection_key,
+                    ExclusiveTxYieldPoint::AfterTimestampCheckBeforeCas.point(),
+                )
+            }) {
+                tracing::debug!(
+                    tx_id,
+                    "injected exclusive acquisition interleaving before CAS"
+                );
+            }
         }
         match self.exclusive_tx.compare_exchange(
             NO_EXCLUSIVE_TX,
