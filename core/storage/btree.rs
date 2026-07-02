@@ -5495,8 +5495,53 @@ impl ProvidesYieldContext for BTreeCursor {
     }
 }
 
+impl BTreeCursor {
+    fn clear_abandoned_overflow_cells(&mut self) {
+        // overflow_cells is transient balancing state, not page content. If a
+        // statement is reset after staging an overflow cell, cached pages must
+        // not carry that sidecar into later operations.
+        if matches!(self.state, CursorState::None)
+            && matches!(self.balance_state.sub_state, BalanceSubState::Start)
+        {
+            return;
+        }
+
+        for page in self.stack.stack.iter().flatten() {
+            page.get().overflow_cells.clear();
+        }
+
+        match &self.state {
+            CursorState::Write(WriteState::Insert { page, .. })
+            | CursorState::Write(WriteState::Overwrite { page, .. }) => {
+                page.get().overflow_cells.clear();
+            }
+            _ => {}
+        }
+
+        if let Some(balance_info) = &self.balance_state.balance_info {
+            for page in balance_info.pages_to_balance.iter().flatten() {
+                page.get().overflow_cells.clear();
+            }
+        }
+
+        match &self.balance_state.sub_state {
+            BalanceSubState::NonRootDoBalancingAllocate {
+                context: Some(context),
+                ..
+            }
+            | BalanceSubState::NonRootDoBalancingFinish { context } => {
+                for page in context.pages_to_balance_new.iter().flatten() {
+                    page.get().overflow_cells.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Drop for BTreeCursor {
     fn drop(&mut self) {
+        self.clear_abandoned_overflow_cells();
         if !self
             .did_register
             .load(crate::sync::atomic::Ordering::Relaxed)
@@ -7620,6 +7665,7 @@ fn find_free_slot(
 pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usable_space: usize) {
     // setup btree page
     let contents = page.get_contents();
+    contents.overflow_cells.clear();
     tracing::debug!(
         "btree_init_page(id={}, offset={}, usable_space={})",
         page.get().id,

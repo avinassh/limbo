@@ -4131,6 +4131,11 @@ impl Pager {
                                 page.get().id
                             )));
                         }
+                        turso_assert!(
+                            page.get().overflow_cells.is_empty(),
+                            "dirty page still has overflow cells at commit time",
+                            { "page_id": page.get().id }
+                        );
                         commit_info.page_source_cursor += 1;
                         commit_info.collected_pages.push(page);
 
@@ -4936,14 +4941,11 @@ impl Pager {
                                 "free_page page id mismatch",
                                 { "expected": page_id, "actual": page.get().id }
                             );
-                            if page.is_loaded() {
-                                let page_contents = page.get_contents();
-                                page_contents.overflow_cells.clear();
-                            }
                             (page, None)
                         }
                         None => return_if_io!(self.read_page(page_id as i64)),
                     };
+                    page.get().overflow_cells.clear();
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
                     let trunk_page_id = header.freelist_trunk_page.get();
@@ -5249,12 +5251,9 @@ impl Pager {
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     self.add_dirty(trunk_page)?;
                     // zero out the page
-                    turso_assert!(
-                        trunk_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist trunk page has overflow cells",
-                        { "page_id": trunk_page.get().id }
-                    );
-                    trunk_page.get_contents().as_ptr().fill(0);
+                    let trunk_page_contents = trunk_page.get_contents();
+                    trunk_page_contents.overflow_cells.clear();
+                    trunk_page_contents.as_ptr().fill(0);
                     let page_key = PageCacheKey::new(trunk_page.get().id);
                     {
                         let page_cache = self.page_cache.read();
@@ -5283,12 +5282,9 @@ impl Pager {
                     let page_contents = trunk_page.get_contents();
                     self.add_dirty(leaf_page)?;
                     // zero out the page
-                    turso_assert!(
-                        leaf_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist leaf page has overflow cells",
-                        { "page_id": leaf_page.get().id }
-                    );
-                    leaf_page.get_contents().as_ptr().fill(0);
+                    let leaf_page_contents = leaf_page.get_contents();
+                    leaf_page_contents.overflow_cells.clear();
+                    leaf_page_contents.as_ptr().fill(0);
                     let page_key = PageCacheKey::new(leaf_page.get().id);
                     {
                         let page_cache = self.page_cache.read();
