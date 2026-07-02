@@ -3835,44 +3835,17 @@ impl BTreeCursor {
                     let parent_contents = parent_page.get_contents();
                     let mut sibling_count_new = *sibling_count_new;
                     let is_table_leaf = matches!(page_type, PageType::TableLeaf);
-                    // Reassign page numbers in increasing order
+                    #[cfg(debug_assertions)]
                     {
-                        let mut page_numbers: [usize; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE] =
-                            [0; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE];
-                        for (i, page) in pages_to_balance_new
-                            .iter()
-                            .take(sibling_count_new)
-                            .enumerate()
-                        {
-                            page_numbers[i] = page.as_ref().unwrap().get().id;
-                        }
-                        page_numbers.sort_unstable();
-                        for (page, new_id) in pages_to_balance_new
-                            .iter()
-                            .take(sibling_count_new)
-                            .rev()
-                            .zip(page_numbers.iter().rev().take(sibling_count_new))
-                        {
-                            let page = page.as_ref().unwrap();
-                            if *new_id != page.get().id {
-                                page.get().id = *new_id;
-                                self.pager
-                                    .upsert_page_in_cache(*new_id, page.0.clone(), true)?;
-                            }
-                        }
-
-                        #[cfg(debug_assertions)]
-                        {
+                        tracing::debug!(
+                            "balance_non_root(parent page_id={})",
+                            parent_page.get().id
+                        );
+                        for page in pages_to_balance_new.iter().take(sibling_count_new) {
                             tracing::debug!(
-                                "balance_non_root(parent page_id={})",
-                                parent_page.get().id
+                                "balance_non_root(new_sibling page_id={})",
+                                page.as_ref().unwrap().get().id
                             );
-                            for page in pages_to_balance_new.iter().take(sibling_count_new) {
-                                tracing::debug!(
-                                    "balance_non_root(new_sibling page_id={})",
-                                    page.as_ref().unwrap().get().id
-                                );
-                            }
                         }
                     }
 
@@ -9345,6 +9318,68 @@ mod tests {
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
         (pager, page2.get().id as i64, db, conn)
+    }
+
+    #[test]
+    fn antithesis_table_leaf_rebalance_preserves_page_identity() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        let db = Database::open_file(io.clone(), db_path.to_str().unwrap())?;
+        let conn = db.connect()?;
+
+        conn.execute("PRAGMA page_size=512;")?;
+        conn.execute("PRAGMA journal_mode=WAL;")?;
+        conn.execute("PRAGMA cache_size=2000;")?;
+        conn.execute(
+            "CREATE TABLE source(
+                id INTEGER PRIMARY KEY,
+                k BLOB UNIQUE,
+                payload BLOB NOT NULL
+            );",
+        )?;
+        conn.execute("CREATE TABLE sink(id INTEGER PRIMARY KEY, payload BLOB NOT NULL);")?;
+
+        conn.execute("BEGIN;")?;
+        for id in 1..=420 {
+            conn.execute(format!(
+                "INSERT INTO source VALUES({id}, x'{id:04x}', zeroblob(300));"
+            ))?;
+        }
+        conn.execute("COMMIT;")?;
+
+        let pager = conn.pager.load().clone();
+        let held_page_id = 197;
+        let (held_page, _) = pager.io.block(|| pager.read_page(held_page_id as i64))?;
+        assert_eq!(held_page.get().id, held_page_id);
+
+        conn.execute("BEGIN;")?;
+        for id in 1..=420 {
+            conn.execute(format!(
+                "UPDATE source SET payload = zeroblob(8) WHERE id = {id};"
+            ))?;
+        }
+        conn.execute("COMMIT;")?;
+        assert_eq!(held_page.get().id, held_page_id);
+
+        conn.execute("BEGIN;")?;
+        for id in 1..=220 {
+            conn.execute(format!("INSERT INTO sink VALUES({id}, zeroblob(300));"))?;
+        }
+        conn.execute("COMMIT;")?;
+        assert_eq!(
+            held_page.get().id,
+            held_page_id,
+            "rebalancing must not mutate the physical identity of a cached page"
+        );
+
+        let integrity = conn
+            .prepare("PRAGMA integrity_check;")?
+            .run_collect_rows()?;
+        assert_eq!(integrity, vec![vec![Value::Text(Text::new("ok"))]]);
+
+        Ok(())
     }
 
     #[test]
