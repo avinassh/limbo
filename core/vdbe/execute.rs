@@ -4047,17 +4047,57 @@ fn begin_mvcc_tx(
     existing_tx_id: Option<u64>,
     connection: &Connection,
     expected_schema_generation: Option<u64>,
+    checkpoint_read_held: bool,
 ) -> Result<u64> {
     match mode {
-        TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => {
-            mv_store.begin_tx_with_schema_generation(pager.clone(), expected_schema_generation)
-        }
-        TransactionMode::Write => mv_store.begin_exclusive_tx(
+        TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => mv_store
+            .begin_tx_with_schema_generation_and_checkpoint_read(
+                pager.clone(),
+                expected_schema_generation,
+                checkpoint_read_held,
+            ),
+        TransactionMode::Write => mv_store.begin_exclusive_tx_with_checkpoint_read(
             pager.clone(),
             existing_tx_id,
             connection,
             expected_schema_generation,
+            checkpoint_read_held,
         ),
+    }
+}
+
+fn begin_fresh_mvcc_tx(
+    mv_store: &MvStore,
+    pager: &Arc<Pager>,
+    mode: &TransactionMode,
+    connection: &Connection,
+    expected_schema_generation: Option<u64>,
+) -> Result<u64> {
+    turso_assert!(
+        !pager.holds_read_lock(),
+        "fresh MVCC transaction should not reuse an existing pager read mark"
+    );
+    let checkpoint_read_held = mv_store.try_begin_read_before_pager_read_tx()?;
+    if let Err(err) = pager.begin_read_tx() {
+        mv_store.end_read_before_pager_read_tx(checkpoint_read_held);
+        return Err(err);
+    }
+    // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
+    pager.mvcc_refresh_if_db_changed();
+    match begin_mvcc_tx(
+        mv_store,
+        pager,
+        mode,
+        None,
+        connection,
+        expected_schema_generation,
+        checkpoint_read_held,
+    ) {
+        Ok(tx_id) => Ok(tx_id),
+        Err(err) => {
+            pager.end_read_tx();
+            Err(err)
+        }
     }
 }
 
@@ -4357,18 +4397,10 @@ pub fn op_transaction_inner(
                 // 2. Start transaction if needed
                 if let Some(mv_store) = mv_store.as_ref() {
                     if is_secondary_db {
-                        if conn.get_auto_commit() && !conn.is_nested_stmt() {
-                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                        }
                         // Attached databases don't participate in the connection-level
-                        // transaction state machine above (phase 1), so the pager read
-                        // tx that the main DB path starts on None→Read isn't triggered
-                        // for them. We need it here to pin a consistent WAL snapshot
-                        // for the attached pager's B-tree page reads.
-                        if !pager.holds_read_lock() {
-                            pager.begin_read_tx()?;
-                        }
-                        pager.mvcc_refresh_if_db_changed();
+                        // transaction state machine above, so they must open
+                        // their own pager snapshot after passing the MVCC
+                        // checkpoint gate.
 
                         let current_mv_tx = conn.get_mv_tx_for_db(*db);
                         if current_mv_tx.is_none() {
@@ -4391,22 +4423,21 @@ pub fn op_transaction_inner(
                             // applies to all databases uniformly.
                             let effective_mode =
                                 conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
-                            match begin_mvcc_tx(
+                            match begin_fresh_mvcc_tx(
                                 mv_store,
                                 &pager,
                                 &effective_mode,
-                                None,
                                 &conn,
                                 None,
                             ) {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
                                     started_secondary_tx = true;
+                                    if conn.get_auto_commit() && !conn.is_nested_stmt() {
+                                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                                    }
                                 }
-                                Err(err) => {
-                                    pager.end_read_tx();
-                                    return Err(err);
-                                }
+                                Err(err) => return Err(err),
                             }
                         } else if write {
                             // Upgrade: attached DB has a Read/Concurrent tx but the
@@ -4423,8 +4454,8 @@ pub fn op_transaction_inner(
                                     Some(tx_id),
                                     &conn,
                                     None,
+                                    false,
                                 ) {
-                                    pager.end_read_tx();
                                     return Err(err);
                                 }
                                 conn.set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
@@ -4439,18 +4470,16 @@ pub fn op_transaction_inner(
                                 !conn.is_nested_stmt(),
                                 "nested stmt should not begin a new read transaction"
                             );
-                            pager.begin_read_tx()?;
-                            if conn.get_auto_commit() {
-                                state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                            }
                         }
-                        // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
-                        pager.mvcc_refresh_if_db_changed();
                         // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                         // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                         // for both.
                         let current_mv_tx = program.connection.get_mv_tx_for_db(*db);
                         let has_existing_mv_tx = current_mv_tx.is_some();
+                        if has_existing_mv_tx {
+                            // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
+                            pager.mvcc_refresh_if_db_changed();
+                        }
 
                         let conn_has_executed_begin_deferred = !has_existing_mv_tx
                             && !program.connection.auto_commit.load(Ordering::SeqCst);
@@ -4458,9 +4487,10 @@ pub fn op_transaction_inner(
                             && *tx_mode == TransactionMode::Concurrent
                         {
                             mark_unlikely();
-                            pager.end_read_tx();
-                            conn.set_tx_state(TransactionState::None);
-                            state.auto_txn_cleanup = TxnCleanup::None;
+                            if started_read_tx {
+                                conn.set_tx_state(TransactionState::None);
+                                state.auto_txn_cleanup = TxnCleanup::None;
+                            }
                             return Err(LimboError::TxError(
                                 "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
                                     .to_string(),
@@ -4481,7 +4511,6 @@ pub fn op_transaction_inner(
                                     Ok(generation) => generation,
                                     Err(err) => {
                                         if started_read_tx {
-                                            pager.end_read_tx();
                                             conn.set_tx_state(TransactionState::None);
                                             state.auto_txn_cleanup = TxnCleanup::None;
                                         }
@@ -4501,11 +4530,10 @@ pub fn op_transaction_inner(
                                     return Ok(InsnFunctionStepResult::IO(io));
                                 }
                             }
-                            match begin_mvcc_tx(
+                            match begin_fresh_mvcc_tx(
                                 mv_store,
                                 &pager,
                                 tx_mode,
-                                None,
                                 &conn,
                                 expected_schema_generation,
                             ) {
@@ -4513,13 +4541,12 @@ pub fn op_transaction_inner(
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
-                                    if is_secondary_db {
-                                        started_secondary_tx = true;
+                                    if started_read_tx && conn.get_auto_commit() {
+                                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                                     }
                                 }
                                 Err(err) => {
                                     if started_read_tx {
-                                        pager.end_read_tx();
                                         conn.set_tx_state(TransactionState::None);
                                         state.auto_txn_cleanup = TxnCleanup::None;
                                     }
@@ -4545,6 +4572,7 @@ pub fn op_transaction_inner(
                                     Some(tx_id),
                                     &conn,
                                     None,
+                                    false,
                                 ) {
                                     if started_read_tx {
                                         pager.end_read_tx();
@@ -5073,7 +5101,13 @@ pub fn op_savepoint(
                         let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
                             tx_id
                         } else {
-                            let tx_id = mv_store.begin_tx(pager.clone())?;
+                            let tx_id = begin_fresh_mvcc_tx(
+                                mv_store,
+                                pager,
+                                &TransactionMode::Read,
+                                &conn,
+                                None,
+                            )?;
                             conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
                             if matches!(conn.get_tx_state(), TransactionState::None) {
                                 conn.set_tx_state(TransactionState::Read);
