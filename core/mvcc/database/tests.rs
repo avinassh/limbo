@@ -17323,6 +17323,119 @@ fn test_integrity_check_passive_reads_freelist_from_pager_not_stale_mvcc_header(
     );
 }
 
+#[test]
+fn test_integrity_check_reads_freelist_from_pager_not_stale_mvcc_header() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for i in 0..80 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, zeroblob(3500))"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("DELETE FROM t WHERE id % 4 = 0").unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let physical_freelist_count = get_rows(&conn, "PRAGMA freelist_count")[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        physical_freelist_count > 1,
+        "checkpointed DELETE should create multiple physical freelist pages"
+    );
+
+    let mv_guard = conn.db.get_mv_store();
+    let mv = mv_guard.as_ref().expect("mvcc store");
+    let mut gh = mv.global_header.write();
+    let header = gh.as_mut().expect("global_header initialized");
+    assert_eq!(
+        header.freelist_pages.get(),
+        physical_freelist_count as u32,
+        "checkpoint should publish the physical freelist count before the test makes it stale"
+    );
+    header.freelist_pages = pack1::U32BE::new((physical_freelist_count - 1) as u32);
+    drop(gh);
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        &rows[0][0].to_string(),
+        "ok",
+        "integrity_check must compare the pager freelist to the pager header"
+    );
+}
+
+/// User-facing flow for the stale-header bug: a passive checkpoint can grow the physical
+/// database while an older transaction is still open. When that older transaction later commits,
+/// it must not publish its old physical page count over the checkpointed header.
+#[test]
+fn test_passive_commit_does_not_regress_checkpointed_page_count_header() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES (1, zeroblob(100))")
+        .unwrap();
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let page_count_before = get_rows(&setup, "PRAGMA page_count")[0][0]
+        .as_int()
+        .unwrap();
+
+    let older = db.connect();
+    older.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&older, "SELECT count(*) FROM t")[0][0]
+            .as_int()
+            .unwrap(),
+        1
+    );
+
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    for i in 2..80 {
+        writer
+            .execute(format!("INSERT INTO t VALUES ({i}, zeroblob(3500))"))
+            .unwrap();
+    }
+    writer.execute("COMMIT").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let page_count_after_checkpoint = get_rows(&writer, "PRAGMA page_count")[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        page_count_after_checkpoint > page_count_before,
+        "writer checkpoint should grow the physical database"
+    );
+
+    older
+        .execute("INSERT INTO t VALUES (1000, zeroblob(100))")
+        .unwrap();
+    older.execute("COMMIT").unwrap();
+
+    let observer = db.connect();
+    let page_count_after_older_commit = get_rows(&observer, "PRAGMA page_count")[0][0]
+        .as_int()
+        .unwrap();
+    assert_eq!(
+        page_count_after_older_commit, page_count_after_checkpoint,
+        "older commit must not restore its old physical page-count header"
+    );
+}
+
 /// PASSIVE port of PR #7620's reproducer: a checkpointed row gets an INSERT OR REPLACE (new
 /// btree-resident marker + replacement) then the replacement is deleted. GC must retain the
 /// btree-resident marker until checkpoint applies the physical delete, or the stale table row
