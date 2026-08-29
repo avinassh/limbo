@@ -2739,6 +2739,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
     }
 }
 
+fn publish_transaction_header(
+    global_header: &mut Option<DatabaseHeader>,
+    tx_header: DatabaseHeader,
+) {
+    // Transactions own logical cookies. Checkpoint/pager owns physical fields
+    // such as database_size, change_counter, and the freelist header.
+    let Some(header) = global_header.as_mut() else {
+        global_header.replace(tx_header);
+        return;
+    };
+
+    header.schema_cookie = tx_header.schema_cookie;
+    header.schema_format = tx_header.schema_format;
+    header.default_page_cache_size = tx_header.default_page_cache_size;
+    header.vacuum_mode_largest_root_page = tx_header.vacuum_mode_largest_root_page;
+    header.text_encoding = tx_header.text_encoding;
+    header.user_version = tx_header.user_version;
+    header.incremental_vacuum_enabled = tx_header.incremental_vacuum_enabled;
+    header.application_id = tx_header.application_id;
+}
+
 impl WriteRowStateMachine {
     fn new(row: Row, cursor: Arc<RwLock<BTreeCursor>>, requires_seek: bool) -> Self {
         Self {
@@ -3214,7 +3235,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     .last_global_header_ts
                     .fetch_max(*end_ts, Ordering::AcqRel);
                 if prev_hdr_ts <= *end_ts {
-                    self.header.write().replace(tx_header);
+                    let mut global_header = self.header.write();
+                    publish_transaction_header(&mut global_header, tx_header);
                 }
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
@@ -3312,7 +3334,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         .last_committed_tx_ts
                         .fetch_max(*end_ts, Ordering::AcqRel);
                     if last_committed_ts <= *end_ts {
-                        global_header.replace(tx_header);
+                        publish_transaction_header(&mut global_header, tx_header);
                     }
                 }
                 if self.did_commit_schema_change {

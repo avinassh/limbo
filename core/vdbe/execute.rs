@@ -15850,12 +15850,10 @@ pub fn op_integrity_check(
     } else {
         program.get_pager_from_database_index(db)?
     };
-    // Passive MVCC: read page-1 freelist fields from the pager; the MVCC header can lag.
-    let passive = mv_store.is_some()
-        && program
-            .connection
-            .experimental_mvcc_passive_checkpoint_enabled();
-    let physical_header_store = if passive { None } else { mv_store.as_ref() };
+    // integrity_check walks the physical btrees and freelist through the pager.
+    // Read physical page-1 fields from that same source; MVCC transaction
+    // headers may lag or be intentionally logical-only snapshots.
+    let physical_header_store = None;
     match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
             let (freelist_trunk_page, db_size) = return_if_io!(with_header(
