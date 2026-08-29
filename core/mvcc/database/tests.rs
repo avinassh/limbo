@@ -3929,6 +3929,88 @@ fn test_running_integrity_check_reprepares_without_schema_cookie_bump() {
     );
 }
 
+#[test]
+fn reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
+    use crate::StepResult;
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    let checkpoint_injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    writer.set_yield_injector(Some(checkpoint_injector.clone()));
+    let mut checkpointing_insert = writer
+        .prepare("INSERT INTO t VALUES (2, 'checkpointed')")
+        .unwrap();
+    let checkpoint_io = checkpointing_insert.get_pager().io.clone();
+    let mut checkpoint_holds_gate = false;
+    for _ in 0..100_000 {
+        match checkpointing_insert.step().unwrap() {
+            StepResult::Yield if checkpoint_injector.is_empty() => {
+                checkpoint_holds_gate = true;
+                break;
+            }
+            StepResult::IO | StepResult::Yield => checkpoint_io.step().unwrap(),
+            StepResult::Row => {}
+            StepResult::Done => panic!("insert completed before BeforePagerCommit yield"),
+            other => panic!("unexpected checkpoint step before yield: {other:?}"),
+        }
+    }
+    assert!(
+        checkpoint_holds_gate,
+        "checkpoint did not reach its guarded write phase"
+    );
+
+    let reader = db.connect();
+    let read_mark_probe = FixedYieldInjector::new([TransactionYieldPoint::BeforeMvccBegin.point()]);
+    reader.set_yield_injector(Some(read_mark_probe.clone()));
+    let mut read = reader.prepare("SELECT v FROM t WHERE id = 1").unwrap();
+    assert!(
+        matches!(read.step().unwrap(), StepResult::Yield) && read_mark_probe.is_empty(),
+        "reader should yield before opening its MVCC transaction"
+    );
+    assert!(
+        !reader.get_pager().holds_read_lock(),
+        "reader must not pin a pager read mark before MVCC begin is allowed"
+    );
+
+    match read.step() {
+        Ok(StepResult::Busy) | Err(LimboError::Busy) => {}
+        other => panic!("reader should be Busy before pinning a read mark, got {other:?}"),
+    }
+    assert!(
+        !reader.get_pager().holds_read_lock(),
+        "Busy reader must not leave a pager read mark pinned"
+    );
+    drop(read);
+
+    writer.set_yield_injector(None);
+    let mut checkpoint_done = false;
+    for _ in 0..100_000 {
+        match checkpointing_insert.step().unwrap() {
+            StepResult::Done => {
+                checkpoint_done = true;
+                break;
+            }
+            StepResult::Row => {}
+            StepResult::IO | StepResult::Yield => checkpoint_io.step().unwrap(),
+            other => panic!("unexpected checkpoint step after yield: {other:?}"),
+        }
+    }
+    assert!(checkpoint_done, "checkpoint did not finish");
+}
+
 /// What this test checks: Auto-checkpoint post-commit failure does not invalidate committed transaction visibility on restart.
 /// Why this matters: Commit contract must remain stable even when checkpoint cleanup fails mid-flight.
 #[test]
