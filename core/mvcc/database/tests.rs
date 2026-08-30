@@ -17288,87 +17288,118 @@ fn test_begin_tx_schema_generation_gate() {
         .rollback_tx(tx, pager, &db.conn, crate::MAIN_DB_ID);
 }
 
-/// Passive mode: freelist fields must come from the pager's live page 1, not a stale MVCC header.
+/// User-facing flow for the Antithesis freelist mismatch: integrity_check pins an
+/// older pager snapshot, then another connection commits and checkpoints a change
+/// that moves the shared MVCC header from freelist count 3 to 2. The resumed
+/// integrity_check must compare the freelist walk against page 1 from its own
+/// pager snapshot, not the newer MVCC transaction header.
 #[test]
-fn test_integrity_check_passive_reads_freelist_from_pager_not_stale_mvcc_header() {
-    let db = MvccTestDbNoConn::new_with_random_db_passive();
-    let conn = db.connect();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+fn test_integrity_check_uses_pager_freelist_header_after_checkpoint_publish_race() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("PRAGMA data_sync_retry = 1").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
         .unwrap();
-    for i in 0..500 {
-        conn.execute(format!(
-            "INSERT INTO t VALUES ({i}, 'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww')"
-        ))
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")
         .unwrap();
+    setup.execute("BEGIN CONCURRENT").unwrap();
+    for id in 1..=80 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({id}, zeroblob(3500))"))
+            .unwrap();
     }
-    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
-    let page_count = get_rows(&conn, "PRAGMA page_count")[0][0].as_int().unwrap();
-    assert!(page_count > 2, "t should span multiple pages");
+    setup.execute("COMMIT").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
-    {
-        let mv_guard = conn.db.get_mv_store();
-        let mv = mv_guard.as_ref().expect("mvcc store");
-        let mut gh = mv.global_header.write();
-        let h = gh.as_mut().expect("global_header initialized");
-        h.freelist_trunk_page = pack1::U32BE::new(page_count as u32);
-        h.freelist_pages = pack1::U32BE::new(1);
+    setup.execute("BEGIN CONCURRENT").unwrap();
+    setup
+        .execute("DELETE FROM t WHERE id IN (10, 20, 30)")
+        .unwrap();
+    setup.execute("COMMIT").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        get_rows(&setup, "PRAGMA freelist_count")[0][0]
+            .as_int()
+            .unwrap(),
+        3,
+        "setup should match the Antithesis failure's physical freelist count"
+    );
+
+    let reader = db.connect();
+    reader.execute("PRAGMA data_sync_retry = 1").unwrap();
+    let injector = FixedYieldInjector::new([TransactionYieldPoint::AfterMainPagerReadTx.point()]);
+    reader.set_yield_injector(Some(injector.clone()));
+    let mut integrity_check = reader.prepare("PRAGMA integrity_check").unwrap();
+    assert!(
+        matches!(integrity_check.step().unwrap(), crate::StepResult::Yield) && injector.is_empty(),
+        "integrity_check should yield after pinning its pager read snapshot"
+    );
+
+    let checkpointer = db.connect();
+    checkpointer.execute("PRAGMA data_sync_retry = 1").unwrap();
+    checkpointer.execute("BEGIN CONCURRENT").unwrap();
+    checkpointer
+        .execute("INSERT INTO t VALUES (1000, zeroblob(3500))")
+        .unwrap();
+    checkpointer.execute("COMMIT").unwrap();
+    match checkpointer.execute("PRAGMA wal_checkpoint(FULL)") {
+        Ok(()) | Err(LimboError::Busy) => {}
+        Err(err) => panic!("checkpoint failed with unexpected error: {err:?}"),
     }
+    assert_eq!(
+        get_rows(&checkpointer, "PRAGMA freelist_count")[0][0]
+            .as_int()
+            .unwrap(),
+        2,
+        "checkpoint should publish the Antithesis failure's expected freelist count"
+    );
 
-    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    reader.set_yield_injector(None);
+    let rows = integrity_check.run_collect_rows().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(
         &rows[0][0].to_string(),
         "ok",
-        "passive integrity_check must read the freelist from the pager's live page 1, not the stale MVCC header"
+        "integrity_check must not report the stale-header Antithesis error"
     );
 }
 
 #[test]
-fn test_integrity_check_reads_freelist_from_pager_not_stale_mvcc_header() {
+fn test_dropping_statement_after_transaction_pager_read_yield_releases_reader() {
     let db = MvccTestDbNoConn::new_with_random_db();
-    let conn = db.connect();
-    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")
         .unwrap();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")
+    setup
+        .execute("INSERT INTO t VALUES (1, zeroblob(3500))")
         .unwrap();
-    conn.execute("BEGIN CONCURRENT").unwrap();
-    for i in 0..80 {
-        conn.execute(format!("INSERT INTO t VALUES ({i}, zeroblob(3500))"))
-            .unwrap();
-    }
-    conn.execute("COMMIT").unwrap();
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    conn.execute("BEGIN CONCURRENT").unwrap();
-    conn.execute("DELETE FROM t WHERE id % 4 = 0").unwrap();
-    conn.execute("COMMIT").unwrap();
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    let physical_freelist_count = get_rows(&conn, "PRAGMA freelist_count")[0][0]
-        .as_int()
-        .unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let reader = db.connect();
+    let injector = FixedYieldInjector::new([TransactionYieldPoint::AfterMainPagerReadTx.point()]);
+    reader.set_yield_injector(Some(injector.clone()));
+    let mut integrity_check = reader.prepare("PRAGMA integrity_check").unwrap();
     assert!(
-        physical_freelist_count > 1,
-        "checkpointed DELETE should create multiple physical freelist pages"
+        matches!(integrity_check.step().unwrap(), crate::StepResult::Yield) && injector.is_empty(),
+        "integrity_check should yield after pinning its pager read snapshot"
     );
+    drop(integrity_check);
+    reader.set_yield_injector(None);
 
-    let mv_guard = conn.db.get_mv_store();
-    let mv = mv_guard.as_ref().expect("mvcc store");
-    let mut gh = mv.global_header.write();
-    let header = gh.as_mut().expect("global_header initialized");
-    assert_eq!(
-        header.freelist_pages.get(),
-        physical_freelist_count as u32,
-        "checkpoint should publish the physical freelist count before the test makes it stale"
-    );
-    header.freelist_pages = pack1::U32BE::new((physical_freelist_count - 1) as u32);
-    drop(gh);
+    let checkpointer = db.connect();
+    checkpointer.execute("BEGIN CONCURRENT").unwrap();
+    checkpointer
+        .execute("INSERT INTO t VALUES (2, zeroblob(3500))")
+        .unwrap();
+    checkpointer.execute("COMMIT").unwrap();
+    checkpointer.execute("PRAGMA wal_checkpoint(FULL)").unwrap();
 
-    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    let rows = get_rows(&checkpointer, "PRAGMA integrity_check");
     assert_eq!(rows.len(), 1);
-    assert_eq!(
-        &rows[0][0].to_string(),
-        "ok",
-        "integrity_check must compare the pager freelist to the pager header"
-    );
+    assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
 /// User-facing flow for the stale-header bug: a passive checkpoint can grow the physical

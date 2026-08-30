@@ -3992,6 +3992,12 @@ pub fn op_halt_if_null(
 #[derive(Debug, Clone, Copy)]
 pub enum OpTransactionState {
     Start,
+    MainMvccBegin {
+        expected_schema_generation: Option<u64>,
+        new_transaction_state: TransactionState,
+        update_connection_state: bool,
+        started_read_tx: bool,
+    },
     AttachedBeginWriteTx,
     BeginNamedSavepoints,
     CheckSchemaCookie,
@@ -4002,15 +4008,17 @@ pub enum OpTransactionState {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TransactionYieldPoint {
     BeforeStart,
+    AfterMainPagerReadTx,
 }
 
 #[cfg(any(test, injected_yields))]
 impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
-    const POINT_COUNT: u8 = 1;
+    const POINT_COUNT: u8 = 2;
 
     fn ordinal(self) -> u8 {
         match self {
             TransactionYieldPoint::BeforeStart => 0,
+            TransactionYieldPoint::AfterMainPagerReadTx => 1,
         }
     }
 }
@@ -4429,9 +4437,42 @@ pub fn op_transaction_inner(
                             }
                         }
                     } else {
-                        // Main database MVCC path (unchanged logic)
+                        // Main database MVCC path.
                         let started_read_tx =
                             updated && matches!(current_state, TransactionState::None);
+                        let current_mv_tx = program.connection.get_mv_tx_for_db(*db);
+                        let has_existing_mv_tx = current_mv_tx.is_some();
+
+                        let conn_has_executed_begin_deferred = !has_existing_mv_tx
+                            && !program.connection.auto_commit.load(Ordering::SeqCst);
+                        if conn_has_executed_begin_deferred
+                            && *tx_mode == TransactionMode::Concurrent
+                        {
+                            mark_unlikely();
+                            if started_read_tx && pager.holds_read_lock() {
+                                pager.end_read_tx();
+                            }
+                            conn.set_tx_state(TransactionState::None);
+                            state.auto_txn_cleanup = TxnCleanup::None;
+                            return Err(LimboError::TxError(
+                                "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
+                                    .to_string(),
+                            ));
+                        }
+
+                        let expected_schema_generation = if !has_existing_mv_tx {
+                            // Read the schema generation before pinning the pager read mark.
+                            // A checkpoint that publishes between this read and the MVCC begin
+                            // will bump the generation, causing begin_tx to return
+                            // SchemaUpdated instead of pairing a new MVCC header with an old
+                            // pager snapshot.
+                            match conn.mvcc_begin_schema_generation() {
+                                Ok(generation) => generation,
+                                Err(err) => return Err(err),
+                            }
+                        } else {
+                            None
+                        };
                         if started_read_tx {
                             turso_assert!(
                                 !conn.is_nested_stmt(),
@@ -4444,73 +4485,29 @@ pub fn op_transaction_inner(
                         }
                         // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
                         pager.mvcc_refresh_if_db_changed();
-                        // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
-                        // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
-                        // for both.
-                        let current_mv_tx = program.connection.get_mv_tx_for_db(*db);
-                        let has_existing_mv_tx = current_mv_tx.is_some();
-
-                        let conn_has_executed_begin_deferred = !has_existing_mv_tx
-                            && !program.connection.auto_commit.load(Ordering::SeqCst);
-                        if conn_has_executed_begin_deferred
-                            && *tx_mode == TransactionMode::Concurrent
-                        {
-                            mark_unlikely();
-                            pager.end_read_tx();
-                            conn.set_tx_state(TransactionState::None);
-                            state.auto_txn_cleanup = TxnCleanup::None;
-                            return Err(LimboError::TxError(
-                                "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
-                                    .to_string(),
-                            ));
-                        }
 
                         if !has_existing_mv_tx {
-                            // Gate the begin on the connection's prepared schema generation,
-                            // captured here (atomically with the connection.schema == db.schema
-                            // check) and re-checked inside begin_tx's clock callback. A passive
-                            // checkpoint publish runs under the same clock and bumps the
-                            // generation, so one that orders into the begin window is detected
-                            // there and forces a reprepare against the published roots — without
-                            // the old non-atomic post-begin recheck (which also tripped on
-                            // publishes strictly after our snapshot).
-                            let expected_schema_generation =
-                                match conn.mvcc_begin_schema_generation() {
-                                    Ok(generation) => generation,
-                                    Err(err) => {
-                                        if started_read_tx {
-                                            pager.end_read_tx();
-                                            conn.set_tx_state(TransactionState::None);
-                                            state.auto_txn_cleanup = TxnCleanup::None;
-                                        }
-                                        return Err(err);
-                                    }
+                            *state.active_op_state.transaction() =
+                                OpTransactionState::MainMvccBegin {
+                                    expected_schema_generation,
+                                    new_transaction_state,
+                                    update_connection_state: updated,
+                                    started_read_tx,
                                 };
-                            match begin_mvcc_tx(
-                                mv_store,
-                                &pager,
-                                tx_mode,
-                                None,
-                                &conn,
-                                expected_schema_generation,
-                            ) {
-                                Ok(tx_id) => {
-                                    program
-                                        .connection
-                                        .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
-                                    if is_secondary_db {
-                                        started_secondary_tx = true;
-                                    }
-                                }
-                                Err(err) => {
-                                    if started_read_tx {
-                                        pager.end_read_tx();
-                                        conn.set_tx_state(TransactionState::None);
-                                        state.auto_txn_cleanup = TxnCleanup::None;
-                                    }
-                                    return Err(err);
+                            #[cfg(any(test, injected_yields))]
+                            {
+                                if let Some(IOResult::IO(io)) =
+                                    crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                                        conn.yield_injector().as_ref(),
+                                        0,
+                                        *db as u64,
+                                        TransactionYieldPoint::AfterMainPagerReadTx,
+                                    )
+                                {
+                                    return Ok(InsnFunctionStepResult::IO(io));
                                 }
                             }
+                            continue;
                         } else if updated {
                             // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
                             let (tx_id, mv_tx_mode) = current_mv_tx
@@ -4655,6 +4652,44 @@ pub fn op_transaction_inner(
                 {
                     *state.active_op_state.transaction() = OpTransactionState::BeginNamedSavepoints;
                     continue;
+                }
+                *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
+                continue;
+            }
+            OpTransactionState::MainMvccBegin {
+                expected_schema_generation,
+                new_transaction_state,
+                update_connection_state,
+                started_read_tx,
+            } => {
+                let conn = program.connection.clone();
+                let Some(mv_store) = mv_store.as_ref() else {
+                    return Err(LimboError::InternalError(
+                        "MainMvccBegin reached without an MVCC store".to_string(),
+                    ));
+                };
+                match begin_mvcc_tx(
+                    mv_store,
+                    &pager,
+                    tx_mode,
+                    None,
+                    &conn,
+                    expected_schema_generation,
+                ) {
+                    Ok(tx_id) => {
+                        conn.set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
+                    }
+                    Err(err) => {
+                        if started_read_tx {
+                            pager.end_read_tx();
+                            conn.set_tx_state(TransactionState::None);
+                            state.auto_txn_cleanup = TxnCleanup::None;
+                        }
+                        return Err(err);
+                    }
+                }
+                if update_connection_state {
+                    conn.set_tx_state(new_transaction_state);
                 }
                 *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
                 continue;
