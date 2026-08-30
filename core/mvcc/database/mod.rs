@@ -5923,6 +5923,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         )
     }
 
+    /// Try to enter the blocking checkpoint gate before the caller pins a
+    /// pager read mark.
+    ///
+    /// Use this only for a fresh MVCC begin that must preserve this order:
+    /// checkpoint gate, pager read mark, MVCC transaction. If this returns
+    /// `true` and the caller fails before handing the guard to a
+    /// `begin_*_with_checkpoint_read` helper, call
+    /// `end_read_before_pager_read_tx(true)`.
+    ///
+    /// Do not use this for read-to-write upgrades. An existing MVCC
+    /// transaction already owns its checkpoint guard.
     pub(crate) fn try_begin_read_before_pager_read_tx(&self) -> Result<bool> {
         if self.experimental_mvcc_passive_checkpoint {
             return Ok(false);
@@ -5933,12 +5944,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(true)
     }
 
+    /// Release a checkpoint gate acquired by
+    /// `try_begin_read_before_pager_read_tx` before MVCC has adopted it.
+    ///
+    /// Do not call this after a `begin_*_with_checkpoint_read` helper
+    /// succeeds. At that point the transaction owns the guard and the normal
+    /// transaction finish path releases it.
     pub(crate) fn end_read_before_pager_read_tx(&self, held: bool) {
         if held {
             self.blocking_checkpoint_lock.unlock();
         }
     }
 
+    /// Begin or upgrade a write MVCC transaction, optionally adopting a
+    /// checkpoint gate that the VDBE already acquired.
+    ///
+    /// Ordinary MvStore callers should use `begin_exclusive_tx`. Use this
+    /// helper only when the caller is preserving the fresh-begin order itself:
+    /// checkpoint gate, pager read mark, MVCC transaction. Pass
+    /// `checkpoint_read_held = false` for upgrades because the existing
+    /// transaction already owns the gate.
     pub(crate) fn begin_exclusive_tx_with_checkpoint_read(
         &self,
         pager: Arc<Pager>,
@@ -6180,6 +6205,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         )
     }
 
+    /// Begin a read MVCC transaction, optionally adopting a checkpoint gate
+    /// that the VDBE already acquired.
+    ///
+    /// Ordinary MvStore callers should use `begin_tx_with_schema_generation`.
+    /// Use this helper only after `try_begin_read_before_pager_read_tx`
+    /// succeeds and the caller has successfully pinned the pager read mark.
+    /// On success, the MVCC transaction owns the checkpoint guard. On error,
+    /// this helper releases the guard, but the caller still owns any pager
+    /// read mark it opened.
     pub(crate) fn begin_tx_with_schema_generation_and_checkpoint_read(
         &self,
         pager: Arc<Pager>,

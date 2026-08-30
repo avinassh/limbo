@@ -4038,8 +4038,13 @@ pub fn op_transaction(
     }
 }
 
-/// Begin an MVCC transaction on the given MvStore using the specified mode.
-/// When `existing_tx_id` is `Some`, upgrades an existing transaction to exclusive.
+/// Begin an MVCC transaction after the caller has already put pager and
+/// checkpoint state in the right shape.
+///
+/// Use `begin_fresh_mvcc_tx` when no MVCC transaction exists yet; it owns the
+/// ordering between the checkpoint gate and pager read mark. Use this helper
+/// directly for read-to-write upgrades, passing the existing transaction id and
+/// `checkpoint_read_held = false`.
 fn begin_mvcc_tx(
     mv_store: &MvStore,
     pager: &Arc<Pager>,
@@ -4066,6 +4071,16 @@ fn begin_mvcc_tx(
     }
 }
 
+/// Start a brand-new MVCC transaction for one pager.
+///
+/// This is the VDBE helper to use when the connection does not already have an
+/// MVCC transaction for the database. It enforces the only safe fresh-begin
+/// order: checkpoint gate, pager read mark, MVCC transaction. That prevents a
+/// reader from pinning a WAL snapshot while a blocking MVCC checkpoint is
+/// already in progress.
+///
+/// Do not use this for read-to-write upgrades. Those keep the existing MVCC
+/// transaction and should call `begin_mvcc_tx` with `existing_tx_id = Some`.
 fn begin_fresh_mvcc_tx(
     mv_store: &MvStore,
     pager: &Arc<Pager>,
