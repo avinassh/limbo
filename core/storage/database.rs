@@ -27,6 +27,15 @@ impl IOContext {
         }
     }
 
+    pub(crate) fn encrypted_page_one(&self) -> Option<Arc<[u8]>> {
+        match &self.page_transform {
+            PageTransform::Codec(codec) => {
+                super::page_transform::encrypted_page_one(codec.as_ref())
+            }
+            _ => None,
+        }
+    }
+
     pub fn get_reserved_space_bytes(&self) -> u8 {
         match &self.page_transform {
             PageTransform::Checksum(ctx) => ctx.required_reserved_bytes(),
@@ -37,6 +46,16 @@ impl IOContext {
 
     pub fn set_encryption(&mut self, encryption_ctx: EncryptionContext) {
         self.page_transform = PageTransform::Codec(page_codec_from_encryption(encryption_ctx));
+    }
+
+    pub(crate) fn capture_encrypted_page_one(&mut self) {
+        let context = self
+            .encryption_context()
+            .expect("encryption context installed")
+            .clone();
+        self.page_transform = PageTransform::Codec(
+            super::page_transform::page_codec_from_encryption_for_open(context),
+        );
     }
 
     pub(crate) fn reset_page_size_in_encryption_ctx(&mut self, page_size: PageSize) {

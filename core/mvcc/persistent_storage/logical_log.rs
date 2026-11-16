@@ -937,7 +937,7 @@ impl LogicalLog {
         let mut upgraded_header = header.clone();
         upgraded_header.version = LOG_VERSION;
 
-        let c = self.write_header_and_publish_on_success(upgraded_header, None)?;
+        let c = self.write_header_and_publish_on_success(upgraded_header, None, &|_| {})?;
         Ok(Some(c))
     }
 
@@ -1007,8 +1007,9 @@ impl LogicalLog {
         &mut self,
         header: LogHeader,
         group: Option<&mut CompletionGroup>,
+        before_submit: &impl Fn(&Completion),
     ) -> Result<Completion> {
-        let (header, c) = self.write_header(header, group)?;
+        let (header, c) = self.write_header(header, group, before_submit)?;
         self.pending_header_write = Some((header, c.clone()));
         self.publish_finished_header_write();
         Ok(c)
@@ -1019,6 +1020,7 @@ impl LogicalLog {
         &self,
         mut header: LogHeader,
         group: Option<&mut CompletionGroup>,
+        before_submit: &impl Fn(&Completion),
     ) -> Result<(LogHeader, Completion)> {
         let header_bytes = header.encode();
         header.hdr_crc32c = u32::from_le_bytes([
@@ -1044,6 +1046,7 @@ impl LogicalLog {
         if let Some(group) = group {
             group.add(&c);
         }
+        before_submit(&c);
         let c = self.file.pwrite(0, buffer, c)?;
         Ok((header, c))
     }
@@ -1051,7 +1054,7 @@ impl LogicalLog {
     pub fn update_header(&mut self) -> Result<Completion> {
         self.finish_pending_header_write();
         let header = self.current_or_new_header()?;
-        self.write_header_and_publish_on_success(header, None)
+        self.write_header_and_publish_on_success(header, None, &|_| {})
     }
 
     #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
@@ -1102,7 +1105,11 @@ impl LogicalLog {
     /// write and truncate can run as a group without an ordering dependency.
     /// Either completion order leaves a header-sized file with the fresh header
     /// bytes at offset zero.
-    pub fn reset_to_fresh_header(&mut self) -> Result<Completion> {
+    #[cfg(any(feature = "conn_raw_api", test))]
+    pub fn reset_to_fresh_header(
+        &mut self,
+        before_submit: impl Fn(&Completion),
+    ) -> Result<Completion> {
         // Regenerate salt so stale frames from before the reset cannot validate
         // against this new CRC chain.
         self.finish_pending_header_write();
@@ -1116,13 +1123,15 @@ impl LogicalLog {
         header.salt = self.io.generate_random_number() as u64;
 
         let mut group = CompletionGroup::new(|_| {});
-        let _header_c = self.write_header_and_publish_on_success(header, Some(&mut group))?;
+        let _header_c =
+            self.write_header_and_publish_on_success(header, Some(&mut group), &before_submit)?;
         let c = Completion::new_trunc(move |result| {
             if let Err(err) = result {
                 tracing::error!("logical_log_truncate failed: {}", err);
             }
         });
         group.add(&c);
+        before_submit(&c);
         let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
         Ok(group.build())
     }
@@ -7496,7 +7505,7 @@ mod tests {
 
         file.fail_header_write
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let c = log.reset_to_fresh_header().unwrap();
+        let c = log.reset_to_fresh_header(|_| {}).unwrap();
         assert!(io.wait_for_completion(c).is_err());
         assert_eq!(log.header().unwrap().salt, before.salt);
         assert_eq!(log.offset, 0);
@@ -7507,7 +7516,7 @@ mod tests {
 
         file.fail_header_write
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let c = log.reset_to_fresh_header().unwrap();
+        let c = log.reset_to_fresh_header(|_| {}).unwrap();
         io.wait_for_completion(c).unwrap();
         let after = log.header().unwrap().clone();
         assert_ne!(after.salt, before.salt);

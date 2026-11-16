@@ -2781,7 +2781,7 @@ fn publish_schema_after_external_restore(
     conn: &Arc<turso_core::Connection>,
     context: &str,
 ) -> Result<()> {
-    conn.publish_schema_after_external_restore()
+    conn.publish_schema_after_external_restore(&conn.preflight_external_restore()?)
         .map_err(|error| {
             Error::DatabaseSyncEngineError(format!(
                 "failed to publish schema after {context}: {error}",

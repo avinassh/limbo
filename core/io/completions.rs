@@ -115,6 +115,8 @@ pub(super) struct CompletionInner {
     /// Keeps the write buffer alive for async I/O backends (io_uring, VFS)
     /// where pwrite returns before the kernel has consumed the buffer.
     write_buffer: OnceLock<Arc<Buffer>>,
+    #[cfg(feature = "conn_raw_api")]
+    external_restore: OnceLock<crate::ExternalRestoreGuard>,
 }
 
 impl fmt::Debug for CompletionInner {
@@ -282,6 +284,8 @@ impl CompletionInner {
             context: Context::new(),
             parent: Mutex::new(None),
             write_buffer: OnceLock::new(),
+            #[cfg(feature = "conn_raw_api")]
+            external_restore: OnceLock::new(),
         }
     }
 }
@@ -307,6 +311,14 @@ impl Completion {
             .write_buffer
             .set(buf)
             .expect("write buffer should only be set once");
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) fn keep_external_restore_alive(&self, guard: crate::ExternalRestoreGuard) {
+        turso_assert!(
+            self.get_inner().external_restore.set(guard).is_ok(),
+            "completion already has a restore reservation"
+        );
     }
 
     pub fn new_write<F>(complete: F) -> Self

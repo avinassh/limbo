@@ -720,7 +720,7 @@ fn reload_connection_after_external_restore(
     context: &str,
 ) -> Result<()> {
     conn.discard_main_mvcc_tx_after_external_restore();
-    match conn.reload_wal_after_external_restore() {
+    match conn.reload_wal_after_external_restore(&conn.preflight_external_restore()?) {
         Ok(()) => {}
         Err(LimboError::SchemaUpdated) => {
             force_reparse_schema_with_retry(conn).map_err(|error| {
@@ -728,11 +728,12 @@ fn reload_connection_after_external_restore(
                     "failed to refresh schema before retrying WAL reload after {context}: {error}",
                 ))
             })?;
-            conn.reload_wal_after_external_restore().map_err(|error| {
-                Error::DatabaseSyncEngineError(format!(
-                    "failed to reload WAL state after {context}: {error}",
-                ))
-            })?;
+            conn.reload_wal_after_external_restore(&conn.preflight_external_restore()?)
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "failed to reload WAL state after {context}: {error}",
+                    ))
+                })?;
         }
         Err(error) => {
             return Err(Error::DatabaseSyncEngineError(format!(
@@ -753,18 +754,20 @@ fn reload_connection_after_external_restore(
 fn publish_schema_after_sync_checkpoint(conn: &Arc<turso_core::Connection>) -> Result<()> {
     conn.get_pager().clear_page_cache(true);
     match force_reparse_schema_with_retry(conn) {
-        Ok(()) => match conn.publish_schema_after_external_restore() {
-            Ok(()) => Ok(()),
-            Err(LimboError::Busy) => {
-                tracing::debug!(
+        Ok(()) => {
+            match conn.publish_schema_after_external_restore(&conn.preflight_external_restore()?) {
+                Ok(()) => Ok(()),
+                Err(LimboError::Busy) => {
+                    tracing::debug!(
                         "checkpoint: schema publish after sync checkpoint skipped due to local busy connection"
                     );
-                Ok(())
+                    Ok(())
+                }
+                Err(error) => Err(Error::DatabaseSyncEngineError(format!(
+                    "failed to publish schema after sync checkpoint: {error}",
+                ))),
             }
-            Err(error) => Err(Error::DatabaseSyncEngineError(format!(
-                "failed to publish schema after sync checkpoint: {error}",
-            ))),
-        },
+        }
         Err(Error::TursoError(LimboError::Busy)) => {
             tracing::debug!(
                 "checkpoint: schema refresh after sync checkpoint skipped due to local busy connection"
@@ -781,7 +784,7 @@ fn publish_schema_after_external_restore(
     conn: &Arc<turso_core::Connection>,
     context: &str,
 ) -> Result<()> {
-    conn.publish_schema_after_external_restore()
+    conn.publish_schema_after_external_restore(&conn.preflight_external_restore()?)
         .map_err(|error| {
             Error::DatabaseSyncEngineError(format!(
                 "failed to publish schema after {context}: {error}",
@@ -1181,6 +1184,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         main_db: Arc<turso_core::Database>,
         opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
+        let _restore_permit = main_db.preflight_external_restore()?;
         let main_db_path = main_db.path.to_string();
         tracing::info!("open_db(path={}): opts={:?}", main_db_path, opts);
         // A previous process may have crashed after writing the replace-base
@@ -1196,7 +1200,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         if recovered {
             // Recovery restored files behind this already-open Database handle,
             // so rebuild its shared WAL/MVCC view before continuing.
-            main_db.reload_wal_after_external_restore()?;
+            main_db.reload_wal_after_external_restore(&main_db.preflight_external_restore()?)?;
         }
 
         let meta_path = create_meta_path(&main_db_path);
@@ -2396,7 +2400,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         drop(finished_main_session);
                         if let Some(mv_store) = main_conn.mv_store().as_ref() {
                             let pager = main_conn.get_pager();
-                            let reset = mv_store.reset_logical_log_after_external_restore().map_err(
+                            let reset = mv_store.reset_logical_log_after_external_restore(&main_conn.preflight_external_restore()?).map_err(
                                 |error| {
                                     Error::DatabaseSyncEngineError(format!(
                                         "failed to reset MVCC logical log after replace-base snapshot: {error}",
@@ -2411,7 +2415,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 },
                             )?;
                             if let Some(sync) = mv_store
-                                .sync_logical_log_after_external_restore(&main_conn)
+                                .sync_logical_log_after_external_restore(&main_conn, &main_conn.preflight_external_restore()?)
                                 .map_err(|error| {
                                     Error::DatabaseSyncEngineError(format!(
                                         "failed to sync MVCC logical log after replace-base snapshot: {error}",

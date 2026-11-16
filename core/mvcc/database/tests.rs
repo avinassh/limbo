@@ -651,6 +651,26 @@ fn mvcc_pragma_page_size_propagates_to_global_header() {
 }
 
 #[test]
+fn mvcc_pragma_page_size_cannot_change_during_first_page_write() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let crate::IOResult::IO(pending) = pager.maybe_allocate_page1().unwrap() else {
+        panic!("first page allocation must write page 1");
+    };
+
+    db.conn.execute("PRAGMA page_size = 512").unwrap();
+    let page_size = pager.get_page_size_unchecked().get();
+    assert_eq!(
+        db.mvcc_store
+            .with_header(|header| header.page_size.get(), None)
+            .unwrap(),
+        page_size
+    );
+    pending.wait(db.db.io.as_ref()).unwrap();
+    db.db.io.block(|| pager.maybe_allocate_page1()).unwrap();
+}
+
+#[test]
 fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
     let db = MvccTestDb::new();
     db.conn
@@ -21682,8 +21702,12 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
-        fn reset_to_fresh_header(&self) -> Result<Completion> {
-            self.inner.reset_to_fresh_header()
+        #[cfg(feature = "conn_raw_api")]
+        fn reset_to_fresh_header(
+            &self,
+            reservation: &crate::ExternalRestoreGuard,
+        ) -> Result<Completion> {
+            self.inner.reset_to_fresh_header(reservation)
         }
         fn get_logical_log_file(&self) -> Arc<dyn File> {
             self.inner.get_logical_log_file()
@@ -21909,8 +21933,12 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
-        fn reset_to_fresh_header(&self) -> Result<Completion> {
-            self.inner.reset_to_fresh_header()
+        #[cfg(feature = "conn_raw_api")]
+        fn reset_to_fresh_header(
+            &self,
+            reservation: &crate::ExternalRestoreGuard,
+        ) -> Result<Completion> {
+            self.inner.reset_to_fresh_header(reservation)
         }
         fn get_logical_log_file(&self) -> Arc<dyn File> {
             self.inner.get_logical_log_file()
@@ -24333,8 +24361,12 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
-        fn reset_to_fresh_header(&self) -> Result<Completion> {
-            self.inner.reset_to_fresh_header()
+        #[cfg(feature = "conn_raw_api")]
+        fn reset_to_fresh_header(
+            &self,
+            reservation: &crate::ExternalRestoreGuard,
+        ) -> Result<Completion> {
+            self.inner.reset_to_fresh_header(reservation)
         }
         fn get_logical_log_file(&self) -> Arc<dyn File> {
             self.inner.get_logical_log_file()

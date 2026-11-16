@@ -3594,6 +3594,13 @@ impl Program {
             }
         }
 
+        pager.clear_failed_encryption_validation();
+        self.connection
+            .with_all_attached_pagers_with_index(|pagers| {
+                for (_, pager) in pagers {
+                    pager.clear_failed_encryption_validation();
+                }
+            });
         let mut abort_error: Option<LimboError> = None;
         if let Err(err) = execute::abort_active_subprogram(self, state, err) {
             capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");

@@ -1,12 +1,15 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::ErrorKind,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use turso_core::{
     io::{FileId, FileSyncType},
-    Buffer, Clock, Completion, CompletionError, File, MonotonicInstant, OpenFlags,
+    Buffer, Clock, Completion, CompletionError, File, LimboError, MonotonicInstant, OpenFlags,
     WallClockInstant, IO,
 };
 
@@ -19,15 +22,77 @@ pub(crate) enum QueuedIoOpKind {
     Truncate,
 }
 
+/// Identifies a request by the logical operation that submitted it and its
+/// position among that operation's requests. Unlike a queue index or a global
+/// counter, it does not change when an unrelated operation's requests are
+/// removed from a schedule.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct QueuedIoRequestId {
+    pub(crate) owner: String,
+    pub(crate) ordinal: u32,
+}
+
+impl std::fmt::Display for QueuedIoRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{}", self.owner, self.ordinal)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct QueuedIoEvent {
     pub(crate) path: String,
     pub(crate) kind: QueuedIoOpKind,
+    pub(crate) id: QueuedIoRequestId,
+    /// Submission order across all owners. For diagnostics only.
+    pub(crate) serial: u64,
+    /// Byte offset for reads and writes; the new length for truncate; 0 for sync.
+    pub(crate) offset: u64,
+    /// Bytes requested by a read or carried by a write; 0 for sync and truncate.
+    pub(crate) len: usize,
+}
+
+/// Who made a queued request run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueuedIoCause {
+    /// The test chose this request with `step_at`, `step_one` or `step_request`.
+    Selected,
+    /// Engine code waited for I/O (`IO::step` or `drain_completions`), which ran
+    /// the request at the front of the queue.
+    Pump,
+    /// The test ran every remaining request with `drain_all`.
+    Drain,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QueuedIoRecord {
+    pub(crate) event: QueuedIoEvent,
+    pub(crate) cause: QueuedIoCause,
+    /// The owner whose code was running when the request ran.
+    pub(crate) running_owner: String,
+    pub(crate) injected_error: bool,
+    /// The completion was aborted before the request ran. The underlying action
+    /// still runs in that case; see `QueuedIo::cancel`.
+    pub(crate) aborted_before_dispatch: bool,
+    completion: Completion,
+}
+
+impl QueuedIoRecord {
+    pub(crate) fn finished(&self) -> bool {
+        self.completion.finished()
+    }
+
+    pub(crate) fn succeeded(&self) -> bool {
+        self.completion.succeeded()
+    }
 }
 
 struct QueuedIoOp {
     event: QueuedIoEvent,
+    completion: Completion,
     action: Box<dyn FnOnce() -> turso_core::Result<()> + Send>,
+    /// The request was armed to fail when submitted (`fault_after`,
+    /// `fail_next_request`).
+    armed_fault: bool,
 }
 
 #[derive(Debug)]
@@ -40,16 +105,34 @@ struct QueuedIoFault {
 
 struct QueuedIoState {
     pending: Mutex<VecDeque<QueuedIoOp>>,
-    history: Mutex<Vec<QueuedIoEvent>>,
+    underlying_pending: Mutex<Vec<Completion>>,
+    records: Mutex<Vec<QueuedIoRecord>>,
     fault: Mutex<Option<QueuedIoFault>>,
+    owner: Mutex<String>,
+    ordinals: Mutex<HashMap<String, u32>>,
+    serial: AtomicU64,
+    stall: Mutex<StallDetector>,
+    fail_next: Mutex<Option<QueuedIoOpKind>>,
+}
+
+#[derive(Default)]
+struct StallDetector {
+    limit: Option<u64>,
+    empty_steps: u64,
 }
 
 impl QueuedIoState {
     fn new() -> Self {
         Self {
             pending: Mutex::new(VecDeque::new()),
-            history: Mutex::new(Vec::new()),
+            underlying_pending: Mutex::new(Vec::new()),
+            records: Mutex::new(Vec::new()),
             fault: Mutex::new(None),
+            owner: Mutex::new("unowned".to_string()),
+            ordinals: Mutex::new(HashMap::new()),
+            serial: AtomicU64::new(0),
+            stall: Mutex::new(StallDetector::default()),
+            fail_next: Mutex::new(None),
         }
     }
 }
@@ -61,19 +144,152 @@ pub(crate) struct QueuedIo {
 
 impl QueuedIo {
     pub(crate) fn new() -> Self {
+        Self::new_with_io(Arc::new(turso_core::MemoryIO::new()))
+    }
+
+    pub(crate) fn new_with_io(inner: Arc<dyn IO>) -> Self {
         Self {
-            inner: Arc::new(turso_core::MemoryIO::new()),
+            inner,
             state: Arc::new(QueuedIoState::new()),
         }
     }
 
     pub(crate) fn step_one(&self) -> turso_core::Result<Option<QueuedIoEvent>> {
-        let Some(op) = self.state.pending.lock().unwrap().pop_front() else {
+        self.step_at(0, false)
+    }
+
+    pub(crate) fn pending_events(&self) -> Vec<QueuedIoEvent> {
+        self.state
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|operation| operation.event.clone())
+            .collect()
+    }
+
+    pub(crate) fn records(&self) -> Vec<QueuedIoRecord> {
+        self.state.records.lock().unwrap().clone()
+    }
+
+    pub(crate) fn step_at(
+        &self,
+        index: usize,
+        fail: bool,
+    ) -> turso_core::Result<Option<QueuedIoEvent>> {
+        self.dispatch(index, fail, QueuedIoCause::Selected)
+    }
+
+    /// Runs the queued request with this identity, or returns `None` if no such
+    /// request is waiting. Never runs a different request in its place.
+    pub(crate) fn step_request(
+        &self,
+        id: &QueuedIoRequestId,
+        fail: bool,
+    ) -> turso_core::Result<Option<QueuedIoEvent>> {
+        let index = self
+            .state
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|operation| &operation.event.id == id);
+        match index {
+            Some(index) => self.dispatch(index, fail, QueuedIoCause::Selected),
+            None => Ok(None),
+        }
+    }
+
+    /// Runs every queued request, including ones submitted while draining.
+    pub(crate) fn drain_all(&self) -> turso_core::Result<usize> {
+        let mut count = 0;
+        loop {
+            if self.dispatch(0, false, QueuedIoCause::Drain)?.is_some() {
+                count += 1;
+                continue;
+            }
+            if self.has_underlying_completions() {
+                self.step_underlying()?;
+                count += 1;
+                continue;
+            }
+            break;
+        }
+        Ok(count)
+    }
+
+    /// Whether a dispatched request is still waiting for the wrapped backend
+    /// to deliver its completion.
+    pub(crate) fn has_underlying_completions(&self) -> bool {
+        let mut pending = self.state.underlying_pending.lock().unwrap();
+        pending.retain(|completion| !completion.finished());
+        !pending.is_empty()
+    }
+
+    /// Gives the wrapped backend one chance to deliver completions without
+    /// dispatching another queued request.
+    pub(crate) fn step_underlying(&self) -> turso_core::Result<()> {
+        self.inner.step()?;
+        let mut pending = self.state.underlying_pending.lock().unwrap();
+        pending.retain(|completion| !completion.finished());
+        Ok(())
+    }
+
+    /// Sets the owner recorded for requests submitted from now on and returns
+    /// the previous owner.
+    pub(crate) fn set_owner(&self, owner: impl Into<String>) -> String {
+        std::mem::replace(&mut *self.state.owner.lock().unwrap(), owner.into())
+    }
+
+    /// Makes `IO::step` fail after `limit` consecutive calls that find no queued
+    /// request, so a blocking wait on I/O that will never be queued reports an
+    /// error instead of spinning forever. `None` turns the check off.
+    pub(crate) fn set_stall_limit(&self, limit: Option<u64>) {
+        *self.state.stall.lock().unwrap() = StallDetector {
+            limit,
+            empty_steps: 0,
+        };
+    }
+
+    fn dispatch(
+        &self,
+        index: usize,
+        fail: bool,
+        cause: QueuedIoCause,
+    ) -> turso_core::Result<Option<QueuedIoEvent>> {
+        let Some(op) = self.state.pending.lock().unwrap().remove(index) else {
             return Ok(None);
         };
+        self.state.stall.lock().unwrap().empty_steps = 0;
         let event = op.event.clone();
-        (op.action)()?;
-        self.state.history.lock().unwrap().push(event.clone());
+        let aborted_before_dispatch =
+            matches!(op.completion.get_error(), Some(CompletionError::Aborted));
+        // Requests submitted by this request's callbacks belong to its owner.
+        let running_owner = self.set_owner(event.id.owner.clone());
+        let result = if fail {
+            op.completion
+                .error(CompletionError::IOError(ErrorKind::Other, "queued_io"));
+            Ok(())
+        } else {
+            (op.action)()
+        };
+        if result.is_ok() && !op.completion.finished() {
+            self.state
+                .underlying_pending
+                .lock()
+                .unwrap()
+                .push(op.completion.clone());
+        }
+        self.set_owner(running_owner.clone());
+        self.state.records.lock().unwrap().push(QueuedIoRecord {
+            event: event.clone(),
+            cause,
+            running_owner,
+            injected_error: fail || op.armed_fault,
+            aborted_before_dispatch,
+            completion: op.completion,
+        });
+        result?;
         Ok(Some(event))
     }
 
@@ -96,9 +312,16 @@ impl QueuedIo {
         });
     }
 
+    /// Makes the next submitted request of this kind, on any file, fail with an
+    /// injected error when it runs. Only one request fails.
+    pub(crate) fn fail_next_request(&self, kind: QueuedIoOpKind) {
+        *self.state.fail_next.lock().unwrap() = Some(kind);
+    }
+
     /// Removes the active queued-I/O fault so cleanup and integrity checks can run normally.
     pub(crate) fn clear_fault(&self) {
         *self.state.fault.lock().unwrap() = None;
+        *self.state.fail_next.lock().unwrap() = None;
     }
 }
 
@@ -132,18 +355,40 @@ impl IO for QueuedIo {
     }
 
     fn step(&self) -> turso_core::Result<()> {
-        self.step_one().map(|_| ())
-    }
-
-    fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
-        while completions.iter().any(|c| !c.finished()) {
-            if self.step_one()?.is_none() {
-                break;
+        if self.dispatch(0, false, QueuedIoCause::Pump)?.is_none() {
+            if self.has_underlying_completions() {
+                self.step_underlying()?;
+                self.state.stall.lock().unwrap().empty_steps = 0;
+                return Ok(());
+            }
+            let mut stall = self.state.stall.lock().unwrap();
+            stall.empty_steps += 1;
+            if stall.limit.is_some_and(|limit| stall.empty_steps > limit) {
+                stall.empty_steps = 0;
+                return Err(LimboError::InternalError(
+                    "queued_io: blocking wait with no queued I/O".to_string(),
+                ));
             }
         }
         Ok(())
     }
 
+    fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        while completions.iter().any(|c| !c.finished()) {
+            if self.dispatch(0, false, QueuedIoCause::Pump)?.is_none() {
+                if self.has_underlying_completions() {
+                    self.step_underlying()?;
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Aborts the completions but leaves their queued actions in place: a
+    /// cancelled request that has not run yet still performs its read or write
+    /// when it is dispatched.
     fn cancel(&self, completions: &[Completion]) -> turso_core::Result<()> {
         for completion in completions {
             completion.abort();
@@ -174,14 +419,36 @@ impl QueuedFile {
     fn enqueue(
         &self,
         kind: QueuedIoOpKind,
+        offset: u64,
+        len: usize,
         completion: Completion,
         action: impl FnOnce() -> turso_core::Result<()> + Send + 'static,
     ) -> turso_core::Result<Completion> {
+        let owner = self.state.owner.lock().unwrap().clone();
+        let ordinal = {
+            let mut ordinals = self.state.ordinals.lock().unwrap();
+            let next = ordinals.entry(owner.clone()).or_insert(0);
+            *next += 1;
+            *next - 1
+        };
         let event = QueuedIoEvent {
             path: self.path.clone(),
             kind,
+            id: QueuedIoRequestId { owner, ordinal },
+            serial: self.state.serial.fetch_add(1, Ordering::SeqCst),
+            offset,
+            len,
         };
-        let fault_this_op = {
+        let fail_next = {
+            let mut next = self.state.fail_next.lock().unwrap();
+            if *next == Some(kind) {
+                *next = None;
+                true
+            } else {
+                false
+            }
+        };
+        let fault_this_op = fail_next || {
             let mut fault = self.state.fault.lock().unwrap();
             if let Some(fault) = fault.as_mut() {
                 if self.path.ends_with(&fault.path_suffix) && kind == fault.kind {
@@ -207,7 +474,9 @@ impl QueuedFile {
 
         self.state.pending.lock().unwrap().push_back(QueuedIoOp {
             event,
+            completion: completion.clone(),
             action: queued_action,
+            armed_fault: fault_this_op,
         });
         Ok(completion)
     }
@@ -225,7 +494,8 @@ impl File for QueuedFile {
     fn pread(&self, pos: u64, completion: Completion) -> turso_core::Result<Completion> {
         let inner = self.inner.clone();
         let c = completion.clone();
-        self.enqueue(QueuedIoOpKind::Pread, completion, move || {
+        let len = completion.as_read().buf().len();
+        self.enqueue(QueuedIoOpKind::Pread, pos, len, completion, move || {
             drop(inner.pread(pos, c)?);
             Ok(())
         })
@@ -239,7 +509,8 @@ impl File for QueuedFile {
     ) -> turso_core::Result<Completion> {
         let inner = self.inner.clone();
         let c = completion.clone();
-        self.enqueue(QueuedIoOpKind::Pwrite, completion, move || {
+        let len = buffer.len();
+        self.enqueue(QueuedIoOpKind::Pwrite, pos, len, completion, move || {
             drop(inner.pwrite(pos, buffer, c)?);
             Ok(())
         })
@@ -252,7 +523,7 @@ impl File for QueuedFile {
     ) -> turso_core::Result<Completion> {
         let inner = self.inner.clone();
         let c = completion.clone();
-        self.enqueue(QueuedIoOpKind::Sync, completion, move || {
+        self.enqueue(QueuedIoOpKind::Sync, 0, 0, completion, move || {
             drop(inner.sync(c, sync_type)?);
             Ok(())
         })
@@ -266,7 +537,8 @@ impl File for QueuedFile {
     ) -> turso_core::Result<Completion> {
         let inner = self.inner.clone();
         let c = completion.clone();
-        self.enqueue(QueuedIoOpKind::Pwritev, completion, move || {
+        let len = buffers.iter().map(|buffer| buffer.len()).sum();
+        self.enqueue(QueuedIoOpKind::Pwritev, pos, len, completion, move || {
             drop(inner.pwritev(pos, buffers, c)?);
             Ok(())
         })
@@ -279,7 +551,7 @@ impl File for QueuedFile {
     fn truncate(&self, len: u64, completion: Completion) -> turso_core::Result<Completion> {
         let inner = self.inner.clone();
         let c = completion.clone();
-        self.enqueue(QueuedIoOpKind::Truncate, completion, move || {
+        self.enqueue(QueuedIoOpKind::Truncate, len, 0, completion, move || {
             drop(inner.truncate(len, c)?);
             Ok(())
         })

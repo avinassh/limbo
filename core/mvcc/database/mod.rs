@@ -4180,19 +4180,33 @@ pub enum ReadPersistentTxTsMaxState {
     },
 }
 
-/// Sub state machine for `MvStore::initialize_mvcc_metadata_table_nonblock`.
-/// Sequences the CREATE TABLE then INSERT statements, holding each prepared
-/// statement across IO yields.
 #[derive(Default)]
-pub enum InitMetadataTableState {
+pub struct InitMetadataTableState {
+    phase: InitMetadataTablePhase,
+    stmt: Option<Box<crate::Statement>>,
+    connection: Option<Arc<Connection>>,
+}
+
+#[derive(Default)]
+enum InitMetadataTablePhase {
     #[default]
-    Start,
-    CreateTable {
-        stmt: Box<crate::Statement>,
-    },
-    Insert {
-        stmt: Box<crate::Statement>,
-    },
+    Begin,
+    CreateTable,
+    Insert,
+    Commit,
+}
+
+impl Drop for InitMetadataTableState {
+    fn drop(&mut self) {
+        self.stmt = None;
+        if let Some(connection) = self.connection.take() {
+            let pager = connection.pager.load();
+            pager.rollback_tx(&connection);
+            connection.auto_commit.store(true, Ordering::SeqCst);
+            connection.set_tx_state(crate::TransactionState::None);
+            connection.clear_tx_poison();
+        }
+    }
 }
 
 /// Sub state machine for [`MvStore::maybe_recover_logical_log`]. The
@@ -4991,43 +5005,40 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.global_header.write().replace(header);
     }
 
-    /// Creates the `__turso_internal_mvcc_meta` table and seeds it with
-    /// `persistent_tx_ts_max` (initialized to 0). This table stores the durable replay
-    /// boundary: on recovery, only logical-log frames with `commit_ts > persistent_tx_ts_max`
-    /// are replayed. Called once during first MVCC bootstrap.
-    /// Creates and seeds the MVCC metadata table, driving the CREATE TABLE then
-    /// INSERT statements cooperatively via the supplied [`InitMetadataTableState`]
-    /// so bootstrap does not block on backends without a synchronous IO pump.
     fn initialize_mvcc_metadata_table_nonblock(
         &self,
         connection: &Arc<Connection>,
         st: &mut InitMetadataTableState,
     ) -> IOResultOr<()> {
         loop {
-            match st {
-                InitMetadataTableState::Start => {
-                    let stmt = connection.prepare(format!(
+            if st.stmt.is_none() {
+                let sql = match st.phase {
+                    InitMetadataTablePhase::Begin => {
+                        assert!(connection.get_auto_commit());
+                        st.connection = Some(connection.clone());
+                        "BEGIN IMMEDIATE".to_string()
+                    }
+                    InitMetadataTablePhase::CreateTable => format!(
                         "CREATE TABLE IF NOT EXISTS {MVCC_META_TABLE_NAME}(k TEXT, v INTEGER NOT NULL)"
-                    ))?;
-                    *st = InitMetadataTableState::CreateTable {
-                        stmt: Box::new(stmt),
-                    };
-                }
-                InitMetadataTableState::CreateTable { stmt } => {
-                    return_if_io!(stmt.run_ignore_rows_nonblock());
-                    let stmt = connection.prepare(format!(
+                    ),
+                    InitMetadataTablePhase::Insert => format!(
                         "INSERT OR IGNORE INTO {MVCC_META_TABLE_NAME}(rowid, k, v) VALUES (1, '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}', 0)"
-                    ))?;
-                    *st = InitMetadataTableState::Insert {
-                        stmt: Box::new(stmt),
-                    };
-                }
-                InitMetadataTableState::Insert { stmt } => {
-                    return_if_io!(stmt.run_ignore_rows_nonblock());
-                    *st = InitMetadataTableState::Start;
+                    ),
+                    InitMetadataTablePhase::Commit => "COMMIT".to_string(),
+                };
+                st.stmt = Some(Box::new(connection.prepare(sql)?));
+            }
+            return_if_io!(st.stmt.as_mut().unwrap().run_ignore_rows_nonblock());
+            st.stmt = None;
+            st.phase = match st.phase {
+                InitMetadataTablePhase::Begin => InitMetadataTablePhase::CreateTable,
+                InitMetadataTablePhase::CreateTable => InitMetadataTablePhase::Insert,
+                InitMetadataTablePhase::Insert => InitMetadataTablePhase::Commit,
+                InitMetadataTablePhase::Commit => {
+                    st.connection = None;
                     return Ok(IOResult::Done(()));
                 }
-            }
+            };
         }
     }
 
@@ -9149,8 +9160,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// The returned completion must finish before reopening/recovering MVCC
     /// state. Otherwise recovery could replay stale local logical-log frames on
     /// top of the restored database image.
-    pub fn reset_logical_log_after_external_restore(&self) -> Result<Completion> {
-        self.storage.reset_to_fresh_header()
+    #[cfg(feature = "conn_raw_api")]
+    pub fn reset_logical_log_after_external_restore(
+        &self,
+        permit: &crate::ExternalRestorePermit,
+    ) -> Result<Completion> {
+        self.validate_external_restore_permit(permit)?;
+        self.storage.reset_to_fresh_header(&permit.reservation)
     }
 
     /// Return the durable sync completion for the freshly reset logical log.
@@ -9158,15 +9174,59 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// This is separate from `reset_logical_log_after_external_restore` so
     /// callers can drive the reset completion cooperatively, then issue the
     /// ordered sync only after the header/truncate group has completed.
+    #[cfg(feature = "conn_raw_api")]
     pub fn sync_logical_log_after_external_restore(
         &self,
         connection: &Arc<Connection>,
+        permit: &crate::ExternalRestorePermit,
     ) -> Result<Option<Completion>> {
+        connection.db.validate_external_restore_permit(permit)?;
+        self.validate_external_restore_permit(permit)?;
         if connection.get_sync_mode() != SyncMode::Off {
             let pager = connection.pager.load().clone();
-            return Ok(Some(self.storage.sync(pager.get_sync_type())?));
+            let c = self.storage.sync(pager.get_sync_type())?;
+            permit.reservation.protect_completion(&c);
+            return Ok(Some(c));
         }
         Ok(None)
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn validate_external_restore_permit(
+        &self,
+        permit: &crate::ExternalRestorePermit,
+    ) -> Result<()> {
+        if self.storage.encryption_ctx().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "external restore is not supported with built-in encryption".into(),
+            ));
+        }
+        if !permit.mv_store.as_ref().is_some_and(|store| {
+            std::ptr::eq(
+                Arc::as_ptr(store).cast::<()>(),
+                std::ptr::from_ref(self).cast::<()>(),
+            )
+        }) {
+            return Err(LimboError::InvalidArgument(
+                "external restore permit belongs to another MVCC store".into(),
+            ));
+        }
+        if !permit
+            .database
+            .get_mv_store()
+            .as_ref()
+            .is_some_and(|store| {
+                std::ptr::eq(
+                    Arc::as_ptr(store).cast::<()>(),
+                    std::ptr::from_ref(self).cast::<()>(),
+                )
+            })
+        {
+            return Err(LimboError::InvalidArgument(
+                "external restore permit refers to a replaced MVCC store".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Reconcile WAL state left by a prior crash or incomplete checkpoint.

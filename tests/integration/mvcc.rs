@@ -104,8 +104,11 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.truncate(checkpointed_through_ts)
     }
 
-    fn reset_to_fresh_header(&self) -> turso_core::Result<turso_core::Completion> {
-        self.inner.reset_to_fresh_header()
+    fn reset_to_fresh_header(
+        &self,
+        reservation: &turso_core::ExternalRestoreGuard,
+    ) -> turso_core::Result<turso_core::Completion> {
+        self.inner.reset_to_fresh_header(reservation)
     }
 
     fn get_logical_log_file(&self) -> Arc<dyn turso_core::File> {
@@ -2142,4 +2145,212 @@ fn test_mvcc_open_tolerates_null_sqlite_sequence_name() -> anyhow::Result<()> {
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT seq FROM sqlite_sequence WHERE name='t3'");
     assert_eq!(rows, vec![(6,)]);
     Ok(())
+}
+
+// Reopening must succeed when an initial MVCC open is abandoned or fails
+// during a write or sync. Found by the encryption fuzzer; the abandoned
+// plaintext case also panicked on main (4b3befbd6).
+
+#[test]
+fn test_reopen_after_abandoned_plaintext_mvcc_open() {
+    for drain_abandoned_requests in [false, true] {
+        for stop_after in 0.. {
+            let io = Arc::new(QueuedIo::new());
+            let path = format!(":abandoned-mvcc-open-{drain_abandoned_requests}-{stop_after}:");
+            let options = new_mvcc_database_options(&io, &path, None);
+            let mut state = turso_core::OpenDbAsyncState::new();
+            let mut finished = false;
+            for step in 0..=stop_after {
+                match Database::open_async(&mut state, io.clone(), &path, &options).unwrap() {
+                    turso_core::IOResult::Done(_) => {
+                        finished = true;
+                        break;
+                    }
+                    turso_core::IOResult::IO(pending) if step < stop_after => {
+                        pending.wait(io.as_ref()).unwrap()
+                    }
+                    turso_core::IOResult::IO(_) => {}
+                }
+            }
+            drop(state);
+            if drain_abandoned_requests {
+                while io.step_one().unwrap().is_some() {}
+            }
+            reopen_and_write(&io, &path, &options, None).unwrap_or_else(|panic| {
+                panic!(
+                    "reopening after abandoning the first open at wait {stop_after} \
+                     (abandoned requests drained: {drain_abandoned_requests}) panicked: {panic}"
+                )
+            });
+            if finished {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn test_reopen_after_plaintext_mvcc_open_failed_on_io_error() {
+    reopen_after_mvcc_open_failed_on_io_error(false);
+}
+
+#[test]
+fn test_reopen_after_encrypted_mvcc_open_failed_on_io_error() {
+    reopen_after_mvcc_open_failed_on_io_error(true);
+}
+
+#[test]
+fn test_reopen_existing_mvcc_header_with_zero_page_count() {
+    use turso_core::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, Version};
+
+    for page_size in [512, 4096, 8192, 65536] {
+        for stored_count in [0u32, 1] {
+            let io = Arc::new(QueuedIo::new());
+            let path = format!(":existing-mvcc-header-{page_size}-{stored_count}:");
+            let mut header = DatabaseHeader::default();
+            header.page_size = PageSize::new(page_size).unwrap();
+            header.read_version = Version::Mvcc.into();
+            header.write_version = header.read_version;
+            header.database_size = stored_count.into();
+            write_empty_database_page(&io, &path, header);
+            let options = new_mvcc_database_options(&io, &path, None);
+            reopen_and_write(&io, &path, &options, None).unwrap_or_else(|panic| {
+                panic!(
+                    "reopening an existing header with page size {page_size} \
+                     and stored page count {stored_count}: {panic}"
+                )
+            });
+        }
+    }
+}
+
+#[test]
+fn test_readonly_wal_open_with_zero_page_count_keeps_file_unchanged() {
+    use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
+    use turso_core::Buffer;
+
+    let io = Arc::new(QueuedIo::new());
+    let path = ":readonly-wal-zero-page-count:";
+    let expected = write_empty_database_page(&io, path, DatabaseHeader::default());
+    let db = Database::open(
+        io.clone(),
+        path,
+        OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::ReadOnly),
+    )
+    .unwrap();
+    let connection = db.connect(ConnectOpts::new()).unwrap();
+    let pages: Vec<(i64,)> = connection.exec_rows("PRAGMA page_count");
+    assert_eq!(pages, [(1,)]);
+    let tables: Vec<(i64,)> = connection.exec_rows("SELECT count(*) FROM sqlite_schema");
+    assert_eq!(tables, [(0,)]);
+    let file = io.open_file(path, OpenFlags::ReadOnly, false).unwrap();
+    let bytes = Arc::new(Buffer::new_temporary(expected.len()));
+    let completion = file
+        .pread(0, Completion::new_read(bytes.clone(), Box::new(|_| None)))
+        .unwrap();
+    io.wait_for_completion(completion).unwrap();
+    assert_eq!(bytes.as_slice(), expected);
+}
+
+fn write_empty_database_page(
+    io: &Arc<QueuedIo>,
+    path: &str,
+    header: turso_core::storage::sqlite3_ondisk::DatabaseHeader,
+) -> Vec<u8> {
+    use turso_core::{Buffer, Page};
+
+    let page_size = header.page_size.get() as usize;
+    let page = Page::new(1);
+    let buffer = Arc::new(Buffer::new_temporary(page_size));
+    page.get().set_buffer(buffer.clone());
+    let contents = page.get_contents();
+    contents.write_database_header(&header);
+    contents.write_page_type(13);
+    contents.write_first_freeblock(0);
+    contents.write_cell_count(0);
+    contents.write_cell_content_area(page_size);
+    contents.write_fragmented_bytes_count(0);
+    let expected = buffer.as_slice().to_vec();
+    let file = io.open_file(path, OpenFlags::Create, false).unwrap();
+    let completion = file
+        .pwrite(0, buffer, Completion::new_write(|_| {}))
+        .unwrap();
+    io.wait_for_completion(completion).unwrap();
+    expected
+}
+
+fn reopen_after_mvcc_open_failed_on_io_error(encrypted: bool) {
+    let hexkey = "01".repeat(32);
+    let encryption = encrypted.then(|| EncryptionOpts {
+        cipher: "aegis256".to_string(),
+        hexkey: hexkey.clone(),
+    });
+    let key = encrypted.then(|| EncryptionKey::from_hex_string(&hexkey).unwrap());
+    for kind in [QueuedIoOpKind::Pwrite, QueuedIoOpKind::Sync] {
+        for successes in 0.. {
+            let io = Arc::new(QueuedIo::new());
+            let path = format!(":failed-mvcc-open-{encrypted}-{kind:?}-{successes}:");
+            let options = new_mvcc_database_options(&io, &path, encryption.clone());
+            io.fault_after("", kind, successes);
+            let first = Database::open(io.clone(), &path, options.clone());
+            io.clear_fault();
+            while io.step_one().unwrap().is_some() {}
+            let first_failed = first.is_err();
+            drop(first);
+            reopen_and_write(&io, &path, &options, key.clone()).unwrap_or_else(|panic| {
+                panic!(
+                    "reopening after the first open failed on {kind:?} number {} panicked: {panic}",
+                    successes + 1
+                )
+            });
+            if !first_failed {
+                break;
+            }
+        }
+    }
+}
+
+fn new_mvcc_database_options(
+    io: &Arc<QueuedIo>,
+    path: &str,
+    encryption: Option<EncryptionOpts>,
+) -> OpenOptions {
+    let file = io.open_file(path, OpenFlags::Create, false).unwrap();
+    OpenOptions::new(Arc::new(SqliteDialect))
+        .storage(Arc::new(turso_core::storage::database::DatabaseFile::new(
+            file,
+        )))
+        .db_opts(
+            DatabaseOpts::new()
+                .with_mvcc(true)
+                .with_encryption(encryption.is_some()),
+        )
+        .encryption(encryption)
+}
+
+/// Opens the database again and writes and reads a row. Returns the panic
+/// message if any step panics.
+fn reopen_and_write(
+    io: &Arc<QueuedIo>,
+    path: &str,
+    options: &OpenOptions,
+    key: Option<EncryptionKey>,
+) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let db = Database::open(io.clone(), path, options.clone()).unwrap();
+        let connection = db
+            .connect(ConnectOpts::new().with_encryption_key(key))
+            .unwrap();
+        connection.execute("CREATE TABLE t(x)").unwrap();
+        connection.execute("INSERT INTO t VALUES (1)").unwrap();
+        let rows: Vec<(i64,)> = connection.exec_rows("SELECT x FROM t");
+        assert_eq!(rows, [(1,)]);
+    }))
+    .map_err(|panic| {
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()))
+            .unwrap_or_default()
+    })
 }

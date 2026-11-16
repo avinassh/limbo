@@ -33,7 +33,7 @@ use crate::{
     storage::{
         self,
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
-        encryption::{AtomicCipherMode, SQLITE_HEADER, TURSO_HEADER_PREFIX},
+        encryption::{EncryptionContext, SQLITE_HEADER, TURSO_HEADER_PREFIX},
         journal_mode,
         page_cache::PageCache,
         page_transform::PageTransform,
@@ -234,6 +234,7 @@ pub struct OpenOptions {
     db_opts: DatabaseOpts,
     pub(crate) native_extensions: crate::native_ext::NativeExtensions,
     encryption: Option<EncryptionOpts>,
+    page_size: Option<PageSize>,
     page_codec: Option<Arc<dyn PageCodec>>,
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     allocators: DatabaseAllocators,
@@ -254,6 +255,7 @@ impl OpenOptions {
             db_opts: DatabaseOpts::default(),
             native_extensions: crate::native_ext::NativeExtensions::default(),
             encryption: None,
+            page_size: None,
             page_codec: None,
             durable_storage: None,
             allocators: DatabaseAllocators::default(),
@@ -287,6 +289,11 @@ impl OpenOptions {
 
     pub fn encryption(mut self, encryption: impl Into<Option<EncryptionOpts>>) -> Self {
         self.encryption = encryption.into();
+        self
+    }
+
+    pub fn page_size(mut self, page_size: PageSize) -> Self {
+        self.page_size = Some(page_size);
         self
     }
 
@@ -347,6 +354,7 @@ pub enum OpenDbAsyncPhase {
     /// Drives `Database::header_validation` (header validation + WAL recovery)
     /// as a sub state machine so WAL recovery on open does not block.
     ValidatingHeader,
+    Connecting,
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
@@ -415,7 +423,15 @@ pub(crate) enum InitState {
     /// Driving `init_pager` (its only IO is the DB-header read).
     InitPager(DbHeaderReadState),
     /// Pager built and read-tx open; reading page 1 for the autovacuum mode.
-    ReadPage1 { pager: Box<Pager> },
+    ReadPage1 { pager: Option<Box<Pager>> },
+}
+
+impl Drop for InitState {
+    fn drop(&mut self) {
+        if let Self::ReadPage1 { pager: Some(pager) } = self {
+            pager.end_read_tx();
+        }
+    }
 }
 
 /// Sub state machine for [`Database::header_validation`], driven from
@@ -424,6 +440,8 @@ pub(crate) enum InitState {
 enum HeaderValidationState {
     Start {
         init: InitState,
+        wal_opened: bool,
+        driver: Option<storage::wal::OpenSharedWal>,
     },
     /// Pager created; (re-entrant) header reads + validation. Holds the owned
     /// `Pager` because `set_wal` needs `&mut Pager`; it is `Arc`-wrapped only
@@ -462,40 +480,10 @@ impl Default for HeaderValidationState {
     fn default() -> Self {
         Self::Start {
             init: InitState::default(),
+            wal_opened: false,
+            driver: None,
         }
     }
-}
-
-/// How `Database::_connect` loads the connection's ANALYZE stats.
-///
-/// A new connection starts from a clone of the shared schema, which carries
-/// no `sqlite_stat1` contents until some connection has loaded them, and the
-/// planner uses those stats for its cost estimates. `_connect` therefore
-/// refreshes them. The refresh is a `SELECT` over `sqlite_stat1`, and that
-/// statement can have to wait: on page I/O, or on another transaction when
-/// it speculatively reads a version whose writer is still preparing. Two
-/// states exist because there are two kinds of caller for that wait:
-///
-/// - `Blocking`: the caller may block, so `_connect` runs the scan to
-///   completion right here by pumping `io.step()`. This is the public
-///   `connect` family for embedded users, where whatever the scan waits for
-///   can make progress on its own, and the internal open-time and MVCC
-///   bootstrap connections, for which the refresh is a no-op because the
-///   database is not initialized yet.
-/// - `Deferred`: the caller must not block, so `_connect` returns the bare
-///   connection and the caller drives the same scan through
-///   `refresh_analyze_stats_nonblock`, handing every wait to its own
-///   scheduler. This is `connect_async`, for hosts that run every connection
-///   cooperatively on one thread: there an explicit yield from the scan is a
-///   request to run *other* connections, which `io.step()` can never satisfy,
-///   so `Blocking` would spin forever.
-///
-/// Stats loading is never skipped outright; `Deferred` only moves it to the
-/// caller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StatsRefresh {
-    Blocking,
-    Deferred,
 }
 
 /// Settings for a single connection, passed to [`Database::connect`] and
@@ -540,10 +528,25 @@ impl ConnectOpts {
 /// connect and pass it to every call until `IOResult::Done`.
 #[derive(Default)]
 pub struct ConnectAsyncState {
-    /// The connection, once created; handed out when the stats refresh ends.
-    conn: Option<Arc<Connection>>,
-    /// The in-flight `sqlite_stat1` scan.
-    refresh: RefreshAnalyzeStatsState,
+    phase: ConnectAsyncPhase,
+}
+
+#[derive(Default)]
+enum ConnectAsyncPhase {
+    #[default]
+    Start,
+    Initialize {
+        opts: ConnectOpts,
+        init: InitState,
+    },
+    Header {
+        key: Option<EncryptionKey>,
+        pager: Arc<Pager>,
+    },
+    Refresh {
+        conn: Arc<Connection>,
+        refresh: RefreshAnalyzeStatsState,
+    },
 }
 
 impl ConnectAsyncState {
@@ -567,6 +570,7 @@ pub struct OpenDbAsyncState {
     /// The database being built, held across the ValidatingHeader phase yields
     /// before it is wrapped in an `Arc`.
     building_db: Option<Database>,
+    initial_page_size: Option<PageSize>,
     /// Sub state machine for `header_validation`, driven in ValidatingHeader.
     header_validation_state: HeaderValidationState,
     /// The dedicated bootstrap connection used by `BootstrapMvStore`, held
@@ -606,6 +610,7 @@ impl OpenDbAsyncState {
             schema_guard: None,
             registry_key: None,
             building_db: None,
+            initial_page_size: None,
             header_validation_state: HeaderValidationState::default(),
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
@@ -620,10 +625,87 @@ impl OpenDbAsyncState {
 
 impl Drop for OpenDbAsyncState {
     fn drop(&mut self) {
+        self.clear_open_resources();
         if let Some(registry_key) = self.registry_key.take() {
             let mut registry = DATABASE_MANAGER.lock();
             registry.remove(&registry_key);
         }
+    }
+}
+
+impl OpenDbAsyncState {
+    fn clear_open_resources(&mut self) {
+        self.schema_guard = None;
+        self.make_from_btree_state = schema::MakeFromBtreeState::new();
+        self.mvcc_convert_stmt = None;
+        self.mvcc_bootstrap_state = mvcc::database::BootstrapState::default();
+        self.roles_stmt = None;
+        self.dialect_schema_stmt = None;
+        self.mvcc_bootstrap_conn = None;
+        self.conn = None;
+        self.pager = None;
+        self.db = None;
+        self.building_db = None;
+        self.header_validation_state = HeaderValidationState::default();
+    }
+}
+
+/// Authorizes restore hooks for one plaintext database and its current MVCC store.
+#[cfg(feature = "conn_raw_api")]
+pub struct ExternalRestorePermit {
+    pub(crate) database: Arc<Database>,
+    pub(crate) mv_store: Option<Arc<MvStore>>,
+    pub(crate) reservation: ExternalRestoreGuard,
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[must_use = "keep the reservation alive until external file replacement finishes"]
+#[derive(Clone)]
+pub struct ExternalRestoreGuard {
+    _reservation: Arc<ExternalRestoreReservation>,
+}
+
+#[cfg(feature = "conn_raw_api")]
+struct ExternalRestoreReservation {
+    target: Arc<ExternalRestoreTarget>,
+}
+
+#[cfg(feature = "conn_raw_api")]
+impl ExternalRestoreGuard {
+    /// Keeps this reservation active while the I/O backend retains the
+    /// completion, including after the caller cancels the operation.
+    /// Call before submitting the completion to the backend.
+    pub fn protect_completion(&self, completion: &crate::Completion) {
+        completion.keep_external_restore_alive(self.clone());
+    }
+}
+
+#[cfg(feature = "conn_raw_api")]
+struct ExternalRestoreTarget {
+    path: String,
+    key: DatabaseKey,
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[derive(Default)]
+struct ExternalRestoreRegistry {
+    protected_databases: HashMap<DatabaseKey, usize>,
+    replacements: Vec<Arc<ExternalRestoreTarget>>,
+}
+
+#[cfg(feature = "conn_raw_api")]
+impl Drop for ExternalRestoreReservation {
+    fn drop(&mut self) {
+        let removed = {
+            let mut registry = EXTERNAL_RESTORE_REGISTRY.lock();
+            let index = registry
+                .replacements
+                .iter()
+                .position(|target| Arc::ptr_eq(target, &self.target))
+                .expect("live restore reservation is registered");
+            registry.replacements.swap_remove(index)
+        };
+        drop(removed);
     }
 }
 
@@ -668,6 +750,10 @@ pub(crate) enum DatabaseKey {
 pub(crate) static DATABASE_MANAGER: LazyLock<
     Arc<parking_lot::Mutex<HashMap<DatabaseKey, RegistryEntry>>>,
 > = LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
+
+#[cfg(feature = "conn_raw_api")]
+static EXTERNAL_RESTORE_REGISTRY: LazyLock<parking_lot::Mutex<ExternalRestoreRegistry>> =
+    LazyLock::new(|| parking_lot::Mutex::new(ExternalRestoreRegistry::default()));
 
 #[cfg(feature = "simulator")]
 pub fn clear_database_registry() {
@@ -730,9 +816,10 @@ pub struct Database<
     /// database is registered. `Drop` uses it to remove the entry.
     registry_key: OnceLock<DatabaseKey>,
 
-    // Encryption
-    encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
+    encrypted_page_one: Option<Arc<[u8]>>,
+    #[cfg(feature = "conn_raw_api")]
+    restore_registry_key: Option<DatabaseKey>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -794,6 +881,18 @@ impl fmt::Debug for Database {
 
 impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Database<A, F> {
     fn drop(&mut self) {
+        #[cfg(feature = "conn_raw_api")]
+        if let Some(key) = self.restore_registry_key.as_ref() {
+            let mut registry = EXTERNAL_RESTORE_REGISTRY.lock();
+            let count = registry
+                .protected_databases
+                .get_mut(key)
+                .expect("live protected database is registered");
+            *count -= 1;
+            if *count == 0 {
+                registry.protected_databases.remove(key);
+            }
+        }
         let Some(key) = self.registry_key.get() else {
             return;
         };
@@ -821,6 +920,7 @@ impl Database {
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
+        initial_page_size: Option<PageSize>,
         allocators: DatabaseAllocators,
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
@@ -841,14 +941,17 @@ impl Database {
             BufferPool::DEFAULT_ARENA_SIZE
         };
 
-        let encryption_cipher_mode = if let Some(encryption_opts) = encryption_opts {
+        let encryption_cipher_mode = if let Some(encryption_opts) = encryption_opts.as_ref() {
             Some(CipherMode::try_from(encryption_opts.cipher.as_str())?)
         } else {
             None
         };
 
         let init_page_1 = if db_size == 0 {
-            let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
+            let default_page_1 = pager::default_page1_with_size(
+                encryption_cipher_mode.as_ref(),
+                initial_page_size.unwrap_or_default(),
+            );
 
             Some(default_page_1)
         } else {
@@ -856,6 +959,10 @@ impl Database {
         };
 
         let enable_custom_types = opts.enable_custom_types || dialect.requires_custom_types();
+        let encryption_key = encryption_opts
+            .as_ref()
+            .map(|options| EncryptionKey::from_hex_string(&options.hexkey))
+            .transpose()?;
 
         let db = Database {
             mv_store,
@@ -891,13 +998,17 @@ impl Database {
                 NEXT_DATABASE_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
 
-            pager_state: Arc::new(SharedPagerState::new(init_page_1)),
+            pager_state: Arc::new(SharedPagerState::with_encryption(
+                init_page_1,
+                encryption_cipher_mode.unwrap_or(CipherMode::None),
+                encryption_key.as_ref(),
+            )?),
             registry_key: OnceLock::new(),
 
-            encryption_cipher_mode: AtomicCipherMode::new(
-                encryption_cipher_mode.unwrap_or(CipherMode::None),
-            ),
             page_codec_id,
+            encrypted_page_one: None,
+            #[cfg(feature = "conn_raw_api")]
+            restore_registry_key: None,
 
             durable_storage: None,
         };
@@ -905,6 +1016,27 @@ impl Database {
         db.register_global_builtin_extensions()
             .expect("unable to register global extensions");
         native_extensions.register(&db)?;
+        #[cfg(feature = "conn_raw_api")]
+        let mut db = db;
+        #[cfg(feature = "conn_raw_api")]
+        if db.encryption_cipher() != CipherMode::None || db.page_codec_id.is_some() {
+            let key = match db.io.file_id(&db.path) {
+                Ok(id) => DatabaseKey::File(id),
+                Err(LimboError::CompletionError(CompletionError::IOError(
+                    std::io::ErrorKind::NotFound,
+                    _,
+                ))) => DatabaseKey::SharedMemory(db.path.clone()),
+                Err(error) => return Err(error),
+            };
+            let mut registry = EXTERNAL_RESTORE_REGISTRY.lock();
+            for target in &registry.replacements {
+                if target.matches(db.io.as_ref(), &key, &db.path)? {
+                    return Err(LimboError::Busy);
+                }
+            }
+            *registry.protected_databases.entry(key.clone()).or_default() += 1;
+            db.restore_registry_key = Some(key);
+        }
         Ok(db)
     }
 
@@ -1019,11 +1151,16 @@ impl Database {
         Ok(())
     }
 
-    fn validate_open_options(options: &OpenOptions) -> Result<()> {
+    pub(crate) fn validate_open_options(options: &OpenOptions) -> Result<()> {
         Self::validate_external_page_codec_options(options.db_opts, options.page_codec.is_some())?;
         if options.encryption.is_some() && options.page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
                 "built-in encryption cannot be combined with an external page codec".to_string(),
+            ));
+        }
+        if options.encryption.is_some() && !options.db_opts.enable_encryption {
+            return Err(LimboError::InvalidArgument(
+                "encryption is an opt in feature".into(),
             ));
         }
         Ok(())
@@ -1158,19 +1295,58 @@ impl Database {
         };
         drop(registry);
 
-        // Validate encryption compatibility (key is not stored for security,
-        // so we can only check cipher mode)
-        let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-        if db_is_encrypted && encryption_opts.is_none() {
-            return Err(LimboError::InvalidArgument(
-                "Database is encrypted but no encryption options provided".to_string(),
-            ));
-        }
+        db.validate_encryption_options(encryption_opts.as_ref())?;
         db.validate_page_codec(page_codec)?;
 
         Self::check_registry_dialect(&db, dialect)?;
 
         Ok(Some(db))
+    }
+
+    fn validate_encryption_options(&self, options: Option<&EncryptionOpts>) -> Result<()> {
+        match options {
+            Some(options) => {
+                if self.page_codec_id.is_some() {
+                    return Err(LimboError::InvalidArgument(
+                        "built-in encryption cannot be combined with an external page codec"
+                            .to_string(),
+                    ));
+                }
+                if !self.opts.enable_encryption {
+                    return Err(LimboError::InvalidArgument(
+                        "encryption is an opt in feature".to_string(),
+                    ));
+                }
+                let cipher = CipherMode::try_from(options.cipher.as_str())?;
+                let key = EncryptionKey::from_hex_string(&options.hexkey)?;
+                let current = self.pager_state.encryption_cipher();
+                if current == CipherMode::None {
+                    return Err(LimboError::InvalidArgument(
+                        "database is already open without encryption".into(),
+                    ));
+                }
+                if current != cipher {
+                    return Err(LimboError::InvalidArgument(
+                        "encryption cipher does not match the database".into(),
+                    ));
+                }
+                let encoded = self
+                    .encrypted_page_one
+                    .as_ref()
+                    .expect("authenticated encrypted database has a verifier");
+                let context = EncryptionContext::new(cipher, &key, encoded.len())?;
+                context.decrypt_page(encoded, 1).map_err(|_| {
+                    LimboError::CompletionError(CompletionError::DecryptionError { page_idx: 1 })
+                })?;
+                Ok(())
+            }
+            None if self.pager_state.encryption_cipher() != CipherMode::None => {
+                Err(LimboError::InvalidArgument(
+                    "encrypted database requires an encryption key".to_string(),
+                ))
+            }
+            None => Ok(()),
+        }
     }
 
     fn validate_page_codec(&self, page_codec: Option<&dyn PageCodec>) -> Result<()> {
@@ -1221,7 +1397,7 @@ impl Database {
     /// when a registry hit short-circuits the open (only possible when
     /// `use_registry` is set).
     #[cfg(feature = "fs")]
-    fn resolve_default_storage(
+    pub(crate) fn resolve_default_storage(
         io: &Arc<dyn IO>,
         path: &str,
         options: &mut OpenOptions,
@@ -1284,7 +1460,7 @@ impl Database {
     }
 
     #[cfg(not(feature = "fs"))]
-    fn resolve_default_storage(
+    pub(crate) fn resolve_default_storage(
         _io: &Arc<dyn IO>,
         _path: &str,
         _options: &mut OpenOptions,
@@ -1393,15 +1569,7 @@ impl Database {
                             drop(registry);
                             tracing::debug!("took database {path:?} from the registry");
 
-                            let db_is_encrypted =
-                                !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-                            if db_is_encrypted && options.encryption.is_none() {
-                                return Err(LimboError::InvalidArgument(
-                                    "Database is encrypted but no encryption options provided"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
+                            db.validate_encryption_options(options.encryption.as_ref())?;
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
                             return Ok(IOResult::Done(db));
@@ -1426,6 +1594,8 @@ impl Database {
             // Lock is dropped here — the Opening sentinel prevents concurrent opens
             // of the same path without holding the mutex across yields.
         }
+
+        state.initial_page_size = options.page_size;
 
         // Open the database (no registry lock held; never re-consults it).
         let result = Self::do_open_async_guarded(
@@ -1509,6 +1679,7 @@ impl Database {
             )
             .into());
         };
+        state.initial_page_size = options.page_size;
         Self::do_open_async_guarded(
             state,
             io,
@@ -1568,7 +1739,7 @@ impl Database {
             native_extensions,
         );
         if result.is_err() {
-            let _ = state.schema_guard.take();
+            state.clear_open_resources();
         }
         result
     }
@@ -1613,6 +1784,7 @@ impl Database {
                         &io,
                         db_file.clone(),
                         encryption_opts.clone(),
+                        state.initial_page_size,
                         allocators.clone(),
                         page_codec.as_deref().map(PageCodec::codec_id),
                         dialect.clone(),
@@ -1659,30 +1831,32 @@ impl Database {
                             "Either WAL or MVStore must be enabled"
                         );
                     }
-                    let _ = &mut db;
+                    db.encrypted_page_one = pager.encrypted_page_one();
+                    assert!(
+                        db.pager_state.encryption_cipher() == CipherMode::None
+                            || db.encrypted_page_one.is_some()
+                    );
 
-                    // Wrap db in Arc before connecting
-                    let db = Arc::new(db);
-
-                    // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
-                    let conn = db._connect(
-                        false,
-                        Some(pager.clone()),
-                        state.encryption_key.clone(),
-                        page_codec.clone(),
-                        ConnectionContext::default(),
-                        StatsRefresh::Blocking,
-                    )?;
-
-                    // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
-                    // to ensure schema_version and make_from_btree are atomic
-                    let guard = db.schema.lock_arc();
-
-                    state.db = Some(db);
+                    state.db = Some(Arc::new(db));
                     state.pager = Some(pager);
-                    state.conn = Some(conn);
-                    state.schema_guard = Some(guard);
+                    state.phase = OpenDbAsyncPhase::Connecting;
+                }
 
+                OpenDbAsyncPhase::Connecting => {
+                    let db = state.db.as_ref().expect("database authenticated");
+                    let pager = state.pager.as_ref().expect("pager authenticated");
+                    let cache_size =
+                        return_if_io!(pager.with_header(|header| header.default_page_cache_size))
+                            .get();
+                    let conn = db.new_connection(
+                        false,
+                        pager.clone(),
+                        state.encryption_key.clone(),
+                        cache_size,
+                        ConnectionContext::default(),
+                    )?;
+                    state.schema_guard = Some(db.schema.lock_arc());
+                    state.conn = Some(conn);
                     state.phase = OpenDbAsyncPhase::ReadingHeader;
                 }
 
@@ -1792,13 +1966,16 @@ impl Database {
                         // hold it across yields. Re-entry reuses the existing
                         // connection and the persisted `BootstrapState`.
                         if state.mvcc_bootstrap_conn.is_none() {
-                            state.mvcc_bootstrap_conn = Some(db._connect(
+                            let cache_size = return_if_io!(
+                                pager.with_header(|header| header.default_page_cache_size)
+                            )
+                            .get();
+                            state.mvcc_bootstrap_conn = Some(db.new_connection(
                                 true,
-                                Some(pager.clone()),
+                                pager.clone(),
                                 state.encryption_key.clone(),
-                                page_codec.clone(),
+                                cache_size,
                                 ConnectionContext::default(),
-                                StatsRefresh::Blocking,
                             )?);
                         }
                         let conn = state.mvcc_bootstrap_conn.as_ref().expect("created above");
@@ -1950,6 +2127,18 @@ impl Database {
             )
             .into());
         }
+        if self.pager_state.encryption_cipher() == CipherMode::None && encryption_key.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "database was opened without encryption".into(),
+            )
+            .into());
+        }
+        if self.pager_state.encryption_cipher() != CipherMode::None && encryption_key.is_none() {
+            return Err(LimboError::InvalidArgument(
+                "encrypted database requires an encryption key".into(),
+            )
+            .into());
+        }
         loop {
             match st {
                 InitState::Start => {
@@ -1967,8 +2156,11 @@ impl Database {
                     // - Bytes 100+: Encrypted content
                     // The encryption context is needed to properly decrypt page 1 when reopening.
                     if let Some(key) = encryption_key {
-                        let cipher_mode = self.encryption_cipher_mode.get();
+                        let cipher_mode = self.pager_state.encryption_cipher();
                         pager.set_encryption_context(cipher_mode, key)?;
+                        if self.encrypted_page_one.is_none() && self.initialized() {
+                            pager.capture_encrypted_page_one();
+                        }
                     } else if let Some(codec) = page_codec {
                         pager.set_page_codec(codec.clone())?;
                     }
@@ -1994,10 +2186,20 @@ impl Database {
                     }
 
                     *st = InitState::ReadPage1 {
-                        pager: Box::new(pager),
+                        pager: Some(Box::new(pager)),
                     };
                 }
-                InitState::ReadPage1 { pager } => {
+                InitState::ReadPage1 { pager: init_pager } => {
+                    let pager = init_pager.as_ref().expect("pager is set in ReadPage1");
+                    match pager.validate_encryption() {
+                        Ok(IOResult::Done(())) => {}
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Err(err) => {
+                            pager.end_read_tx();
+                            return Err(err);
+                        }
+                    }
+                    pager.set_page_size(pager.get_page_size_unchecked());
                     // Read page 1 within the read transaction to determine the
                     // autovacuum mode. The read tx stays open across an IO
                     // yield here (re-entry resumes the read); we only end it
@@ -2067,9 +2269,8 @@ impl Database {
                     pager.end_read_tx();
                     pager.set_auto_vacuum_mode(mode);
 
-                    let InitState::ReadPage1 { pager } = std::mem::take(st) else {
-                        unreachable!("state is ReadPage1");
-                    };
+                    let pager = init_pager.take().expect("pager is set in ReadPage1");
+                    *st = InitState::default();
                     return Ok(IOResult::Done(*pager));
                 }
             }
@@ -2093,16 +2294,36 @@ impl Database {
     ) -> IOResultOr<Arc<Pager>> {
         loop {
             match st {
-                HeaderValidationState::Start { init } => {
+                HeaderValidationState::Start {
+                    init,
+                    wal_opened,
+                    driver,
+                } => {
+                    if !*wal_opened
+                        && self.pager_state.encryption_cipher() != CipherMode::None
+                        && self.initialized()
+                    {
+                        if driver.is_none() {
+                            *driver = Some(WalFileShared::open_shared_if_exists_begin(
+                                &self.io,
+                                &self.wal_path,
+                                self.open_flags,
+                            )?);
+                        }
+                        self.shared_wal =
+                            return_if_io!(driver.as_mut().expect("WAL driver initialized").poll());
+                        *wal_opened = true;
+                    }
                     // `_init` does not modify `open_flags` (the autovacuum
                     // override happens later in `Validate`), so capturing
                     // `is_readonly` across the `_init` yields is stable.
                     let pager =
                         return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
+                    self.buffer_pool = pager.buffer_pool.clone();
                     let log_exists =
                         journal_mode::logical_log_exists(std::path::Path::new(&self.path));
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
-                    turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
+
                     *st = HeaderValidationState::Validate {
                         pager: Box::new(pager),
                         is_readonly,
@@ -2350,7 +2571,11 @@ impl Database {
                 } => {
                     // Always open shared WAL and set it in the Database and Pager.
                     // MVCC currently requires a WAL open to function.
-                    let mut shared_wal = {
+                    let mut shared_wal = if self.pager_state.encryption_cipher() != CipherMode::None
+                        && self.initialized()
+                    {
+                        self.shared_wal.clone()
+                    } else {
                         #[cfg(not(host_shared_wal))]
                         {
                             if driver.is_none() {
@@ -2364,10 +2589,6 @@ impl Database {
                         }
                         #[cfg(host_shared_wal)]
                         {
-                            // Native-only coordination path: `io.step` pumps
-                            // synchronously here, so the blocking shims are
-                            // fine. (Driver field is unused on host.)
-                            let _ = &driver;
                             let flags = self.open_flags;
                             let shared_authority = self.open_shared_wal_coordination_for_open()?;
                             if let Some(authority) = shared_authority.as_ref() {
@@ -2387,11 +2608,17 @@ impl Database {
                                     )?
                                 }
                             } else {
-                                WalFileShared::open_shared_if_exists(
-                                    &self.io,
-                                    &self.wal_path,
-                                    flags,
-                                )?
+                                if driver.is_none() {
+                                    *driver = Some(WalFileShared::open_shared_if_exists_begin(
+                                        &self.io,
+                                        &self.wal_path,
+                                        flags,
+                                    )?);
+                                }
+                                return_if_io!(driver
+                                    .as_mut()
+                                    .expect("WAL driver initialized")
+                                    .poll())
                             }
                         }
                     };
@@ -2453,7 +2680,9 @@ impl Database {
                         self.shared_wal.read().last_checksum_and_max_frame();
                     let wal =
                         self.build_wal(last_checksum_and_max_frame, pager.buffer_pool.clone())?;
-                    pager.set_wal(wal);
+                    if pager.wal.is_none() {
+                        pager.set_wal(wal);
+                    }
 
                     // Clear page cache after attaching WAL since pages may have been cached
                     // from disk reads before WAL was attached. The WAL may contain newer
@@ -2495,10 +2724,118 @@ impl Database {
         }
     }
 
+    /// Reserves the target against encrypted or codec-backed opens, including
+    /// raw opens and filesystem aliases. Existing protected databases reject
+    /// the reservation. Keep it until all replacement writes finish; attach it
+    /// to asynchronous write completions with [`ExternalRestoreGuard::protect_completion`].
+    #[cfg(feature = "conn_raw_api")]
+    pub fn preflight_external_restore_for_path(
+        io: Arc<dyn IO>,
+        path: &str,
+    ) -> Result<ExternalRestoreGuard> {
+        let key = match io.file_id(path) {
+            Ok(id) => DatabaseKey::File(id),
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                _,
+            ))) => DatabaseKey::SharedMemory(path.to_string()),
+            Err(error) => return Err(error),
+        };
+        let target = Arc::new(ExternalRestoreTarget {
+            path: path.to_string(),
+            key: key.clone(),
+        });
+        {
+            let mut registry = EXTERNAL_RESTORE_REGISTRY.lock();
+            for protected in registry.protected_databases.keys() {
+                let protected_path = match protected {
+                    DatabaseKey::SharedMemory(path) => path.as_str(),
+                    _ => "",
+                };
+                let mut matches = target.matches(io.as_ref(), protected, protected_path)?;
+                if !matches && !protected_path.is_empty() {
+                    match io.file_id(protected_path) {
+                        Ok(id) => {
+                            matches = target.matches(
+                                io.as_ref(),
+                                &DatabaseKey::File(id),
+                                protected_path,
+                            )?
+                        }
+                        Err(LimboError::CompletionError(CompletionError::IOError(
+                            std::io::ErrorKind::NotFound,
+                            _,
+                        ))) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                if matches {
+                    return Err(LimboError::InvalidArgument("external restore is not supported with built-in encryption or an external page codec".into()));
+                }
+            }
+            registry.replacements.push(target.clone());
+        }
+        let reservation = ExternalRestoreGuard {
+            _reservation: Arc::new(ExternalRestoreReservation { target }),
+        };
+        let registry = DATABASE_MANAGER.lock();
+        let db = match registry.get(&key) {
+            Some(RegistryEntry::Opening) => return Err(LimboError::Busy),
+            Some(RegistryEntry::Ready(weak)) => weak.upgrade(),
+            None => None,
+        };
+        drop(registry);
+        if let Some(db) = db {
+            db.ensure_external_restore_supported()?;
+        }
+        Ok(reservation)
+    }
+
+    pub(crate) fn encryption_cipher(&self) -> CipherMode {
+        self.pager_state.encryption_cipher()
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn preflight_external_restore(self: &Arc<Self>) -> Result<ExternalRestorePermit> {
+        self.ensure_external_restore_supported()?;
+        let reservation = Self::preflight_external_restore_for_path(self.io.clone(), &self.path)?;
+        Ok(ExternalRestorePermit {
+            database: self.clone(),
+            mv_store: self.get_mv_store().as_ref().cloned(),
+            reservation,
+        })
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) fn validate_external_restore_permit(
+        &self,
+        permit: &ExternalRestorePermit,
+    ) -> Result<()> {
+        self.ensure_external_restore_supported()?;
+        if !std::ptr::eq(Arc::as_ptr(&permit.database), self) {
+            return Err(LimboError::InvalidArgument(
+                "external restore permit belongs to another database".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn ensure_external_restore_supported(&self) -> Result<()> {
+        if self.encryption_cipher() != CipherMode::None || self.page_codec_id.is_some() {
+            return Err(LimboError::InvalidArgument("external restore is not supported with built-in encryption or an external page codec".into()));
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "conn_raw_api")]
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
-    pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
+    pub fn reload_wal_after_external_restore(
+        self: &Arc<Self>,
+        permit: &ExternalRestorePermit,
+    ) -> Result<()> {
+        self.validate_external_restore_permit(permit)?;
         if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
                 "reloading a WAL after external restore is not supported with an external page codec"
@@ -2555,14 +2892,8 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
-            let mvcc_bootstrap_conn = self._connect(
-                true,
-                None,
-                None,
-                None,
-                ConnectionContext::default(),
-                StatsRefresh::Blocking,
-            )?;
+            let mvcc_bootstrap_conn =
+                self._connect(true, None, None, None, ConnectionContext::default())?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -2621,67 +2952,74 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            opts.encryption_key,
-            opts.page_codec,
-            context,
-            StatsRefresh::Blocking,
-        )
+        self._connect(false, None, opts.encryption_key, opts.page_codec, context)
     }
 
-    /// Non-blocking [`Self::connect`].
-    ///
-    /// Creating the connection itself never waits, but the connect-time
-    /// ANALYZE stats refresh runs a `SELECT` over `sqlite_stat1`, and that
-    /// statement can have to wait: on page I/O, or on another transaction
-    /// (a read that speculatively saw a version whose writer is still
-    /// preparing waits for that writer at its own commit). `connect` pumps
-    /// `io.step()` until the statement finishes, which is only correct when
-    /// the other transaction can make progress on its own. In a host that
-    /// schedules every connection cooperatively on one thread it cannot:
-    /// the wait is an explicit yield asking the host to run *other*
-    /// connections, and `io.step()` never does that, so `connect` spins.
-    ///
-    /// This variant hands every wait back to the caller as
-    /// `IOResult::IO(..)`. Drive it like `open_async`: on `IO`, run the host
-    /// scheduler if the completion is an explicit yield, wait for the
-    /// completion, then call again with the same `state`. The stats refresh
-    /// stays best-effort: a failure to prepare or scan `sqlite_stat1` is
-    /// logged and the connection is returned without stats.
-    ///
-    /// Only the first call, which creates the connection, uses `opts`; later
-    /// calls with the same `state` only resume the stats refresh.
+    /// Creates a connection, returning every initialization and statistics I/O wait to the caller.
     pub fn connect_async(
         self: &Arc<Database>,
         opts: ConnectOpts,
         state: &mut ConnectAsyncState,
     ) -> IOResultOr<Arc<Connection>> {
-        let conn = match &state.conn {
-            Some(conn) => conn.clone(),
-            None => {
-                let conn = self._connect(
-                    false,
-                    None,
-                    opts.encryption_key,
-                    opts.page_codec,
-                    ConnectionContext::default(),
-                    StatsRefresh::Deferred,
-                )?;
-                state.conn = Some(conn.clone());
-                conn
+        let result = (|| {
+            if matches!(state.phase, ConnectAsyncPhase::Start) {
+                self.validate_page_codec(opts.page_codec.as_deref())?;
+                state.phase = ConnectAsyncPhase::Initialize {
+                    opts,
+                    init: InitState::default(),
+                };
             }
-        };
-        match refresh_analyze_stats_nonblock(&conn, &mut state.refresh) {
-            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-            Ok(IOResult::Done(())) => {}
-            Err(err) => {
-                tracing::warn!("Failed to refresh analyze stats on connect: {err}");
+            loop {
+                match &mut state.phase {
+                    ConnectAsyncPhase::Start => unreachable!(),
+                    ConnectAsyncPhase::Initialize { opts, init } => {
+                        let pager = return_if_io!(self._init_nonblock(
+                            init,
+                            opts.encryption_key.as_ref(),
+                            opts.page_codec.as_ref()
+                        ));
+                        state.phase = ConnectAsyncPhase::Header {
+                            key: opts.encryption_key.take(),
+                            pager: Arc::new(pager),
+                        };
+                    }
+                    ConnectAsyncPhase::Header { key, pager } => {
+                        return_if_io!(pager.validate_encryption());
+                        let cache_size = return_if_io!(
+                            pager.with_header(|header| header.default_page_cache_size)
+                        )
+                        .get();
+                        let conn = self.new_connection(
+                            false,
+                            pager.clone(),
+                            key.take(),
+                            cache_size,
+                            ConnectionContext::default(),
+                        )?;
+                        state.phase = ConnectAsyncPhase::Refresh {
+                            conn,
+                            refresh: RefreshAnalyzeStatsState::default(),
+                        };
+                    }
+                    ConnectAsyncPhase::Refresh { conn, refresh } => {
+                        match refresh_analyze_stats_nonblock(conn, refresh) {
+                            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                            Ok(IOResult::Done(())) => {}
+                            Err(err) => {
+                                tracing::warn!("Failed to refresh analyze stats on connect: {err}")
+                            }
+                        }
+                        let conn = conn.clone();
+                        *state = ConnectAsyncState::default();
+                        return Ok(IOResult::Done(conn));
+                    }
+                }
             }
+        })();
+        if result.is_err() {
+            *state = ConnectAsyncState::default();
         }
-        *state = ConnectAsyncState::default();
-        Ok(IOResult::Done(conn))
+        result
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2692,7 +3030,6 @@ impl Database {
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
         context: ConnectionContext,
-        stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
             return Err(LimboError::InvalidArgument(
@@ -2716,8 +3053,7 @@ impl Database {
         };
         let default_cache_size = pager
             .io
-            .block(|| pager.with_header(|header| header.default_page_cache_size))
-            .unwrap_or_default()
+            .block(|| pager.with_header(|header| header.default_page_cache_size))?
             .get();
 
         let conn = self.new_connection(
@@ -2727,9 +3063,7 @@ impl Database {
             default_cache_size,
             context,
         )?;
-        if stats == StatsRefresh::Blocking {
-            refresh_analyze_stats(&conn);
-        }
+        refresh_analyze_stats(&conn);
         Ok(conn)
     }
 
@@ -2754,8 +3088,8 @@ impl Database {
         Ok(conn)
     }
 
-    /// Build the `Connection` object. Does not touch the database: the
-    /// ANALYZE stats refresh is the caller's job, blocking or not.
+    /// Build the `Connection` object. The ANALYZE stats refresh is the caller's job,
+    /// blocking or not.
     fn new_connection(
         self: &Arc<Database>,
         is_mvcc_bootstrap_connection: bool,
@@ -2764,13 +3098,22 @@ impl Database {
         default_cache_size: i32,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
-        let encryption_cipher = self.encryption_cipher_mode.get();
+        match pager.validate_encryption().map_err(|error| *error)? {
+            IOResult::Done(()) => {}
+            IOResult::IO(_) => {
+                return Err(LimboError::InternalError(
+                    "connection pager has not completed authentication".into(),
+                ))
+            }
+        }
+        self.pager_state.connection_cipher(&pager)?;
+        let schema = self.schema_for_pager(&pager);
         let conn = Arc::new(Connection {
             db: self.clone(),
             context: context.value,
             hooks: context.hooks,
             pager: ArcSwap::new(pager),
-            schema: RwLock::new(self.schema.lock().clone()),
+            schema: RwLock::new(schema),
             database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
@@ -2821,8 +3164,7 @@ impl Database {
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
-            encryption_key: RwLock::new(encryption_key),
-            encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
+            encryption_key,
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
@@ -2868,6 +3210,20 @@ impl Database {
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
         Ok(conn)
+    }
+
+    pub(crate) fn schema_for_pager(&self, pager: &Pager) -> Arc<Schema> {
+        let schema = self.schema.lock();
+        if pager.can_share_schema() {
+            return schema.clone();
+        }
+        let mut empty = Schema::with_options(
+            self.experimental_custom_types_enabled(),
+            self.dialect.as_ref(),
+        )
+        .expect("built-in type definitions are malformed");
+        empty.copy_table_valued_functions(&schema);
+        Arc::new(empty)
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -3361,50 +3717,54 @@ impl Database {
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
     ) -> IOResultOr<Pager> {
-        let cipher = self.encryption_cipher_mode.get();
+        let cipher = self.pager_state.encryption_cipher();
         let encrypted = encryption_key.is_some() || !matches!(cipher, CipherMode::None);
 
         // For an existing (initialized) database, read the 512-byte header
         // once (non-blocking) and recover both the reserved-space byte and the
         // on-disk page size from it.
-        let (header_reserved_bytes, header_page_size) = if self.initialized() {
-            let header = return_if_io!(self.read_db_header_buf(hdr_st));
-            if let Some(codec) = page_codec {
-                // A codec may transform the magic bytes, so a short codec
-                // file cannot be judged here.
-                if let Some(err) = header.short_read() {
-                    return Err(err.into());
+        let frozen_size = self.pager_state.page_size();
+        let (header_reserved_bytes, header_page_size) =
+            if cipher != CipherMode::None && frozen_size.is_some() {
+                (Some(cipher.metadata_size() as u8), frozen_size)
+            } else if self.initialized() {
+                let header = return_if_io!(self.read_db_header_buf(hdr_st));
+                if let Some(codec) = page_codec {
+                    // A codec may transform the magic bytes, so a short codec
+                    // file cannot be judged here.
+                    if let Some(err) = header.short_read() {
+                        return Err(err.into());
+                    }
+                    let header_info = codec.bootstrap_page_info(header.bytes())?;
+                    let page_size_u32 = u32::try_from(header_info.page_size).map_err(|_| {
+                        LimboError::InvalidArgument(format!(
+                            "page codec reported invalid page size {}",
+                            header_info.page_size
+                        ))
+                    })?;
+                    let Some(page_size) = PageSize::new(page_size_u32) else {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "page codec reported invalid page size {}",
+                            header_info.page_size
+                        ))
+                        .into());
+                    };
+                    if !page_size.has_valid_reserved_space(header_info.reserved_space) {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "page codec reported invalid reserved space {} for page size {}",
+                            header_info.reserved_space,
+                            page_size.get()
+                        ))
+                        .into());
+                    }
+                    (Some(header_info.reserved_space), Some(page_size))
+                } else {
+                    let (reserved, page_size) = Self::plain_header_page_info(&header, encrypted)?;
+                    (Some(reserved), Some(page_size))
                 }
-                let header_info = codec.bootstrap_page_info(header.bytes())?;
-                let page_size_u32 = u32::try_from(header_info.page_size).map_err(|_| {
-                    LimboError::InvalidArgument(format!(
-                        "page codec reported invalid page size {}",
-                        header_info.page_size
-                    ))
-                })?;
-                let Some(page_size) = PageSize::new(page_size_u32) else {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "page codec reported invalid page size {}",
-                        header_info.page_size
-                    ))
-                    .into());
-                };
-                if !page_size.has_valid_reserved_space(header_info.reserved_space) {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "page codec reported invalid reserved space {} for page size {}",
-                        header_info.reserved_space,
-                        page_size.get()
-                    ))
-                    .into());
-                }
-                (Some(header_info.reserved_space), Some(page_size))
             } else {
-                let (reserved, page_size) = Self::plain_header_page_info(&header, encrypted)?;
-                (Some(reserved), Some(page_size))
-            }
-        } else {
-            (None, None)
-        };
+                (None, None)
+            };
         if let (Some(codec), Some(reserved_bytes)) = (page_codec, header_reserved_bytes) {
             let required_reserved_bytes = codec.required_reserved_bytes();
             if reserved_bytes != required_reserved_bytes {
@@ -3434,7 +3794,12 @@ impl Database {
         let page_size =
             self.determine_actual_page_size(&shared_wal, requested_page_size, header_page_size)?;
 
-        let buffer_pool = self.buffer_pool.clone();
+        let buffer_pool =
+            if cipher != CipherMode::None && self.initialized() && frozen_size.is_none() {
+                BufferPool::begin_init(&self.io, BufferPool::DEFAULT_ARENA_SIZE)
+            } else {
+                self.buffer_pool.clone()
+            };
         if self.initialized() {
             buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
         }
@@ -3457,9 +3822,15 @@ impl Database {
             self.pager_state.clone(),
         )?;
         if self.initialized() {
-            pager.set_page_size(page_size);
+            pager.stage_page_size(page_size);
         }
         if let Some(reserved_bytes) = reserved_bytes {
+            if cipher != CipherMode::None && reserved_bytes as usize != cipher.metadata_size() {
+                return Err(LimboError::InvalidArgument(
+                    "encryption cipher does not match the database reserved bytes".into(),
+                )
+                .into());
+            }
             pager.set_reserved_space_bytes(reserved_bytes);
         }
         if disable_checksums {
@@ -3471,10 +3842,6 @@ impl Database {
 
     /// Recovers the page size and reserved-space byte from a database header
     /// that is not handled by a page codec.
-    ///
-    /// The magic bytes are not judged here: an encrypted database carries the
-    /// Turso prefix instead, and its key may arrive only after connect (PRAGMA
-    /// key). The magic is checked at open validation, where the key is known.
     fn plain_header_page_info(header: &DbHeaderRead, encrypted: bool) -> Result<(u8, PageSize)> {
         // SQLite zero-fills a file shorter than a page before judging its
         // header (btree.c lockBtree), so a short file is judged the same way.
@@ -3696,6 +4063,26 @@ impl Database {
     }
 }
 
+#[cfg(feature = "conn_raw_api")]
+impl ExternalRestoreTarget {
+    fn matches(&self, io: &dyn IO, key: &DatabaseKey, path: &str) -> Result<bool> {
+        if self.path == path || &self.key == key {
+            return Ok(true);
+        }
+        let DatabaseKey::File(id) = key else {
+            return Ok(false);
+        };
+        match io.file_id(&self.path) {
+            Ok(current) => Ok(current == *id),
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                _,
+            ))) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 pub(crate) struct AttachedDatabase {
     pub(crate) db: Arc<Database>,
     pub(crate) pager: Arc<Pager>,
@@ -3814,6 +4201,93 @@ mod database_tests {
         assert!(is_memory_like(""));
         assert!(!is_memory_like("memory.db"));
         assert!(!is_memory_like("file:memory.db"));
+    }
+
+    #[test]
+    fn new_connection_rejects_a_pager_without_a_key() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let db = Database::open(
+            io.clone(),
+            ":memory:publication",
+            OpenOptions::new(Arc::new(EngineDialect))
+                .db_opts(DatabaseOpts::new().with_encryption(true))
+                .encryption(EncryptionOpts {
+                    cipher: "aegis256".into(),
+                    hexkey: "01".repeat(32),
+                }),
+        )
+        .unwrap();
+        let mut state = super::DbHeaderReadState::default();
+        let pager =
+            crate::util::IOExt::block(io.as_ref(), || db.init_pager(None, &mut state, None, None))
+                .unwrap();
+        assert!(db
+            .new_connection(
+                false,
+                Arc::new(pager),
+                None,
+                0,
+                super::ConnectionContext::default()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn new_connection_authenticates_the_pagers_own_key() {
+        for (byte, accepted) in [(1, true), (2, false)] {
+            let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+            let db = Database::open(
+                io.clone(),
+                ":memory:publication-key",
+                OpenOptions::new(Arc::new(EngineDialect))
+                    .db_opts(DatabaseOpts::new().with_encryption(true))
+                    .encryption(EncryptionOpts {
+                        cipher: "aegis256".into(),
+                        hexkey: "01".repeat(32),
+                    }),
+            )
+            .unwrap();
+            let key = EncryptionKey::new_256([byte; 32]);
+            let mut state = super::DbHeaderReadState::default();
+            let pager = crate::util::IOExt::block(io.as_ref(), || {
+                db.init_pager(None, &mut state, Some(&key), None)
+            })
+            .unwrap();
+            pager.enable_encryption(true);
+            pager
+                .set_encryption_context(crate::CipherMode::Aegis256, &key)
+                .unwrap();
+            assert_eq!(
+                db.new_connection(
+                    false,
+                    Arc::new(pager),
+                    Some(key),
+                    0,
+                    super::ConnectionContext::default()
+                )
+                .is_ok(),
+                accepted
+            );
+        }
+    }
+
+    #[test]
+    fn pager_cannot_change_the_database_encryption_identity() {
+        let db = Database::open(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:immutable",
+            OpenOptions::new(Arc::new(EngineDialect))
+                .db_opts(DatabaseOpts::new().with_encryption(true)),
+        )
+        .unwrap();
+        let pager = db._init(None, None).unwrap();
+        assert!(pager
+            .set_encryption_context(
+                crate::CipherMode::Aegis256,
+                &EncryptionKey::new_256([1; 32])
+            )
+            .is_err());
+        assert_eq!(db.encryption_cipher(), crate::CipherMode::None);
     }
 
     #[cfg(feature = "fs")]
@@ -5310,7 +5784,7 @@ mod database_tests {
             err,
             LimboError::InvalidArgument(message)
                 if message
-                    == "cannot configure built-in encryption while an external page codec is installed"
+                    == "encryption must be configured when opening the database"
         ));
     }
 

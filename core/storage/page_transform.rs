@@ -2,7 +2,7 @@ use std::any::Any;
 
 use crate::storage::checksum::ChecksumContext;
 use crate::storage::encryption::EncryptionContext;
-use crate::sync::Arc;
+use crate::sync::{Arc, Mutex};
 use crate::{CompletionError, LimboError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +126,13 @@ impl dyn PageCodec {
 }
 
 pub(crate) fn page_codec_from_encryption(context: EncryptionContext) -> Arc<dyn PageCodec> {
-    Arc::new(EncryptionPageCodec::new(context))
+    Arc::new(EncryptionPageCodec::new(context, false))
+}
+
+pub(crate) fn page_codec_from_encryption_for_open(
+    context: EncryptionContext,
+) -> Arc<dyn PageCodec> {
+    Arc::new(EncryptionPageCodec::new(context, true))
 }
 
 pub(crate) fn page_codec_encryption_context(codec: &dyn PageCodec) -> Option<&EncryptionContext> {
@@ -134,6 +140,15 @@ pub(crate) fn page_codec_encryption_context(codec: &dyn PageCodec) -> Option<&En
         .as_any()
         .downcast_ref::<EncryptionPageCodec>()
         .map(|codec| &codec.context)
+}
+
+pub(crate) fn encrypted_page_one(codec: &dyn PageCodec) -> Option<Arc<[u8]>> {
+    codec
+        .as_any()
+        .downcast_ref::<EncryptionPageCodec>()?
+        .page_one
+        .lock()
+        .clone()
 }
 
 pub(crate) fn page_codec_completion_error(
@@ -149,11 +164,17 @@ pub(crate) fn page_codec_completion_error(
 
 struct EncryptionPageCodec {
     context: EncryptionContext,
+    page_one: Mutex<Option<Arc<[u8]>>>,
+    capture_page_one: bool,
 }
 
 impl EncryptionPageCodec {
-    fn new(context: EncryptionContext) -> Self {
-        Self { context }
+    fn new(context: EncryptionContext, capture_page_one: bool) -> Self {
+        Self {
+            context,
+            capture_page_one,
+            page_one: Mutex::new(None),
+        }
     }
 }
 
@@ -188,7 +209,35 @@ impl PageCodec for EncryptionPageCodec {
     ) -> Result<()> {
         // todo(v): once we have in place encryption, we can avoid allocations here
         let decrypted = self.context.decrypt_page(input, context.page_no as usize)?;
+        if context.page_no == 1 {
+            self.validate_page_one_layout(input)?;
+            if self.capture_page_one {
+                *self.page_one.lock() = Some(Arc::from(input));
+            }
+        }
         output.copy_from_slice(&decrypted);
+        Ok(())
+    }
+}
+
+impl EncryptionPageCodec {
+    fn validate_page_one_layout(&self, page: &[u8]) -> Result<()> {
+        if page.len() < super::sqlite3_ondisk::DatabaseHeader::SIZE {
+            return Err(LimboError::InvalidArgument(
+                "encrypted page 1 is shorter than its header".into(),
+            ));
+        }
+        let size = super::sqlite3_ondisk::PageSize::new_from_header_u16(u16::from_be_bytes([
+            page[16], page[17],
+        ]))?;
+        if size.get() as usize != self.context.page_size()
+            || page.len() != self.context.page_size()
+            || page[20] != self.required_reserved_bytes()
+        {
+            return Err(LimboError::InvalidArgument(
+                "encrypted page layout does not match the cipher".into(),
+            ));
+        }
         Ok(())
     }
 }

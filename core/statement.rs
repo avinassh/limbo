@@ -1013,7 +1013,18 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
-        if conn.get_auto_commit() && !conn.schema_reparse_in_progress() {
+        let cmd = match &self.reprepare_cmd {
+            Some(cmd) => cmd.clone(),
+            None => {
+                let (cmd, _) = conn.parse_sql(&self.program.sql)?;
+                cmd.expect("Same SQL string should be able to be parsed")
+            }
+        };
+        conn.validate_encryption_for_command(&cmd)?;
+        if conn.get_auto_commit()
+            && !conn.schema_reparse_in_progress()
+            && self.pager.can_share_schema()
+        {
             conn.maybe_reparse_schema()?;
         }
 
@@ -1023,14 +1034,6 @@ impl Statement {
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
-            let cmd = match &self.reprepare_cmd {
-                Some(cmd) => cmd.clone(),
-                None => {
-                    let (cmd, _) = conn.parse_sql(&self.program.sql)?;
-                    cmd.expect("Same SQL string should be able to be parsed")
-                }
-            };
-
             let syms = conn.syms.read();
             let mode = self.query_mode;
             #[cfg(debug_assertions)]

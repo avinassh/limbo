@@ -1577,26 +1577,113 @@ impl Savepoint {
 pub struct SharedPagerState {
     init_lock: Mutex<()>,
     init_page_1: ArcSwapOption<Page>,
+    allocate_page1_state: RwLock<AllocatePage1State>,
+    encryption_cipher: CipherMode,
+    encrypted_init_page_1: Option<Arc<[u8]>>,
     page_size: AtomicU32,
 }
 
 impl SharedPagerState {
     pub fn new(init_page_1: Option<PageRef>) -> Self {
+        Self::with_encryption(init_page_1, CipherMode::None, None)
+            .expect("plaintext pager initialization is infallible")
+    }
+
+    pub(crate) fn with_encryption(
+        init_page_1: Option<PageRef>,
+        cipher: CipherMode,
+        key: Option<&EncryptionKey>,
+    ) -> Result<Self> {
         let page_size = init_page_1.as_ref().map_or(0, |page| {
             let contents = page.get_contents();
             bytemuck::from_bytes::<DatabaseHeader>(&contents.as_ptr()[0..DatabaseHeader::SIZE])
                 .page_size
                 .get()
         });
-        Self {
+        let allocate_page1_state = if init_page_1.is_some() {
+            AllocatePage1State::Start
+        } else {
+            AllocatePage1State::Done
+        };
+        let encrypted_init_page_1 = if cipher != CipherMode::None {
+            match init_page_1.as_ref() {
+                Some(page) => {
+                    let context = EncryptionContext::new(
+                        cipher,
+                        key.expect("encrypted pager initialization requires a key"),
+                        page_size as usize,
+                    )?;
+                    Some(
+                        context
+                            .encrypt_page(page.get_contents().as_ptr(), 1)?
+                            .into(),
+                    )
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        Ok(Self {
             init_lock: Mutex::new(()),
             init_page_1: ArcSwapOption::new(init_page_1),
+            allocate_page1_state: RwLock::new(allocate_page1_state),
+            encryption_cipher: cipher,
+            encrypted_init_page_1,
             page_size: AtomicU32::new(page_size),
+        })
+    }
+
+    pub(crate) fn encryption_cipher(&self) -> CipherMode {
+        self.encryption_cipher
+    }
+
+    pub(crate) fn page_size(&self) -> Option<PageSize> {
+        PageSize::new(self.page_size.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn connection_cipher(&self, pager: &Pager) -> Result<CipherMode> {
+        if !pager.can_share_schema() {
+            return Err(LimboError::InvalidArgument(
+                "encrypted database requires an encryption key".to_string(),
+            ));
         }
+        Ok(self.encryption_cipher)
     }
 
     pub(crate) fn initialized(&self) -> bool {
-        self.init_page_1.load().is_none()
+        #[cfg(shuttle)]
+        crate::sync::encryption_schedule_point(true);
+        let initialized = self.init_page_1.load().is_none();
+        #[cfg(shuttle)]
+        {
+            crate::thread::yield_now();
+            crate::sync::encryption_schedule_point(false);
+        }
+        initialized
+    }
+
+    fn initial_page_1(&self) -> Option<PageRef> {
+        #[cfg(shuttle)]
+        crate::sync::encryption_schedule_point(true);
+        let page = self.init_page_1.load_full();
+        #[cfg(shuttle)]
+        {
+            crate::thread::yield_now();
+            crate::sync::encryption_schedule_point(false);
+        }
+        page
+    }
+
+    fn set_initial_page_1(&self, page: Option<PageRef>) {
+        #[cfg(shuttle)]
+        crate::sync::encryption_schedule_point(true);
+        self.init_page_1.store(page);
+        #[cfg(shuttle)]
+        {
+            crate::thread::yield_now();
+            crate::sync::encryption_schedule_point(false);
+        }
     }
 
     pub(crate) fn is_init_locked(&self) -> bool {
@@ -1646,8 +1733,6 @@ pub struct Pager {
     auto_vacuum_mode: AtomicU8,
     /// The state of the current allocate page operation.
     allocate_page_state: RwLock<AllocatePageState>,
-    /// The state of the current allocate page1 operation.
-    allocate_page1_state: RwLock<AllocatePage1State>,
     /// Cache reserved_space at Pager init and reuse for subsequent
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
@@ -1668,6 +1753,9 @@ pub struct Pager {
     #[cfg(feature = "autovacuum")]
     vacuum_state: RwLock<VacuumState>,
     pub(crate) io_ctx: RwLock<IOContext>,
+    staged_page_size: AtomicU32,
+    encryption_verified: AtomicBool,
+    encryption_validation: Mutex<EncryptionValidationState>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
     /// Whether this pager holds an ephemeral table or index, whose file no
@@ -1831,15 +1919,29 @@ enum AllocatePageState {
 #[derive(Clone)]
 enum AllocatePage1State {
     Start,
+    Retry,
     Writing {
         page: PageRef,
+        completion: Completion,
     },
     /// Fsyncing the freshly written page 1 to the main database file, so a
     /// WAL can never exist next to an empty (0-byte on disk) database file.
     Syncing {
         page: PageRef,
+        completion: Completion,
     },
     Done,
+}
+
+#[derive(Clone, Default)]
+enum EncryptionValidationState {
+    #[default]
+    Start,
+    Reading {
+        page: PageRef,
+        completion: Completion,
+        end_read_tx: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1931,11 +2033,6 @@ impl Pager {
         buffer_pool: Arc<BufferPool>,
         shared: Arc<SharedPagerState>,
     ) -> Result<Self> {
-        let allocate_page1_state = if shared.init_page_1.load().is_some() {
-            RwLock::new(AllocatePage1State::Start)
-        } else {
-            RwLock::new(AllocatePage1State::Done)
-        };
         Ok(Self {
             db_file,
             wal,
@@ -1963,7 +2060,6 @@ impl Pager {
             checkpoint_state: RwLock::new(CheckpointState::default()),
             buffer_pool,
             auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
-            allocate_page1_state,
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
             free_page_state: RwLock::new(FreePageState::Start),
@@ -1979,6 +2075,9 @@ impl Pager {
                 btree_create_vacuum_full_state: BtreeCreateVacuumFullState::Start,
             }),
             io_ctx: RwLock::new(IOContext::default()),
+            staged_page_size: AtomicU32::new(0),
+            encryption_verified: AtomicBool::new(false),
+            encryption_validation: Mutex::new(EncryptionValidationState::Start),
             enable_encryption: AtomicBool::new(false),
             ephemeral: AtomicBool::new(false),
             shared,
@@ -2149,7 +2248,7 @@ impl Pager {
             match state {
                 HeaderRefState::Start => {
                     // If db is not initialized, return the in-memory page
-                    if let Some(page1) = self.shared.init_page_1.load_full() {
+                    if let Some(page1) = self.shared.initial_page_1() {
                         return Ok(IOResult::Done(page1));
                     }
 
@@ -2178,6 +2277,20 @@ impl Pager {
                         page.get().id() == DatabaseHeader::PAGE_ID,
                         "incorrect header page id"
                     );
+                    if !page.has_wal_tag() && !page.is_dirty() {
+                        let contents = page.get_contents();
+                        let mut header = *bytemuck::from_bytes::<DatabaseHeader>(
+                            &contents.as_ptr()[..DatabaseHeader::SIZE],
+                        );
+                        if header.database_size.get() == 0 {
+                            let page_size = u64::from(self.get_page_size_unchecked().get());
+                            let file_pages = self.db_file.size()?.div_ceil(page_size);
+                            header.database_size = u32::try_from(file_pages)
+                                .map_err(|_| LimboError::IntegerOverflow)?
+                                .into();
+                            contents.write_database_header(&header);
+                        }
+                    }
                     *self.header_ref_state.write() = HeaderRefState::Start;
                     return Ok(IOResult::Done(page));
                 }
@@ -2710,16 +2823,10 @@ impl Pager {
                 })
             })?;
         } else {
-            let IOResult::Done(_) = self.with_header_mut(|header| {
+            self.update_initial_header(|header| {
                 header.vacuum_mode_largest_root_page = largest_root_page.into();
                 header.incremental_vacuum_enabled = incremental_vacuum_enabled.into();
-            })?
-            else {
-                panic!("fresh database auto-vacuum setup should not do any IO");
-            };
-            // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
-            // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
-            self.dirty_pages.write().clear();
+            })?;
         }
 
         self.set_auto_vacuum_mode(mode);
@@ -3113,9 +3220,22 @@ impl Pager {
     }
 
     /// Set the page size of an empty database for all of its pagers. Does nothing once page 1 exists.
-    pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
+    pub(crate) fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
+        if self.encryption_cipher() != CipherMode::None {
+            if self.get_page_size_unchecked() == size {
+                return Ok(());
+            }
+            return Err(LimboError::InvalidArgument(
+                "encrypted database page size is fixed when opening the database".into(),
+            ));
+        }
         let _lock = self.shared.init_lock.lock();
-        if self.db_initialized() {
+        if self.db_initialized()
+            || !matches!(
+                *self.shared.allocate_page1_state.read(),
+                AllocatePage1State::Start
+            )
+        {
             return Ok(());
         }
         if let Some(codec) = self.page_codec_external() {
@@ -3151,7 +3271,7 @@ impl Pager {
             (size.get() - header.reserved_space as u32) as usize,
         );
 
-        self.shared.init_page_1.store(Some(page));
+        self.shared.set_initial_page_1(Some(page));
         self.set_page_size(size);
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
@@ -3168,10 +3288,15 @@ impl Pager {
     ///
     /// This is a no-op when encryption is not configured.
     fn reset_page_size_in_encryption_ctx(&self, size: PageSize) {
-        self.io_ctx.write().reset_page_size_in_encryption_ctx(size);
-        if !self.is_encryption_ctx_set() {
+        if self
+            .io_ctx
+            .read()
+            .encryption_context()
+            .is_none_or(|context| context.page_size() == size.get() as usize)
+        {
             return;
         }
+        self.io_ctx.write().reset_page_size_in_encryption_ctx(size);
         if let Some(wal) = self.wal.as_ref() {
             wal.set_io_context(self.io_ctx.read().clone());
         }
@@ -3179,24 +3304,50 @@ impl Pager {
 
     /// Set the initial journal version in page 1 before the database is initialized.
     pub fn set_initial_journal_version(&self, version: sqlite3_ondisk::Version) -> Result<()> {
-        turso_assert!(!self.db_initialized());
         let raw_version = sqlite3_ondisk::RawVersion::from(version);
-        let IOResult::Done(_) = self.with_header_mut(|header| {
+        self.update_initial_header(|header| {
             header.read_version = raw_version;
             header.write_version = raw_version;
-        })?
-        else {
-            panic!("DB should not be initialized and should not do any IO");
-        };
-        // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
-        // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
-        self.dirty_pages.write().clear();
+        })
+    }
+
+    fn update_initial_header(&self, change: impl FnOnce(&mut DatabaseHeader)) -> Result<()> {
+        let _lock = self.shared.init_lock.lock();
+        if self.db_initialized()
+            || !matches!(
+                *self.shared.allocate_page1_state.read(),
+                AllocatePage1State::Start
+            )
+        {
+            return Err(LimboError::Busy);
+        }
+        let original = self
+            .shared
+            .initial_page_1()
+            .expect("uninitialized database has page 1");
+        let contents = original.get_contents();
+        let buffer = Arc::new(Buffer::new_temporary(contents.as_ptr().len()));
+        buffer.as_mut_slice().copy_from_slice(contents.as_ptr());
+        let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
+        page.get().set_buffer(buffer);
+        let mut header = *bytemuck::from_bytes::<DatabaseHeader>(
+            &page.get_contents().as_ptr()[..DatabaseHeader::SIZE],
+        );
+        change(&mut header);
+        page.get_contents().write_database_header(&header);
+        page.set_loaded();
+        self.shared.set_initial_page_1(Some(page));
         Ok(())
     }
 
     /// Get the current page size. Returns None if not set yet.
     pub fn get_page_size(&self) -> Option<PageSize> {
-        let value = self.shared.page_size.load(Ordering::SeqCst);
+        let value = self.staged_page_size.load(Ordering::SeqCst);
+        let value = if value == 0 {
+            self.shared.page_size.load(Ordering::SeqCst)
+        } else {
+            value
+        };
         if value == 0 {
             None
         } else {
@@ -3206,9 +3357,7 @@ impl Pager {
 
     /// Get the current page size, panicking if not set.
     pub fn get_page_size_unchecked(&self) -> PageSize {
-        let value = self.shared.page_size.load(Ordering::SeqCst);
-        turso_assert_ne!(value, 0);
-        PageSize::new(value).expect("invalid page size stored")
+        self.get_page_size().expect("page size must be initialized")
     }
 
     pub(crate) fn has_wal(&self) -> bool {
@@ -3224,8 +3373,17 @@ impl Pager {
     }
 
     /// Set the page size. Used internally when page size is determined.
-    pub fn set_page_size(&self, size: PageSize) {
+    pub(crate) fn set_page_size(&self, size: PageSize) {
+        let current = self.shared.page_size.load(Ordering::SeqCst);
+        assert!(
+            self.encryption_cipher() == CipherMode::None || current == 0 || current == size.get()
+        );
         self.shared.page_size.store(size.get(), Ordering::SeqCst);
+        self.staged_page_size.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn stage_page_size(&self, size: PageSize) {
+        self.staged_page_size.store(size.get(), Ordering::SeqCst);
     }
 
     /// Get the current reserved space. Returns None if not set yet.
@@ -3239,7 +3397,11 @@ impl Pager {
     }
 
     /// Set the reserved space. Must fit in u8.
-    pub fn set_reserved_space(&self, space: u8) {
+    pub(crate) fn set_reserved_space(&self, space: u8) {
+        assert!(
+            self.encryption_cipher() == CipherMode::None
+                || space as usize == self.encryption_cipher().metadata_size()
+        );
         self.reserved_space.store(space as u16, Ordering::SeqCst);
     }
 
@@ -3327,12 +3489,9 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn maybe_allocate_page1(&self) -> IOResultOr<()> {
         if !self.db_initialized() {
-            if let Some(_lock) = self.shared.init_lock.try_lock() {
-                return Ok(self.allocate_page1()?.map(|_| ()));
-            }
-            // Give a chance for the allocation to happen elsewhere
-            io_yield_one!(Completion::new_yield());
+            return_if_io!(self.allocate_page1());
         }
+        return_if_io!(self.validate_encryption());
         Ok(IOResult::Done(()))
     }
 
@@ -4889,6 +5048,9 @@ impl Pager {
         id = "wal_insert_frame_marks_cached_page_with_frame_number"
     )]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
+        if self.encryption_cipher() != CipherMode::None || self.has_external_page_codec() {
+            return Err(LimboError::InvalidArgument("external restore is not supported with built-in encryption or an external page codec".into()));
+        }
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("wal_insert_frame() called on database without WAL");
             return Err(LimboError::InternalError(
@@ -5708,11 +5870,27 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn allocate_page1(&self) -> IOResultOr<PageRef> {
-        let state = self.allocate_page1_state.read().clone();
+        return_if_io!(self.validate_encryption());
+        let Some(_lock) = self.shared.init_lock.try_lock() else {
+            io_yield_one!(Completion::new_yield());
+        };
+        if self.db_initialized() {
+            return self.read_header_page();
+        }
+        let state = self.shared.allocate_page1_state.read().clone();
         match state {
-            AllocatePage1State::Start => {
+            AllocatePage1State::Start | AllocatePage1State::Retry => {
                 turso_assert!(!self.db_initialized());
                 tracing::trace!("allocate_page1(Start)");
+                self.reset_page_size_in_encryption_ctx(self.get_page_size_unchecked());
+                if self.shared.encryption_cipher() != CipherMode::None
+                    && !self.is_encryption_ctx_set()
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "encrypted database requires an encryption key".to_string(),
+                    )
+                    .into());
+                }
 
                 let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
                     panic!("DB should not be initialized and should not do any IO");
@@ -5738,6 +5916,7 @@ impl Pager {
                     default_header.reserved_space
                 );
 
+                *self.shared.allocate_page1_state.write() = AllocatePage1State::Retry;
                 self.buffer_pool
                     .finalize_with_page_size(default_header.page_size.get() as usize)?;
                 let page = allocate_new_page(1, &self.buffer_pool);
@@ -5767,10 +5946,21 @@ impl Pager {
 
                 // Pin page1 to prevent eviction while stored in state machine
                 page1.pin();
-                *self.allocate_page1_state.write() = AllocatePage1State::Writing { page: page1 };
+                *self.shared.allocate_page1_state.write() = AllocatePage1State::Writing {
+                    page: page1,
+                    completion: c.clone(),
+                };
                 io_yield_one!(c);
             }
-            AllocatePage1State::Writing { page } => {
+            AllocatePage1State::Writing { page, completion } => {
+                if let Some(err) = completion.get_error() {
+                    page.unpin();
+                    *self.shared.allocate_page1_state.write() = AllocatePage1State::Retry;
+                    return Err(err.into());
+                }
+                if !completion.succeeded() {
+                    io_yield_one!(completion);
+                }
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
                 if self.wal.is_some() {
@@ -5788,12 +5978,23 @@ impl Pager {
                         self.syncing.clone(),
                         self.get_sync_type(),
                     )?;
-                    *self.allocate_page1_state.write() = AllocatePage1State::Syncing { page };
+                    *self.shared.allocate_page1_state.write() = AllocatePage1State::Syncing {
+                        page,
+                        completion: c.clone(),
+                    };
                     io_yield_one!(c);
                 }
                 self.finish_allocate_page1(page)
             }
-            AllocatePage1State::Syncing { page } => {
+            AllocatePage1State::Syncing { page, completion } => {
+                if let Some(err) = completion.get_error() {
+                    page.unpin();
+                    *self.shared.allocate_page1_state.write() = AllocatePage1State::Retry;
+                    return Err(err.into());
+                }
+                if !completion.succeeded() {
+                    io_yield_one!(completion);
+                }
                 tracing::trace!("allocate_page1(Syncing done)");
                 self.finish_allocate_page1(page)
             }
@@ -5811,15 +6012,15 @@ impl Pager {
             LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
         })?;
         // After we wrote the header page, we may now set this None, to signify we initialized
-        self.shared.init_page_1.store(None);
+        self.shared.set_initial_page_1(None);
         page.unpin();
-        *self.allocate_page1_state.write() = AllocatePage1State::Done;
+        *self.shared.allocate_page1_state.write() = AllocatePage1State::Done;
         Ok(IOResult::Done(page))
     }
 
     pub fn allocating_page1(&self) -> bool {
         matches!(
-            *self.allocate_page1_state.read(),
+            *self.shared.allocate_page1_state.read(),
             AllocatePage1State::Writing { .. } | AllocatePage1State::Syncing { .. }
         )
     }
@@ -6169,6 +6370,21 @@ impl Pager {
     }
 
     fn reset_internal_states(&self) {
+        self.clear_failed_encryption_validation();
+        if !self.db_initialized() {
+            let _lock = self.shared.init_lock.lock();
+            let mut state = self.shared.allocate_page1_state.write();
+            match &*state {
+                AllocatePage1State::Writing { page, completion }
+                | AllocatePage1State::Syncing { page, completion }
+                    if completion.failed() =>
+                {
+                    page.unpin();
+                    *state = AllocatePage1State::Retry;
+                }
+                _ => {}
+            }
+        }
         self.pending_reads.write().clear();
         *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
@@ -6208,6 +6424,130 @@ impl Pager {
         self.io_ctx.read().encryption_context().is_some()
     }
 
+    pub(crate) fn can_share_schema(&self) -> bool {
+        self.shared.encryption_cipher() == CipherMode::None
+            || self.encryption_verified.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn encryption_cipher(&self) -> CipherMode {
+        self.shared.encryption_cipher()
+    }
+
+    pub(crate) fn validate_encryption(&self) -> IOResultOr<()> {
+        if self.shared.encryption_cipher() != CipherMode::None {
+            self.reset_page_size_in_encryption_ctx(self.get_page_size_unchecked());
+        }
+        if self.can_share_schema() {
+            return Ok(IOResult::Done(()));
+        }
+        if !self.is_encryption_ctx_set() {
+            return Err(LimboError::InvalidArgument(
+                "encrypted database requires an encryption key".to_string(),
+            )
+            .into());
+        }
+        {
+            let _lock = self.shared.init_lock.lock();
+            if !self.db_initialized() {
+                let encrypted = self
+                    .shared
+                    .encrypted_init_page_1
+                    .as_ref()
+                    .expect("new encrypted database has an encrypted bootstrap page");
+                let mut context = self
+                    .io_ctx
+                    .read()
+                    .encryption_context()
+                    .expect("encryption context was checked above")
+                    .clone();
+                context.set_page_size(
+                    PageSize::new(encrypted.len() as u32)
+                        .expect("encrypted bootstrap page has a valid size"),
+                );
+                context.decrypt_page(encrypted, 1).map_err(|_| {
+                    LimboError::CompletionError(CompletionError::DecryptionError { page_idx: 1 })
+                })?;
+                self.encryption_verified.store(true, Ordering::Release);
+                return Ok(IOResult::Done(()));
+            }
+        }
+        loop {
+            let state = self.encryption_validation.lock().clone();
+            match state {
+                EncryptionValidationState::Start => {
+                    self.reset_page_size_in_encryption_ctx(self.get_page_size_unchecked());
+                    let end_read_tx = !self.holds_read_lock();
+                    if end_read_tx {
+                        self.begin_read_tx()?;
+                    }
+                    let (page, completion) = match self.read_page_no_cache(1, None, false, None) {
+                        Ok(read) => read,
+                        Err(err) => {
+                            if end_read_tx {
+                                self.end_read_tx();
+                            }
+                            return Err(err.into());
+                        }
+                    };
+                    *self.encryption_validation.lock() = EncryptionValidationState::Reading {
+                        page,
+                        completion,
+                        end_read_tx,
+                    };
+                }
+                EncryptionValidationState::Reading {
+                    page,
+                    completion,
+                    end_read_tx,
+                } => {
+                    if let Some(err) = completion.get_error() {
+                        self.clear_failed_encryption_validation();
+                        return Err(err.into());
+                    }
+                    if !completion.succeeded() {
+                        io_yield_one!(completion);
+                    }
+                    turso_assert!(page.is_loaded());
+                    *self.encryption_validation.lock() = EncryptionValidationState::Start;
+                    self.encryption_verified.store(true, Ordering::Release);
+                    if end_read_tx {
+                        self.end_read_tx();
+                    }
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn validate_encryption_blocking(&self) -> Result<()> {
+        let result = self.io.block(|| self.validate_encryption());
+        if result.is_err() {
+            self.clear_failed_encryption_validation();
+        }
+        result
+    }
+
+    pub(crate) fn clear_failed_encryption_validation(&self) {
+        if self.can_share_schema() {
+            return;
+        }
+        let mut state = self.encryption_validation.lock();
+        if let EncryptionValidationState::Reading {
+            completion,
+            end_read_tx,
+            ..
+        } = &*state
+        {
+            if completion.failed() {
+                let end_read_tx = *end_read_tx;
+                if end_read_tx {
+                    self.end_read_tx();
+                }
+                *state = EncryptionValidationState::Start;
+            }
+        }
+    }
+
     pub(crate) fn has_external_page_codec(&self) -> bool {
         self.io_ctx.read().has_external_page_codec()
     }
@@ -6220,16 +6560,14 @@ impl Pager {
         self.enable_encryption.load(Ordering::SeqCst)
     }
 
-    pub fn set_encryption_context(
+    pub(crate) fn set_encryption_context(
         &self,
         cipher_mode: CipherMode,
         key: &EncryptionKey,
     ) -> Result<()> {
-        // we will set the encryption context only if the encryption is opted-in.
         if !self.enable_encryption.load(Ordering::SeqCst) {
             return Err(LimboError::InvalidArgument(
-                "encryption is an opt in feature. enable it via passing `--experimental-encryption`"
-                    .into(),
+                "encryption is an opt in feature".into(),
             ));
         }
         if self.has_external_page_codec() {
@@ -6238,29 +6576,46 @@ impl Pager {
                     .into(),
             ));
         }
-
-        let page_size = self.get_page_size_unchecked().get() as usize;
-        let encryption_ctx = EncryptionContext::new(cipher_mode, key, page_size)?;
-        {
-            let mut io_ctx = self.io_ctx.write();
-            io_ctx.set_encryption(encryption_ctx);
+        if cipher_mode == CipherMode::None || cipher_mode != self.encryption_cipher() {
+            return Err(LimboError::InvalidArgument(
+                "encryption cipher does not match the database".into(),
+            ));
         }
-        let Some(wal) = self.wal.as_ref() else {
-            return Ok(());
-        };
-        wal.set_io_context(self.io_ctx.read().clone());
-        // whenever we set the encryption context, lets reset the page cache. The page cache
-        // might have been loaded with page 1 to initialise the connection. During initialisation,
-        // we only read the header which is unencrypted, but the rest of the page is. If so, lets
-        // clear the cache.
-        self.clear_page_cache(false);
-        // Also invalidate cached schema cookie to force re-read of page 1 with encryption
-        self.set_schema_cookie(None);
+        let mut io_ctx = self.io_ctx.write();
+        if io_ctx.encryption_context().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "encryption context is already set".into(),
+            ));
+        }
+        let context = EncryptionContext::new(
+            cipher_mode,
+            key,
+            self.get_page_size_unchecked().get() as usize,
+        )?;
+        io_ctx.set_encryption(context);
+        if let Some(wal) = self.wal.as_ref() {
+            wal.set_io_context(io_ctx.clone());
+        }
         Ok(())
     }
 
+    pub(crate) fn capture_encrypted_page_one(&self) {
+        let mut io_ctx = self.io_ctx.write();
+        io_ctx.capture_encrypted_page_one();
+        if let Some(wal) = &self.wal {
+            wal.set_io_context(io_ctx.clone());
+        }
+    }
+
+    pub(crate) fn encrypted_page_one(&self) -> Option<Arc<[u8]>> {
+        if !self.db_initialized() {
+            return self.shared.encrypted_init_page_1.clone();
+        }
+        self.io_ctx.read().encrypted_page_one()
+    }
+
     pub(crate) fn set_page_codec(&self, codec: Arc<dyn PageCodec>) -> Result<()> {
-        if self.is_encryption_ctx_set() {
+        if self.is_encryption_ctx_set() || self.shared.encryption_cipher() != CipherMode::None {
             return Err(LimboError::InvalidArgument(
                 "cannot install an external page codec while built-in encryption is configured"
                     .into(),
@@ -6308,13 +6663,13 @@ impl Pager {
         wal.set_io_context(self.io_ctx.read().clone())
     }
 
-    pub fn set_reserved_space_bytes(&self, value: u8) {
+    pub(crate) fn set_reserved_space_bytes(&self, value: u8) {
         self.set_reserved_space(value);
     }
 
     /// Encryption is an opt-in feature. If the flag is passed, then enable the encryption on
     /// pager, which is then used to set it on the IOContext.
-    pub fn enable_encryption(&self, enable: bool) {
+    pub(crate) fn enable_encryption(&self, enable: bool) {
         self.enable_encryption.store(enable, Ordering::SeqCst);
     }
 }
@@ -6332,8 +6687,13 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef
 }
 
 pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
+    default_page1_with_size(cipher, PageSize::default())
+}
+
+pub(crate) fn default_page1_with_size(cipher: Option<&CipherMode>, size: PageSize) -> PageRef {
     // New Database header for empty Database
     let mut default_header = DatabaseHeader::default();
+    default_header.page_size = size;
 
     if let Some(cipher) = cipher {
         // we will set the reserved space bytes as required by either the encryption

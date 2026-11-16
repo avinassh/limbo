@@ -106,7 +106,6 @@ use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     index_method::IndexMethod,
     schema::Trigger,
-    storage::encryption::AtomicCipherMode,
     sync::{atomic::AtomicBool, Arc, RwLock},
     translate::emitter::TransactionMode,
     vdbe::metrics::ConnectionMetrics,
@@ -139,6 +138,8 @@ pub use database::{
 pub(crate) use database::{DatabaseCatalog, InitState};
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
+#[cfg(feature = "conn_raw_api")]
+pub use database::{ExternalRestoreGuard, ExternalRestorePermit};
 #[cfg(test)]
 pub(crate) use dialect::EngineDialect;
 pub use dialect::{Dialect, NewOwner, RelationChange};

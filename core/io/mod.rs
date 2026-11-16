@@ -654,11 +654,7 @@ pub trait IO: Clock + Send + Sync {
     /// Default uses OS-level metadata; non-filesystem backends override
     /// with synthetic hash-based identity.
     fn file_id(&self, path: &str) -> Result<FileId> {
-        get_file_id(path).map_err(|e| {
-            crate::LimboError::InternalError(format!(
-                "failed to get file identity for '{path}': {e}"
-            ))
-        })
+        get_file_id(path).map_err(|error| crate::error::io_error(error, "file_id"))
     }
 }
 

@@ -207,6 +207,7 @@ pub(crate) enum AttachDatabaseState {
 pub(crate) enum AttachDatabaseState {
     #[default]
     Start,
+    Open(Box<AttachDatabaseOpenState>),
     Init(Box<AttachDatabaseInitState>),
     Bootstrap(Box<AttachDatabaseBootstrapState>),
     Publish {
@@ -215,6 +216,19 @@ pub(crate) enum AttachDatabaseState {
         pager: Arc<Pager>,
     },
     Done,
+}
+
+#[cfg(feature = "fs")]
+pub(crate) struct AttachDatabaseOpenState {
+    alias: String,
+    reserved_space: Option<u8>,
+    path: String,
+    modeof: Option<String>,
+    io: Arc<dyn IO>,
+    options: crate::OpenOptions,
+    state: crate::OpenDbAsyncState,
+    cached: Option<Arc<Database>>,
+    encryption_key: Option<EncryptionKey>,
 }
 
 #[cfg(feature = "fs")]
@@ -302,6 +316,15 @@ impl Connection {
         attached_db_pager: &Pager,
         reserved_space: Option<u8>,
     ) -> Result<()> {
+        if attached_db_pager.encryption_cipher() != crate::CipherMode::None {
+            let required = attached_db_pager.encryption_cipher().metadata_size() as u8;
+            if reserved_space.is_some_and(|space| space != required) {
+                return Err(LimboError::InvalidArgument(
+                    "encrypted attached database reserved bytes must match its cipher".into(),
+                ));
+            }
+            return attached_db_pager.set_initial_page_size(self.get_page_size());
+        }
         let target_page_size = self.get_page_size();
         let attached_min_reserved_space =
             Self::minimum_reserved_space_for_fresh_attach(attached_db_pager);
@@ -459,6 +482,7 @@ impl Connection {
                     }
 
                     let db_opts = DatabaseOpts::new()
+                        .with_encryption(self.db.experimental_encryption_enabled())
                         .with_views(self.db.experimental_views_enabled())
                         .with_custom_types(self.db.experimental_custom_types_enabled())
                         .with_index_method(self.db.experimental_index_method_enabled())
@@ -472,36 +496,87 @@ impl Connection {
                     } else {
                         self.db.io.clone()
                     };
-                    let main_db_flags = self.db.open_flags;
-                    let (db, encryption_opts) = Self::from_uri_attached(
-                        path,
-                        db_opts,
-                        main_db_flags,
+                    let uri = crate::util::OpenOptions::parse(path)?;
+                    let mut flags = uri.get_flags()?;
+                    if self.db.open_flags.contains(crate::OpenFlags::ReadOnly) {
+                        flags |= crate::OpenFlags::ReadOnly;
+                    }
+                    let encryption = match (uri.cipher.as_ref(), uri.hexkey.as_ref()) {
+                        (Some(cipher), Some(hexkey)) => Some(crate::EncryptionOpts {
+                            cipher: cipher.clone(),
+                            hexkey: hexkey.clone(),
+                        }),
+                        (Some(_), None) => {
+                            return Err(LimboError::InvalidArgument(
+                                "hexkey is required when cipher is provided".into(),
+                            )
+                            .into())
+                        }
+                        (None, Some(_)) => {
+                            return Err(LimboError::InvalidArgument(
+                                "cipher is required when hexkey is provided".into(),
+                            )
+                            .into())
+                        }
+                        (None, None) => None,
+                    };
+                    let encryption_key = encryption
+                        .as_ref()
+                        .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
+                        .transpose()?;
+                    let io = uri.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
+                    let mut options = crate::OpenOptions::new(self.db.dialect())
+                        .flags(flags)
+                        .db_opts(db_opts)
+                        .encryption(encryption)
+                        .page_size(self.get_page_size());
+                    Database::validate_open_options(&options)?;
+                    let cached =
+                        Database::resolve_default_storage(&io, &uri.path, &mut options, true)?;
+                    *state = AttachDatabaseState::Open(Box::new(AttachDatabaseOpenState {
+                        alias: alias.to_string(),
+                        reserved_space,
+                        path: uri.path,
+                        modeof: uri.modeof,
                         io,
-                        self.db.dialect(),
-                    )?;
+                        options,
+                        state: crate::OpenDbAsyncState::new(),
+                        cached,
+                        encryption_key,
+                    }));
+                }
+                AttachDatabaseState::Open(open) => {
+                    let db = if let Some(db) = open.cached.take() {
+                        db
+                    } else {
+                        crate::return_if_io!(Database::open_async(
+                            &mut open.state,
+                            open.io.clone(),
+                            &open.path,
+                            &open.options
+                        ))
+                    };
+                    if let Some(modeof) = open.modeof.as_ref() {
+                        let perms = std::fs::metadata(modeof)
+                            .map_err(|error| crate::error::io_error(error, "metadata"))?;
+                        std::fs::set_permissions(&open.path, perms.permissions())
+                            .map_err(|error| crate::error::io_error(error, "set_permissions"))?;
+                    }
                     let attached_is_fresh = !db.initialized();
-                    if !is_memory_db {
-                        Self::validate_attach_target(&db, attached_is_fresh, alias)?;
+                    if !is_memory_like(&open.path) {
+                        Self::validate_attach_target(&db, attached_is_fresh, &open.alias)?;
                     }
                     self.reject_unsupported_fresh_mvcc_attach_durable_storage(
-                        alias,
+                        &open.alias,
                         &db,
                         attached_is_fresh,
                     )?;
-
-                    let encryption_key = if let Some(ref enc) = encryption_opts {
-                        Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
-                    } else {
-                        None
-                    };
-
                     *state = AttachDatabaseState::Init(Box::new(AttachDatabaseInitState {
-                        alias: alias.to_string(),
-                        reserved_space,
+                        alias: open.alias.clone(),
+                        reserved_space: open.reserved_space,
                         db,
                         attached_is_fresh,
-                        encryption_key,
+                        encryption_key: open.encryption_key.take(),
                         init_st: crate::InitState::default(),
                     }));
                 }
