@@ -2753,6 +2753,59 @@ fn regression_async_connect_state_cannot_change_database() -> anyhow::Result<()>
 }
 
 #[test]
+fn regression_public_header_mutation_preserves_encrypted_layout() -> anyhow::Result<()> {
+    use turso_core::storage::sqlite3_ondisk::PageSize;
+    use turso_core::IOExt;
+    let tmp = TempDatabaseBuilder::new()
+        .with_encryption(CIPHER_A, KEY_A)
+        .build();
+    let owner = tmp.connect_limbo();
+    owner.execute("CREATE TABLE secrets(value TEXT)")?;
+    owner.execute("BEGIN IMMEDIATE")?;
+    owner.execute("INSERT INTO secrets VALUES ('protected value')")?;
+    let pager = owner.get_pager();
+    for change_size in [false, true] {
+        let result = tmp.io.block(|| {
+            pager.with_header_mut(|header| {
+                header.user_version = 42.into();
+                if change_size {
+                    header.page_size = PageSize::new(8192).unwrap();
+                } else {
+                    header.reserved_space = 0;
+                }
+            })
+        });
+        assert!(
+            result.is_err(),
+            "a public header mutation must reject encrypted layout changes"
+        );
+        let header = tmp.io.block(|| {
+            pager.with_header(|header| {
+                (
+                    header.page_size.get(),
+                    header.reserved_space,
+                    header.user_version.get(),
+                )
+            })
+        })?;
+        assert_eq!(header, (4096, 48, 0));
+    }
+    tmp.io
+        .block(|| pager.with_header_mut(|header| header.user_version = 7.into()))?;
+    owner.execute("COMMIT")?;
+    let peer = tmp.connect_limbo();
+    let rows: Vec<(String,)> = peer.exec_rows("SELECT value FROM secrets");
+    assert_eq!(rows, [("protected value".into(),)]);
+    assert_eq!(
+        tmp.io.block(|| peer
+            .get_pager()
+            .with_header(|header| header.user_version.get()))?,
+        7
+    );
+    Ok(())
+}
+
+#[test]
 fn regression_restore_reservation_blocks_encrypted_open_until_drop() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("restore-reservation.db");

@@ -89,22 +89,22 @@ impl HeaderRef {
 }
 
 #[derive(Debug, Clone)]
-pub struct HeaderRefMut(PageRef);
+pub(crate) struct HeaderRefMut(PageRef);
 
 impl HeaderRefMut {
-    pub fn from_pager(pager: &Pager) -> IOResultOr<Self> {
+    pub(crate) fn from_pager(pager: &Pager) -> IOResultOr<Self> {
         let page = return_if_io!(pager.read_header_page());
         pager.add_dirty(&page)?;
         Ok(IOResult::Done(Self(page)))
     }
 
-    pub fn borrow_mut(&self) -> &mut DatabaseHeader {
+    pub(crate) fn borrow_mut(&self) -> &mut DatabaseHeader {
         let content = self.0.get_contents();
         bytemuck::from_bytes_mut::<DatabaseHeader>(&mut content.as_ptr()[0..DatabaseHeader::SIZE])
     }
 
     /// Get a reference to the underlying page
-    pub fn page(&self) -> &PageRef {
+    pub(crate) fn page(&self) -> &PageRef {
         &self.0
     }
 }
@@ -6412,10 +6412,21 @@ impl Pager {
     }
 
     pub fn with_header_mut<T>(&self, f: impl Fn(&mut DatabaseHeader) -> T) -> IOResultOr<T> {
-        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
-        let header = header_ref.borrow_mut();
-        let result = f(header);
-        // Update cached schema cookie after modification
+        let header_ref = return_if_io!(HeaderRef::from_pager(self));
+        let mut header = *header_ref.borrow();
+        let result = f(&mut header);
+        let cipher = self.encryption_cipher();
+        if cipher != CipherMode::None
+            && (header.page_size != self.get_page_size_unchecked()
+                || header.reserved_space as usize != cipher.metadata_size())
+        {
+            return Err(LimboError::InvalidArgument(
+                "encrypted database page layout is fixed when opening the database".into(),
+            )
+            .into());
+        }
+        self.add_dirty(&header_ref.0)?;
+        header_ref.0.get_contents().write_database_header(&header);
         self.set_schema_cookie(Some(header.schema_cookie.get()));
         Ok(IOResult::Done(result))
     }
