@@ -378,6 +378,7 @@ async fn copy_sync_engine_file<Ctx, IO: SyncEngineIo>(
     source_path: &str,
     target_path: &str,
     is_memory: bool,
+    reservation: Option<&turso_core::ExternalRestoreGuard>,
 ) -> Result<bool> {
     let Some(content) = full_read(
         coro,
@@ -391,17 +392,39 @@ async fn copy_sync_engine_file<Ctx, IO: SyncEngineIo>(
         remove_file_if_present(&io, target_path)?;
         return Ok(false);
     };
-    full_write(
-        coro,
-        io.clone(),
-        sync_engine_io,
-        target_path,
-        is_memory,
-        content,
-    )
-    .await?;
+    if let Some(reservation) = reservation {
+        let file = io.open_file(target_path, OpenFlags::Create, false)?;
+        let c = Completion::new_trunc(|_| {});
+        reservation.protect_completion(&c);
+        let c = file.truncate(0, c)?;
+        wait_restore_completion(coro, c).await?;
+        let c = Completion::new_write(|_| {});
+        reservation.protect_completion(&c);
+        let c = file.pwrite(0, Arc::new(Buffer::new(content)), c)?;
+        wait_restore_completion(coro, c).await?;
+    } else {
+        full_write(
+            coro,
+            io.clone(),
+            sync_engine_io,
+            target_path,
+            is_memory,
+            content,
+        )
+        .await?;
+    }
     sync_path_if_present(coro, &io, target_path).await?;
     Ok(true)
+}
+
+async fn wait_restore_completion<Ctx>(coro: &Coro<Ctx>, c: Completion) -> Result<()> {
+    while !c.finished() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    if let Some(error) = c.get_error() {
+        return Err(LimboError::CompletionError(error).into());
+    }
+    Ok(())
 }
 
 impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
@@ -436,6 +459,7 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
                 &path,
                 &backup_path,
                 is_memory,
+                None,
             )
             .await?;
             files.push(ReplaceBaseBackupFile {
@@ -482,6 +506,8 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         main_db_path: &str,
     ) -> Result<bool> {
+        let _restore_reservation =
+            turso_core::Database::preflight_external_restore_for_path(io.clone(), main_db_path)?;
         let marker_path = create_replace_base_marker_path(main_db_path);
         let is_memory = is_memory(main_db_path);
         let Some(marker) = full_read(
@@ -517,6 +543,10 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
     }
 
     async fn restore<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
+        let _restore_reservation = turso_core::Database::preflight_external_restore_for_path(
+            self.io.clone(),
+            &self.main_db_path,
+        )?;
         let is_memory = is_memory(&self.main_db_path);
         for file in &self.manifest.files {
             if file.present {
@@ -527,6 +557,7 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
                     &file.backup_path,
                     &file.path,
                     is_memory,
+                    Some(&_restore_reservation),
                 )
                 .await?;
                 if !restored {
@@ -949,6 +980,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         opts: &DatabaseSyncEngineOpts,
         meta: Option<DatabaseMetadata>,
     ) -> Result<DatabaseMetadata> {
+        let _restore_reservation =
+            turso_core::Database::preflight_external_restore_for_path(io.clone(), main_db_path)?;
         tracing::info!("bootstrap_db(path={}): opts={:?}", main_db_path, opts);
         let meta_path = create_meta_path(main_db_path);
         let partial_sync_opts = opts.partial_sync_opts.clone();
@@ -1289,6 +1322,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         main_db_path: &str,
         opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
+        let _restore_reservation =
+            turso_core::Database::preflight_external_restore_for_path(io.clone(), main_db_path)?;
         ReplaceBaseApplyGuard::recover_pending(
             coro,
             io.clone(),
