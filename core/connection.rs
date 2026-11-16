@@ -5964,3 +5964,354 @@ mod tests {
         assert!(conn.schema.read().dialect_schema.is_some());
     }
 }
+
+#[cfg(all(test, shuttle))]
+mod encryption_race_tests {
+    use super::*;
+    use crate::thread;
+
+    #[test]
+    fn exhaustive_encryption_key_installation() {
+        exhaustive("key installation", false, || {
+            let (db, first, second) = connections();
+            let _connections = (first.clone(), second.clone());
+            assert_eq!(
+                race(
+                    move || first.set_encryption_key(key(1)).is_ok(),
+                    move || second.set_encryption_key(key(2)).is_ok()
+                ),
+                [false, false]
+            );
+            assert_single_binding(&db, CipherMode::Aegis256, 1);
+        });
+    }
+
+    #[test]
+    fn exhaustive_encryption_key_and_cipher_installation() {
+        exhaustive("key and cipher installation", false, || {
+            let (db, first, second) = connections();
+            let _connections = (first.clone(), second.clone());
+            assert_eq!(
+                race(
+                    move || first.set_encryption_key(key(2)).is_ok(),
+                    move || second.set_encryption_cipher(CipherMode::Aes256Gcm).is_ok()
+                ),
+                [false, false]
+            );
+            assert_single_binding(&db, CipherMode::Aegis256, 1);
+        });
+    }
+
+    #[test]
+    fn exhaustive_competing_encryption_configurations() {
+        exhaustive("competing encryption configurations", true, || {
+            let (db, _, _) = connections();
+            let first_db = db.clone();
+            let second_db = db.clone();
+            assert_eq!(
+                race(
+                    move || first_db
+                        .connect(ConnectOpts::new().with_encryption_key(Some(key(1))))
+                        .is_ok(),
+                    move || second_db
+                        .connect(ConnectOpts::new().with_encryption_key(Some(key(2))))
+                        .is_ok()
+                ),
+                [true, false]
+            );
+            assert_single_binding(&db, CipherMode::Aegis256, 1);
+        });
+    }
+
+    #[test]
+    fn exhaustive_encrypted_first_write() {
+        exhaustive("encrypted first write", true, || {
+            let (db, first, second) = connections();
+            assert_eq!(
+                race(
+                    move || {
+                        let pager = first.pager.load();
+                        pager.io.block(|| pager.maybe_allocate_page1()).is_ok()
+                    },
+                    move || {
+                        let pager = second.pager.load();
+                        pager.io.block(|| pager.maybe_allocate_page1()).is_ok()
+                    }
+                ),
+                [true, true]
+            );
+            assert_single_binding(&db, CipherMode::Aegis256, 1);
+        });
+    }
+
+    #[test]
+    fn exhaustive_encryption_configuration_and_first_write() {
+        exhaustive("encryption configuration and first write", true, || {
+            let (db, first, second) = connections();
+            assert_eq!(
+                race(
+                    move || first.set_encryption_key(key(2)).is_ok(),
+                    move || {
+                        let pager = second.pager.load();
+                        pager.io.block(|| pager.maybe_allocate_page1()).is_ok()
+                    }
+                ),
+                [false, true]
+            );
+            assert_single_binding(&db, CipherMode::Aegis256, 1);
+        });
+    }
+
+    #[test]
+    fn exhaustive_initial_header_and_encryption() {
+        exhaustive("initial header and encryption", true, || {
+            let (db, first, second) = connections();
+            assert_eq!(
+                race(
+                    move || first.reset_page_size(crate::MAIN_DB_ID, 8192).is_ok(),
+                    move || second.set_reserved_bytes(0).is_ok()
+                ),
+                [false, false]
+            );
+            let conn = db
+                .connect(ConnectOpts::new().with_encryption_key(Some(key(1))))
+                .unwrap();
+            assert_eq!(conn.get_page_size().get(), 4096);
+            assert_eq!(
+                conn.get_reserved_bytes(),
+                Some(CipherMode::Aegis256.metadata_size() as u8)
+            );
+        });
+    }
+
+    #[test]
+    fn exhaustive_encrypted_schema_publication() {
+        exhaustive("schema publication", true, || {
+            let (db, writer, _) = connections();
+            let observer = db.clone();
+            assert_eq!(
+                race(
+                    move || writer.execute("CREATE TABLE secrets(value TEXT)").is_ok(),
+                    move || observer
+                        .connect(ConnectOpts::new().with_encryption_key(Some(key(2))))
+                        .is_ok()
+                ),
+                [true, false]
+            );
+            assert_single_binding(&db, CipherMode::Aegis256, 1);
+        });
+    }
+
+    #[test]
+    fn seeded_concurrent_settings_installation() {
+        seeded("s09-two-keys", true, || {
+            let (db, first, second) = connections();
+            assert_eq!(
+                race(
+                    move || first.set_encryption_key(key(1)).is_ok(),
+                    move || second.set_encryption_key(key(2)).is_ok()
+                ),
+                [false, false]
+            );
+            assert_single_binding(&db, CipherMode::Aegis256, 1);
+        });
+    }
+
+    #[test]
+    fn seeded_plaintext_first_write_against_encryption() {
+        seeded("s10", true, || {
+            let db = Database::open(
+                Arc::new(crate::MemoryIO::new()),
+                ":memory:plaintext",
+                crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                    .db_opts(DatabaseOpts::new().with_encryption(true)),
+            )
+            .unwrap();
+            let plain = db.connect(ConnectOpts::new()).unwrap();
+            let configuring = db.connect(ConnectOpts::new()).unwrap();
+            assert_eq!(
+                race(
+                    move || plain.execute("CREATE TABLE data(x)").is_ok(),
+                    move || configuring.set_encryption_key(key(1)).is_ok()
+                ),
+                [true, false]
+            );
+            assert_eq!(db.encryption_cipher(), CipherMode::None);
+        });
+    }
+
+    fn connections() -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
+        let db = Database::open(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+                .db_opts(DatabaseOpts::new().with_encryption(true))
+                .encryption(crate::EncryptionOpts {
+                    cipher: "aegis256".into(),
+                    hexkey: "01".repeat(32),
+                }),
+        )
+        .unwrap();
+        let first = db
+            .connect(ConnectOpts::new().with_encryption_key(Some(key(1))))
+            .unwrap();
+        let second = db
+            .connect(ConnectOpts::new().with_encryption_key(Some(key(1))))
+            .unwrap();
+        (db, first, second)
+    }
+
+    fn key(byte: u8) -> EncryptionKey {
+        EncryptionKey::new_256([byte; 32])
+    }
+
+    fn race(
+        first: impl FnOnce() -> bool + Send + 'static,
+        second: impl FnOnce() -> bool + Send + 'static,
+    ) -> [bool; 2] {
+        let first = thread::spawn(first);
+        let second = thread::spawn(second);
+        [first.join().unwrap(), second.join().unwrap()]
+    }
+
+    fn assert_single_binding(db: &Arc<Database>, cipher: CipherMode, winner: u8) {
+        let valid = db
+            .connect(ConnectOpts::new().with_encryption_key(Some(key(winner))))
+            .unwrap();
+        assert_eq!(valid.get_encryption_cipher_mode(), Some(cipher));
+        assert!(db.connect(ConnectOpts::new()).is_err());
+        assert!(db
+            .connect(ConnectOpts::new().with_encryption_key(Some(key(3 - winner))))
+            .is_err());
+    }
+
+    /// A bounded seeded campaign. `ENCRYPTION_THREAD_SEED` picks the seed
+    /// (default 1) and `ENCRYPTION_THREAD_EXECUTIONS` the number of
+    /// executions (default 64). Shuttle prints a failing schedule, which
+    /// `ENCRYPTION_THREAD_REPLAY` replays for `ENCRYPTION_THREAD_SCENARIO`.
+    fn seeded(name: &'static str, shared_accesses: bool, body: impl Fn() + Send + Sync + 'static) {
+        let replay = thread_replay();
+        if replay
+            .as_ref()
+            .is_some_and(|(scenario, _)| scenario != name)
+        {
+            return;
+        }
+        let mut config = shuttle::Config::default();
+        config.stack_size = 1024 * 1024;
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        if let Some((_, schedule)) = replay {
+            eprintln!("encryption thread scenario {name}: replay");
+            let scheduler = EncryptionScheduler {
+                inner: shuttle::scheduler::ReplayScheduler::new_from_encoded(&schedule),
+                shared_accesses,
+            };
+            shuttle::Runner::new(scheduler, config).run(body);
+            return;
+        }
+        let seed = std::env::var("ENCRYPTION_THREAD_SEED")
+            .map_or(1, |seed| seed.parse().expect("ENCRYPTION_THREAD_SEED"));
+        let executions = std::env::var("ENCRYPTION_THREAD_EXECUTIONS").map_or(64, |count| {
+            count.parse().expect("ENCRYPTION_THREAD_EXECUTIONS")
+        });
+        let scheduler = EncryptionScheduler {
+            inner: shuttle::scheduler::RandomScheduler::new_from_seed(seed, executions),
+            shared_accesses,
+        };
+        eprintln!("encryption thread scenario {name}: seed {seed}, {executions} executions");
+        let completed = shuttle::Runner::new(scheduler, config).run(body);
+        eprintln!("encryption seeded {name}: seed {seed}, {completed} executions");
+    }
+
+    fn thread_replay() -> Option<(String, String)> {
+        let Some(schedule) = std::env::var_os("ENCRYPTION_THREAD_REPLAY") else {
+            assert!(
+                std::env::var_os("ENCRYPTION_THREAD_SCENARIO").is_none(),
+                "ENCRYPTION_THREAD_SCENARIO requires ENCRYPTION_THREAD_REPLAY"
+            );
+            return None;
+        };
+        let scenario = std::env::var("ENCRYPTION_THREAD_SCENARIO")
+            .expect("ENCRYPTION_THREAD_REPLAY requires ENCRYPTION_THREAD_SCENARIO");
+        assert!(
+            matches!(
+                scenario.as_str(),
+                "s09-two-keys"
+                    | "s09-cipher-key"
+                    | "s09-same-cipher"
+                    | "s09-different-ciphers"
+                    | "s10-first-write"
+            ),
+            "unknown ENCRYPTION_THREAD_SCENARIO: {scenario}"
+        );
+        Some((
+            scenario,
+            schedule
+                .into_string()
+                .expect("ENCRYPTION_THREAD_REPLAY must be a string"),
+        ))
+    }
+
+    fn exhaustive(
+        name: &'static str,
+        shared_accesses: bool,
+        body: impl Fn() + Send + Sync + 'static,
+    ) {
+        let mut config = shuttle::Config::default();
+        config.stack_size = 1024 * 1024;
+        config.max_steps = shuttle::MaxSteps::FailAfter(10_000);
+        let scheduler = EncryptionScheduler {
+            inner: shuttle::scheduler::DfsScheduler::new(None, false),
+            shared_accesses,
+        };
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let executions = shuttle::Runner::new(scheduler, config).run(move || {
+            let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count > 0 && count % 10_000 == 0 {
+                eprintln!("encryption DFS {name}: {count} schedules explored");
+            }
+            body();
+        });
+        eprintln!("encryption DFS {name}: {executions} complete schedules");
+    }
+
+    /// Runs the test's root thread alone and, when `shared_accesses` is set,
+    /// lets other threads interleave only at labelled shared-state accesses.
+    struct EncryptionScheduler<S> {
+        inner: S,
+        shared_accesses: bool,
+    }
+
+    impl<S: shuttle::scheduler::Scheduler> shuttle::scheduler::Scheduler for EncryptionScheduler<S> {
+        fn new_execution(&mut self) -> Option<shuttle::scheduler::Schedule> {
+            self.inner.new_execution()
+        }
+
+        fn next_task(
+            &mut self,
+            runnable: &[&shuttle::scheduler::Task],
+            current: Option<shuttle::scheduler::TaskId>,
+            yielding: bool,
+        ) -> Option<shuttle::scheduler::TaskId> {
+            if let Some(root) = runnable.iter().find(|task| usize::from(task.id()) == 0) {
+                return self.inner.next_task(&[root], current, yielding);
+            }
+            if let Some(current) = current.filter(|_| self.shared_accesses) {
+                let shared = shuttle::current::get_label_for_task::<
+                    crate::sync::EncryptionSchedulePoint,
+                >(current)
+                .is_some_and(|point| point.0);
+                if !shared {
+                    if let Some(task) = runnable.iter().find(|task| task.id() == current) {
+                        return self.inner.next_task(&[task], Some(current), yielding);
+                    }
+                }
+            }
+            self.inner.next_task(runnable, current, yielding)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.inner.next_u64()
+        }
+    }
+}

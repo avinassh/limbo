@@ -1,0 +1,76 @@
+{
+  "source_commit": "4b3befbd6cf76ea81cdb15580c9ac6dd9e061c45",
+  "source_version": "0.9.0-pre.5",
+  "key_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+  "table": "legacy_secrets",
+  "rows": [
+    [
+      1,
+      "legacy-one"
+    ],
+    [
+      2,
+      "legacy-two"
+    ]
+  ],
+  "cases": [
+    {
+      "name": "aegis256-wal",
+      "cipher": "aegis256",
+      "page_size": 4096,
+      "mode": "wal"
+    },
+    {
+      "name": "aes256-wal",
+      "cipher": "aes256gcm",
+      "page_size": 8192,
+      "mode": "wal"
+    },
+    {
+      "name": "aegis256-mvcc",
+      "cipher": "aegis256",
+      "page_size": 4096,
+      "mode": "mvcc"
+    },
+    {
+      "name": "aes256-mvcc",
+      "cipher": "aes256gcm",
+      "page_size": 8192,
+      "mode": "mvcc"
+    }
+  ],
+  "files": {
+    "aegis256-mvcc.db": {
+      "bytes": 8192,
+      "sha256": "668f4c233904946abf1f0abffc14875a4e3149ceec817dacf58531451973d818"
+    },
+    "aegis256-mvcc.db-log": {
+      "bytes": 478,
+      "sha256": "91cf418a584614eb8a7f9206e3d20387a0ab8c1873944ba1e3ea6f1a18b904b3"
+    },
+    "aegis256-wal.db": {
+      "bytes": 4096,
+      "sha256": "451efb0223b7ebf6a7b477e9d472681c65a4f1ab186740680785de0df1e91d55"
+    },
+    "aegis256-wal.db-wal": {
+      "bytes": 12392,
+      "sha256": "b2ef5b3366a460edfc93f654ce3df619cacc874f70c9382c38772dff32cd8860"
+    },
+    "aes256-mvcc.db": {
+      "bytes": 16384,
+      "sha256": "20df45bef43206c913b94367a331311a527b798b490b13d2ed6db164ff37dd9d"
+    },
+    "aes256-mvcc.db-log": {
+      "bytes": 438,
+      "sha256": "6023d0a8239608772f0cf355afe2101f90aa412276e52f8ba5b3dc2595a4d6a2"
+    },
+    "aes256-wal.db": {
+      "bytes": 8192,
+      "sha256": "d19139b84ddd149fc4161eaa51e1f3ea6656c8fbda283c72d66e96fea5837ae7"
+    },
+    "aes256-wal.db-wal": {
+      "bytes": 24680,
+      "sha256": "fde7ad6c2e8abfebd38cdeeb096ae836950c0bc90cf0cbc14332214fd5f6b9ad"
+    }
+  }
+}
