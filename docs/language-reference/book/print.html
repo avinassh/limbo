@@ -9310,40 +9310,18 @@ openssl rand -hex 16
 <p>A 256-bit key produces a 64-character hex string. A 128-bit key produces a 32-character hex string.</p>
 <p><strong>Store your encryption key securely.</strong> If the key is lost, the encrypted database cannot be recovered. There is no key recovery mechanism.</p>
 <h2 id="creating-an-encrypted-database"><a class="header" href="#creating-an-encrypted-database">Creating an Encrypted Database</a></h2>
-<p>There are two ways to configure encryption: PRAGMAs in the SQL shell, or URI parameters on the command line.</p>
-<h3 id="method-1-pragmas"><a class="header" href="#method-1-pragmas">Method 1: PRAGMAs</a></h3>
-<p>Start Turso with the encryption flag, then set the cipher and key before creating any tables:</p>
-<pre><code class="language-bash">tursodb --experimental-encryption database.db
-</code></pre>
-<pre><code class="language-sql">PRAGMA cipher = 'aegis256';
-PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
-
--- The database is now encrypted. Use it normally.
-CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
-INSERT INTO users VALUES (1, 'Alice');
-SELECT * FROM users;
-</code></pre>
-<p>Both <code>PRAGMA cipher</code> and <code>PRAGMA hexkey</code> must be set before any other database operations. The encryption context is established when both values are present. Once set, the cipher and key cannot be changed within the same session.</p>
-<h3 id="method-2-uri-parameters"><a class="header" href="#method-2-uri-parameters">Method 2: URI Parameters</a></h3>
+<p>Encryption must be configured when opening a database, using both cipher and key URI parameters. Assignments to cipher and hexkey PRAGMAs are rejected during preparation, including on an empty database. Encryption identity and encrypted page layout are immutable after open.</p>
 <p>Specify the cipher and key directly in the database URI:</p>
 <pre><code class="language-bash">tursodb --experimental-encryption \
   "file:database.db?cipher=aegis256&amp;hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
 </code></pre>
-<p>This is equivalent to setting the PRAGMAs and is the preferred method for scripting and automation.</p>
+<p>Credentials must be supplied at open time; encryption PRAGMA assignments are rejected.</p>
 <h2 id="opening-an-encrypted-database"><a class="header" href="#opening-an-encrypted-database">Opening an Encrypted Database</a></h2>
 <p>To open an existing encrypted database, you must provide the correct cipher and key. The recommended approach is URI parameters:</p>
 <pre><code class="language-bash">tursodb --experimental-encryption \
   "file:database.db?cipher=aegis256&amp;hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
 </code></pre>
-<p>Alternatively, open the file and set PRAGMAs before any queries:</p>
-<pre><code class="language-bash">tursodb --experimental-encryption database.db
-</code></pre>
-<pre><code class="language-sql">PRAGMA cipher = 'aegis256';
-PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
-
--- Database is now accessible
-SELECT * FROM users;
-</code></pre>
+<p>Key-bearing CLI URIs can expose keys through process arguments, shell history, and command-line recording. Temporary databases and query spill files may contain plaintext. Each attached database requires its own cipher/key URI; ATTACH ... KEY does not configure built-in encryption.</p>
 <p>Opening an encrypted database without providing the correct cipher and key will fail. Providing the wrong cipher or the wrong key will also fail. Turso does not silently return corrupted data.</p>
 <h2 id="reading-encryption-settings"><a class="header" href="#reading-encryption-settings">Reading Encryption Settings</a></h2>
 <p>You can query the current cipher with:</p>
@@ -9358,9 +9336,9 @@ SELECT * FROM users;
 <tr><th>PRAGMA</th><th>Type</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>PRAGMA cipher = 'name'</code></td><td>Write</td><td>Set the encryption cipher for the session. Must be set before any I/O.</td></tr>
+<tr><td><code>PRAGMA cipher = 'name'</code></td><td>Rejected</td><td>Configure encryption when opening the database.</td></tr>
 <tr><td><code>PRAGMA cipher</code></td><td>Read</td><td>Return the current cipher name.</td></tr>
-<tr><td><code>PRAGMA hexkey = 'hex_string'</code></td><td>Write</td><td>Set the encryption key as a hex-encoded string. Must match the cipher’s key size.</td></tr>
+<tr><td><code>PRAGMA hexkey</code></td><td>Read</td><td>Report whether the connection has a key, without returning key material. Assignments are rejected.</td></tr>
 </tbody>
 </table>
 </div>

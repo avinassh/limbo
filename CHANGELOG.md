@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+* Built-in encryption must be configured at open time. Cipher/key PRAGMA assignments and connection setters now return errors; public pager encryption and layout setters are no longer available. Cached opens and every connection authenticate independently before returning shared state. Encrypted page layout is immutable. In-place VACUUM of encrypted attachments and external restore/sync replacement of live encrypted databases are rejected. Async connection states and restore permits are bound to their originating database. Restore reservations exclude encrypted opens through completion or cancellation of pending writes. Existing encrypted files keep their format and credentials.
+
 ## 0.8.0 -- 2026-09-28
 
 ### Added
