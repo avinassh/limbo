@@ -525,10 +525,12 @@ impl ConnectOpts {
 }
 
 /// Resumable state for [`Database::connect_async`]. Create one per
-/// connect and pass it to every call until `IOResult::Done`.
+/// connect and pass it to the same database on every call until `IOResult::Done`.
+/// Resuming it on another database returns an error without consuming the state.
 #[derive(Default)]
 pub struct ConnectAsyncState {
     phase: ConnectAsyncPhase,
+    database: Option<Arc<Database>>,
 }
 
 #[derive(Default)]
@@ -2961,9 +2963,20 @@ impl Database {
         opts: ConnectOpts,
         state: &mut ConnectAsyncState,
     ) -> IOResultOr<Arc<Connection>> {
+        if state
+            .database
+            .as_ref()
+            .is_some_and(|database| !Arc::ptr_eq(database, self))
+        {
+            return Err(LimboError::InvalidArgument(
+                "connect state belongs to another database".into(),
+            )
+            .into());
+        }
         let result = (|| {
             if matches!(state.phase, ConnectAsyncPhase::Start) {
                 self.validate_page_codec(opts.page_codec.as_deref())?;
+                state.database = Some(self.clone());
                 state.phase = ConnectAsyncPhase::Initialize {
                     opts,
                     init: InitState::default(),
@@ -3098,6 +3111,11 @@ impl Database {
         default_cache_size: i32,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
+        if !pager.shares_database_state(&self.pager_state) {
+            return Err(LimboError::InvalidArgument(
+                "connection pager belongs to another database".into(),
+            ));
+        }
         match pager.validate_encryption().map_err(|error| *error)? {
             IOResult::Done(()) => {}
             IOResult::IO(_) => {

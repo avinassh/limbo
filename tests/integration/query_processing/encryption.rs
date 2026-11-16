@@ -2704,6 +2704,55 @@ fn cold_encrypted_attach_yields_before_catalog_publication() -> anyhow::Result<(
 }
 
 #[test]
+fn regression_async_connect_state_cannot_change_database() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+    let io = Arc::new(QueuedIo::new());
+    let a = Database::open(
+        io.clone(),
+        ":async-state-origin:",
+        ReadLockDatabase::options_for(KEY_A),
+    )?;
+    let owner_a = a.connect(
+        ConnectOpts::new().with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?)),
+    )?;
+    owner_a.execute("CREATE TABLE a_data(value TEXT)")?;
+    let b = Database::open(
+        io.clone(),
+        ":async-state-other:",
+        ReadLockDatabase::options_for(KEY_B),
+    )?;
+    let owner_b = b.connect(
+        ConnectOpts::new().with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_B)?)),
+    )?;
+    owner_b.execute("PRAGMA journal_mode = 'mvcc'")?;
+    owner_b.execute("CREATE TABLE secrets(value TEXT)")?;
+    owner_b.execute("INSERT INTO secrets VALUES ('protected value')")?;
+    let opts = ConnectOpts::new().with_encryption_key(Some(EncryptionKey::from_hex_string(KEY_A)?));
+    let mut state = turso_core::ConnectAsyncState::new();
+    let IOResult::IO(pending) = a.connect_async(opts.clone(), &mut state)? else {
+        panic!("page-1 read must yield");
+    };
+    pending.wait(io.as_ref())?;
+    assert!(
+        b.connect_async(ConnectOpts::new(), &mut state).is_err(),
+        "a pending connect state must reject another database"
+    );
+    let connected = loop {
+        match a.connect_async(opts.clone(), &mut state)? {
+            IOResult::Done(conn) => break conn,
+            IOResult::IO(pending) => pending.wait(io.as_ref())?,
+        }
+    };
+    assert!(Arc::ptr_eq(&connected.get_pager().db_file, &a.db_file));
+    assert!(!connected
+        .current_schema()
+        .has_table(turso_core::NamespaceId::ROOT, "secrets"));
+    let rows: Vec<(String,)> = owner_b.exec_rows("SELECT value FROM secrets");
+    assert_eq!(rows, [("protected value".into(),)]);
+    Ok(())
+}
+
+#[test]
 fn regression_restore_reservation_blocks_encrypted_open_until_drop() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("restore-reservation.db");
