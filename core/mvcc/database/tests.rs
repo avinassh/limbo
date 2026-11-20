@@ -4154,18 +4154,63 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
 
 /// Counts the B-tree steps MVCC cursors take to seek and to advance, and never yields.
 #[derive(Debug, Default)]
-struct SeekBtreeSteps(AtomicU64);
+struct SeekBtreeSteps {
+    seek_progress: AtomicU64,
+    total: AtomicU64,
+}
 
 impl YieldInjector for SeekBtreeSteps {
     fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
-        if point == CursorYieldPoint::SeekBtreeProgress.point()
+        let is_seek = point == CursorYieldPoint::SeekBtreeProgress.point();
+        if is_seek {
+            self.seek_progress.fetch_add(1, Ordering::Relaxed);
+        }
+        if is_seek
             || point == CursorYieldPoint::AdvanceBtreeForwardProgress.point()
             || point == CursorYieldPoint::AdvanceBtreeBackwardProgress.point()
         {
-            self.0.fetch_add(1, Ordering::Relaxed);
+            self.total.fetch_add(1, Ordering::Relaxed);
         }
         false
     }
+}
+
+#[test]
+fn test_nonunique_index_join_reuses_btree_position() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX b_v ON b(v)").unwrap();
+    conn.execute("INSERT INTO b VALUES (1,1),(2,0),(3,1),(4,0)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute(
+        "WITH RECURSIVE s(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM s WHERE x<12) \
+         INSERT INTO a SELECT x,x%2 FROM s",
+    )
+    .unwrap();
+
+    let sql = "SELECT count(*),sum(b.id) FROM a CROSS JOIN b INDEXED BY b_v WHERE b.v=a.v";
+    let plan = get_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+    assert!(
+        plan.iter()
+            .flatten()
+            .any(|value| { value.to_string() == "SEARCH b USING COVERING INDEX b_v (v=?)" }),
+        "{plan:?}"
+    );
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    let result = get_rows(&conn, sql);
+    conn.set_yield_injector(None);
+    assert_eq!(result, vec![vec![Value::from_i64(24), Value::from_i64(60)]]);
+    let seek_progress = steps.seek_progress.load(Ordering::Relaxed);
+    assert!(
+        seek_progress <= 24,
+        "12 index probes should take at most 24 B-tree seek progress events, got {seek_progress}"
+    );
 }
 
 #[test]
@@ -4797,7 +4842,7 @@ fn test_exact_index_seek_with_duplicate_and_null_prefixes() {
                     ),
                 )
                 .expect("MVCC index cursor must open");
-                steps.0.store(0, Ordering::Relaxed);
+                steps.total.store(0, Ordering::Relaxed);
                 let result = conn
                     .db
                     .io
@@ -4825,7 +4870,7 @@ fn test_exact_index_seek_with_duplicate_and_null_prefixes() {
                     );
                 }
                 if single_row {
-                    let taken = steps.0.load(Ordering::Relaxed);
+                    let taken = steps.total.load(Ordering::Relaxed);
                     assert!(
                         taken <= 2,
                         "unique={unique}, values={values:?}, op={op:?}: {taken} B-tree steps"
@@ -5001,6 +5046,8 @@ fn test_index_cursor_steps_forward_after_stepping_back_past_deleted_row(
 #[rstest::rstest]
 #[case::nonunique_forward(false, false, false)]
 #[case::nonunique_backward(false, false, true)]
+#[case::nonunique_prefix_forward(false, true, false)]
+#[case::nonunique_prefix_backward(false, true, true)]
 #[case::unique_forward(true, false, false)]
 #[case::unique_backward(true, false, true)]
 #[case::unique_prefix_forward(true, true, false)]
@@ -5053,6 +5100,133 @@ fn test_exact_index_seek_steps_past_matching_rows(
     assert_eq!(
         actual, expected,
         "unique={unique}, prefix_only={prefix_only}, key_in_btree={key_in_btree}, op={op:?}"
+    );
+}
+
+#[rstest::rstest]
+#[case::nonunique("", "20", Value::from_i64(20))]
+#[case::nullable_unique("UNIQUE", "NULL", Value::Null)]
+fn test_duplicate_prefix_seek_continues_after_writes(
+    #[case] unique_sql: &str,
+    #[case] probe_sql: &str,
+    #[case] probe: Value,
+    #[values(false, true)] backwards: bool,
+    #[values(false, true)] reverse: bool,
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)")
+        .unwrap();
+    conn.execute(format!("CREATE {unique_sql} INDEX t_k_v ON t(k,v)"))
+        .unwrap();
+    conn.execute(format!(
+        "INSERT INTO t VALUES (10,0,10),(30,1,{probe_sql}),(50,1,{probe_sql}),(70,2,50)"
+    ))
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute(format!(
+        "INSERT INTO t VALUES (20,0,20),(25,1,{probe_sql}),(40,1,{probe_sql}),         (55,1,{probe_sql}),(60,2,40)"
+    ))
+    .unwrap();
+
+    let (op, current, inserted, deleted) = if backwards {
+        (SeekOp::LE { eq_only: true }, 55, 53, 50)
+    } else {
+        (SeekOp::GE { eq_only: true }, 25, 27, 30)
+    };
+    let k = Value::from_i64(1);
+    let prefix = ImmutableRecord::from_values(&[k.clone(), probe.clone()], 2).unwrap();
+    let full = ImmutableRecord::from_values(&[k, probe, Value::from_i64(current)], 3).unwrap();
+    let mut cursor = test_index_cursor(&conn, "t_k_v");
+    let actual = with_cursor_yields(&conn, yields, || {
+        for record in [&prefix, &full] {
+            let result = conn
+                .db
+                .io
+                .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+                .unwrap();
+            assert!(matches!(result, SeekResult::Found));
+            assert_eq!(conn.db.io.block(|| cursor.rowid()).unwrap(), Some(current));
+        }
+
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({inserted},1,{probe_sql}); DELETE FROM t WHERE id={deleted}"
+        ))
+        .unwrap();
+
+        rowids_from_current_row(&conn, &mut cursor, backwards ^ reverse)
+    });
+    assert_eq!(
+        actual,
+        match (backwards, reverse) {
+            (false, false) => vec![25, 27, 40, 50, 55, 60, 70],
+            (false, true) => vec![25, 20, 10],
+            (true, false) => vec![55, 53, 40, 30, 25, 20, 10],
+            (true, true) => vec![55, 60, 70],
+        }
+    );
+    drop(cursor);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[rstest::rstest]
+#[case::mvcc_forward(false, false, [10, 20, 40, 60, 70])]
+#[case::mvcc_backward(true, false, [70, 60, 40, 20, 10])]
+#[case::btree_forward(false, true, [10, 20, 40, 60, 70])]
+#[case::btree_backward(true, true, [70, 60, 40, 20, 10])]
+fn test_exact_index_cursor_returns_rows_restored_by_savepoint_rollback(
+    #[case] backwards: bool,
+    #[case] first_in_btree: bool,
+    #[case] expected: [i64; 5],
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_k ON t(k)").unwrap();
+    conn.execute("INSERT INTO t VALUES (20,1),(40,1),(60,1)")
+        .unwrap();
+    let insert_endpoints = "INSERT INTO t VALUES (10,1),(70,1)";
+    if first_in_btree {
+        conn.execute(insert_endpoints).unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    if !first_in_btree {
+        conn.execute(insert_endpoints).unwrap();
+    }
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("DELETE FROM t WHERE id IN (20,60)").unwrap();
+
+    let op = if backwards {
+        SeekOp::LE { eq_only: true }
+    } else {
+        SeekOp::GE { eq_only: true }
+    };
+    let key = ImmutableRecord::from_values(&[Value::from_i64(1)], 1).unwrap();
+    let mut cursor = test_index_cursor(&conn, "t_k");
+    let result = conn
+        .db
+        .io
+        .block(|| cursor.seek(SeekKey::IndexKey(key.as_record_ref()), op))
+        .unwrap();
+    assert!(matches!(result, SeekResult::Found));
+    assert_eq!(
+        conn.db.io.block(|| cursor.rowid()).unwrap(),
+        Some(expected[0])
+    );
+
+    conn.execute("ROLLBACK TO s").unwrap();
+
+    assert_eq!(
+        rowids_from_current_row(&conn, &mut cursor, backwards),
+        expected
     );
 }
 

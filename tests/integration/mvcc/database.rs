@@ -6935,6 +6935,28 @@ fn test_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
     }
 }
 
+#[test]
+fn test_exact_index_scan_returns_rows_restored_by_savepoint_rollback() {
+    let actual = ["ASC", "DESC"].map(|order| {
+        let db = MvccTestDb::new();
+        let conn = &db.conn;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_k ON t(k)").unwrap();
+        conn.execute("INSERT INTO t VALUES (20,1),(40,1),(60,1)")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        conn.execute("INSERT INTO t VALUES (10,1),(70,1)").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute("DELETE FROM t WHERE id IN (20,60)").unwrap();
+
+        let sql = format!("SELECT id FROM t INDEXED BY t_k WHERE k=1 ORDER BY id {order}");
+        scan_with_write_after_rows(conn, &sql, 1, conn, "ROLLBACK TO s")
+    });
+    assert_eq!(actual, ["10,20,40,60,70", "70,60,40,20,10"]);
+}
+
 /// Steps `scan_sql` on `conn` and runs `write_sql` on `writer` once the scan has
 /// returned `rows_before_write` rows. Returns the rows, with columns joined by `|`.
 fn scan_with_write_after_rows(
