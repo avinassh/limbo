@@ -5067,6 +5067,91 @@ fn test_nonunique_index_join_reuses_btree_position() {
     );
 }
 
+/// Replaced rows hide their old physical entries. Integrity checking probes a
+/// complete primary-key entry and then steps to check uniqueness; each step
+/// must not walk the remaining hidden B-tree entries again.
+#[test]
+fn test_integrity_check_after_text_primary_key_replacements_has_bounded_work() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let n = 512;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+    conn.execute("CREATE TABLE items(k TEXT PRIMARY KEY, v TEXT)")
+        .unwrap();
+    for i in 1..=n {
+        conn.execute(format!("INSERT INTO items VALUES ('key-{i}','payload')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    for i in 1..=n {
+        conn.execute(format!(
+            "DELETE FROM items WHERE k='key-{i}'; \
+             INSERT INTO items VALUES ('key-{i}','payload')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    let result = get_rows(&conn, "PRAGMA integrity_check");
+    conn.set_yield_injector(None);
+    assert_eq!(result, vec![vec![Value::from_text("ok")]]);
+    let work = steps.total.load(Ordering::Relaxed);
+    assert!(
+        work <= 16 * n,
+        "integrity checking {n} replaced text keys took {work} B-tree progress events"
+    );
+}
+
+/// The indexed join returns one match per probe, even though its ordinary
+/// non-unique index permits duplicates. Hidden physical rows must not turn
+/// either the equality lookup or its continuation into a scan of the tail.
+#[test]
+fn test_nonunique_index_join_after_replacements_has_bounded_work() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let n = 128;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, k TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX ik ON items(k)").unwrap();
+    for i in 1..=n {
+        conn.execute(format!("INSERT INTO items VALUES ({i},'{i:08}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    for i in 1..=n {
+        conn.execute(format!(
+            "DELETE FROM items WHERE k='{i:08}'; \
+             INSERT INTO items VALUES ({i},'{i:08}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    let sql = "SELECT count(*) FROM items a JOIN items b INDEXED BY ik ON b.k=a.k";
+    let plan = get_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+    assert!(
+        plan.iter()
+            .flatten()
+            .any(|value| value.to_string() == "SEARCH b USING COVERING INDEX ik (k=?)"),
+        "{plan:?}"
+    );
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    let result = get_rows(&conn, sql);
+    conn.set_yield_injector(None);
+    assert_eq!(result, vec![vec![Value::from_i64(n as i64)]]);
+    let work = steps.total.load(Ordering::Relaxed);
+    assert!(
+        work <= 16 * n,
+        "joining {n} replaced text keys took {work} B-tree progress events"
+    );
+}
+
 /// What this test checks: An exact rowid seek over checkpointed rows that newer versions shadow
 /// returns each row's newest version, or nothing for a deleted or missing row, in a few B-tree
 /// steps however many shadowed rows follow its target.
