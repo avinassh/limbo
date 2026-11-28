@@ -5,12 +5,13 @@
 use super::IntegerType;
 use crate::error::sqlstate_error;
 use crate::functions::{like_matches, pg_scalar_function, Boolean};
+use turso_core::alloc::TursoTryWithCapacityExt;
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarReturn};
-use turso_core::{OpenOptions, Register, Result, Value};
+use turso_core::{OpenOptions, Register, Result, Value, ValueBlob};
 use turso_pg_parser::sqlstate::{SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE};
 
 /// A bytea value. Returning one gives the function the type `bytea`.
-pub(crate) struct Bytea(pub(crate) Vec<u8>);
+pub(crate) struct Bytea(pub(crate) ValueBlob);
 
 impl ScalarReturn for Bytea {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("bytea"));
@@ -26,7 +27,11 @@ pub(crate) fn register_bytea_functions(options: OpenOptions) -> OpenOptions {
             "byteacat",
             FunctionArity::Exact(2),
             true,
-            |_, args| Ok(byteas(args)?.map(|(left, right)| Bytea(byteacat(left, right)))),
+            |_, args| {
+                byteas(args)?
+                    .map(|(left, right)| Ok(Bytea(byteacat(left, right)?)))
+                    .transpose()
+            },
         ))
         .extension_function(pg_scalar_function(
             "bytealike",
@@ -66,8 +71,12 @@ fn byteas(args: &[Register]) -> Result<Option<(&[u8], &[u8])>> {
 }
 
 /// PostgreSQL's `byteacat`: the bytes of `left` followed by those of `right`.
-pub(crate) fn byteacat(left: &[u8], right: &[u8]) -> Vec<u8> {
-    [left, right].concat()
+/// A failed allocation returns an error.
+pub(crate) fn byteacat(left: &[u8], right: &[u8]) -> Result<ValueBlob> {
+    let mut bytes = ValueBlob::try_with_capacity_ext(left.len() + right.len())?;
+    bytes.extend_from_slice(left);
+    bytes.extend_from_slice(right);
+    Ok(bytes)
 }
 
 /// PostgreSQL's `bytealike`: whether `text` matches the LIKE `pattern`, byte
@@ -78,11 +87,12 @@ pub(crate) fn bytealike(text: &[u8], pattern: &[u8]) -> Result<bool> {
 }
 
 /// PostgreSQL's cast from an integer of type `from` to bytea (`int2_bytea`,
-/// `int4_bytea` and `int8_bytea`): its bytes, most significant first.
-pub(crate) fn int_to_bytea(value: i64, from: IntegerType) -> Value {
+/// `int4_bytea` and `int8_bytea`): its bytes, most significant first. A
+/// failed allocation returns an error.
+pub(crate) fn int_to_bytea(value: i64, from: IntegerType) -> Result<Value> {
     let bytes = value.to_be_bytes();
     let width = usize::from(from.digits());
-    Value::from_blob(bytes[bytes.len() - width..].to_vec())
+    Ok(Value::from_slice(&bytes[bytes.len() - width..])?)
 }
 
 /// PostgreSQL's cast from bytea to an integer of type `target` (`bytea_int2`,
@@ -117,10 +127,14 @@ mod tests {
         bytealike(text, pattern).unwrap()
     }
 
+    fn blob(bytes: &[u8]) -> Value {
+        Value::from_slice(bytes).unwrap()
+    }
+
     #[test]
     fn concatenation_joins_the_bytes() {
-        assert_eq!(byteacat(b"\xff", b"\x00"), vec![0xff, 0x00]);
-        assert_eq!(byteacat(b"", b""), Vec::<u8>::new());
+        assert_eq!(*byteacat(b"\xff", b"\x00").unwrap(), [0xff, 0x00]);
+        assert!(byteacat(b"", b"").unwrap().is_empty());
     }
 
     #[test]
@@ -180,12 +194,12 @@ mod tests {
 
     #[test]
     fn an_integer_casts_to_its_bytes() {
-        assert_eq!(int_to_bytea(1, Int2), Value::from_blob(vec![0, 1]));
-        assert_eq!(int_to_bytea(-1, Int2), Value::from_blob(vec![0xff, 0xff]));
-        assert_eq!(int_to_bytea(258, Int4), Value::from_blob(vec![0, 0, 1, 2]));
+        assert_eq!(int_to_bytea(1, Int2).unwrap(), blob(&[0, 1]));
+        assert_eq!(int_to_bytea(-1, Int2).unwrap(), blob(&[0xff, 0xff]));
+        assert_eq!(int_to_bytea(258, Int4).unwrap(), blob(&[0, 0, 1, 2]));
         assert_eq!(
-            int_to_bytea(-2, Int8),
-            Value::from_blob(vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe])
+            int_to_bytea(-2, Int8).unwrap(),
+            blob(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe])
         );
     }
 

@@ -60,7 +60,10 @@ fn bytea_input(text: &str) -> Result<Value> {
         Some(hex) => read_hex(hex)?,
         None => read_escape_format(text)?,
     };
-    Ok(Value::from_blob(bytes))
+    // A Value::Blob holds a ValueBlob, which turso_core allocates with its own
+    // allocator when it is built with --cfg nightly. Copy the bytes into one,
+    // and return an error if that allocation fails.
+    Ok(Value::from_slice(&bytes)?)
 }
 
 impl RegisteredType for Bytea {
@@ -151,7 +154,7 @@ mod tests {
 
     fn read(text: &str) -> Result<Vec<u8>, String> {
         match bytea_input(text) {
-            Ok(Value::Blob(bytes)) => Ok(bytes),
+            Ok(Value::Blob(bytes)) => Ok(bytes.to_vec()),
             Ok(other) => panic!("{other} is not a blob"),
             Err(error) => Err(error.to_string()),
         }
