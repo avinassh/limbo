@@ -1064,7 +1064,7 @@ fn copy_text_encoding_returns_one_record_per_row() {
     update
         .bind_at(
             std::num::NonZero::new(1).unwrap(),
-            Value::from_blob(vec![0, 255]),
+            Value::from_slice(&[0, 255]).unwrap(),
         )
         .unwrap();
     update.run_ignore_rows().unwrap();

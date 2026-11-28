@@ -1019,7 +1019,9 @@ fn binary_parameter_value(
 ) -> PgWireResult<Value> {
     match BinaryEncoding::of(pg_type) {
         Some(BinaryEncoding::Text) => pg_bytes_to_value(bytes, pg_type, Some(connection)),
-        Some(BinaryEncoding::Bytea) => Ok(Value::from_blob(bytes.to_vec())),
+        // A failed allocation of the copy is an out-of-memory error.
+        Some(BinaryEncoding::Bytea) => Value::from_slice(bytes)
+            .map_err(|error| pg_error(turso_core::LimboError::from(error).into())),
         Some(
             BinaryEncoding::Bool
             | BinaryEncoding::Int2
@@ -1367,7 +1369,7 @@ mod tests {
             let mut stmt = conn
                 .prepare(r#"UPDATE "A""B;C" SET data = $1 WHERE id = $2"#)
                 .unwrap();
-            stmt.bind_at(NonZero::new(1).unwrap(), Value::from_blob(bytes))
+            stmt.bind_at(NonZero::new(1).unwrap(), Value::from_slice(&bytes).unwrap())
                 .unwrap();
             stmt.bind_at(NonZero::new(2).unwrap(), Value::from_i64(id))
                 .unwrap();
@@ -1764,7 +1766,7 @@ mod tests {
             (
                 vec![Some(Type::BYTEA)],
                 b"\\x41",
-                Some(Value::from_blob(b"\\x41".to_vec())),
+                Some(Value::from_slice(b"\\x41").unwrap()),
             ),
             (vec![Some(Type::INT8)], b"\0\0\0\0\0\0\0\x2a", None),
             (vec![Some(Type::TIMESTAMPTZ)], b"\0\0\0\0\0\0\0\0", None),
@@ -2415,13 +2417,13 @@ mod tests {
     #[test]
     fn test_pg_bytes_to_value_bytea() {
         let val = pg_bytes_to_value(b"\\xDEADBEEF", &Type::BYTEA, None).unwrap();
-        assert_eq!(val, Value::from_blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(val, Value::from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap());
     }
 
     #[test]
     fn test_pg_bytes_to_value_bytea_reads_the_escape_format() {
         let val = pg_bytes_to_value(b"a\\101\\\\", &Type::BYTEA, None).unwrap();
-        assert_eq!(val, Value::from_blob(b"aA\\".to_vec()));
+        assert_eq!(val, Value::from_slice(b"aA\\").unwrap());
     }
 
     #[test]
