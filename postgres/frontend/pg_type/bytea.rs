@@ -60,7 +60,7 @@ fn bytea_input(text: &str) -> Result<Value> {
         Some(hex) => read_hex(hex)?,
         None => read_escape_format(text)?,
     };
-    Ok(Value::from_blob(bytes))
+    Ok(Value::from_slice(&bytes)?)
 }
 
 impl RegisteredType for Bytea {

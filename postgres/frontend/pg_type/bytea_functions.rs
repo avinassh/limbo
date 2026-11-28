@@ -16,7 +16,7 @@ impl ScalarReturn for Bytea {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("bytea"));
 
     fn into_value(self) -> Value {
-        Value::from_blob(self.0)
+        Value::from_slice(&self.0).expect(turso_core::alloc::ALLOC_ERR_MSG)
     }
 }
 
@@ -82,7 +82,7 @@ pub(crate) fn bytealike(text: &[u8], pattern: &[u8]) -> Result<bool> {
 pub(crate) fn int_to_bytea(value: i64, from: IntegerType) -> Value {
     let bytes = value.to_be_bytes();
     let width = usize::from(from.digits());
-    Value::from_blob(bytes[bytes.len() - width..].to_vec())
+    Value::from_slice(&bytes[bytes.len() - width..]).expect(turso_core::alloc::ALLOC_ERR_MSG)
 }
 
 /// PostgreSQL's cast from bytea to an integer of type `target` (`bytea_int2`,
